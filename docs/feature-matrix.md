@@ -12,14 +12,6 @@ versions or planning production use.
 | [Envoy AI Gateway](https://aigateway.envoyproxy.io/) | Not covered by this demo | Envoy Gateway policies and filters | Includes token-based rate limiting | LLM response usage can drive quotas | Usually provided by authn / policy integrations | Not yet included |
 | [agentgateway](https://agentgateway.dev/docs/kubernetes/latest/) | Not covered by this demo | API-key authentication and authorization policies | Request and token limits | Supports token-based limits | API-key authentication | Not yet included |
 
-## Terminology
-
-The [kagent project](https://kagent.dev/) focuses on building and running
-Kubernetes-native AI agents. [agentgateway](https://agentgateway.dev/) is a
-separate gateway project for AI, MCP, and agent traffic. This guide lists them
-separately rather than treating “kagentgateway” as an interchangeable product
-name.
-
 ## References
 
 - [Bifrost Helm deployment](https://docs.getbifrost.ai/deployment-guides/helm)
