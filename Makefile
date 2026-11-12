@@ -1,7 +1,7 @@
 NAMESPACE ?= ai-gateway-demo
 KRAKEND_NAMESPACE ?= krakend-demo
 
-.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall
+.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall
 
 help:
 	@printf '%s\n' \
@@ -13,10 +13,14 @@ help:
 	  'krakend-port-forward  Forward the KrakenD service to localhost:8080' \
 	  'krakend-demo          Check health and optionally send a sample request' \
 	  'krakend-uninstall     Remove the KrakenD demo namespace' \
+	  'agentgateway-install  Install the governed agentgateway demo' \
+	  'agentgateway-port-forward Forward the agentgateway service to localhost:8080' \
+	  'agentgateway-demo     Exercise agentgateway authentication, limits, and revocation' \
+	  'agentgateway-uninstall Remove the agentgateway demo resources' \
 	  'validate              Check shell script syntax'
 
 validate:
-	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh
+	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh scripts/agentgateway-common.sh scripts/install-agentgateway.sh scripts/demo-agentgateway.sh scripts/uninstall-agentgateway.sh
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 
 bifrost-install:
@@ -43,3 +47,15 @@ krakend-demo:
 
 krakend-uninstall:
 	kubectl delete namespace "$(KRAKEND_NAMESPACE)"
+
+agentgateway-install:
+	@NAMESPACE="$(NAMESPACE)" ./scripts/install-agentgateway.sh
+
+agentgateway-port-forward:
+	kubectl port-forward -n "$(NAMESPACE)" svc/agentgateway-proxy 8080:80
+
+agentgateway-demo:
+	@NAMESPACE="$(NAMESPACE)" ./scripts/demo-agentgateway.sh
+
+agentgateway-uninstall:
+	@NAMESPACE="$(NAMESPACE)" ./scripts/uninstall-agentgateway.sh

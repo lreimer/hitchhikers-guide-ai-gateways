@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgateway-httpbun
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-demo
+    app.kubernetes.io/name: agentgateway-httpbun
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentgateway-httpbun
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: agentgateway-demo
+        app.kubernetes.io/name: agentgateway-httpbun
+    spec:
+      containers:
+        - name: httpbun
+          image: sharat87/httpbun@sha256:6730442b216f3a8f580a37a0a9dd496f2e7d11419f226274509a9ea29a2d3169
+          env:
+            - name: HTTPBUN_BIND
+              value: 0.0.0.0:3090
+          ports:
+            - name: http
+              containerPort: 3090
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-httpbun
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agentgateway-httpbun
+  ports:
+    - name: http
+      port: 3090
+      targetPort: http
+      protocol: TCP

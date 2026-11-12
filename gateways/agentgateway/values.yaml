@@ -1,0 +1,11 @@
+controller:
+  replicaCount: 1
+  image:
+    tag: v1.7.0
+rbac:
+  gatewayNamespaces: []
+image:
+  tag: v1.7.0
+proxy:
+  image:
+    tag: v1.7.0

@@ -10,6 +10,7 @@ scripted walkthrough.
 | --- | --- | --- |
 | [Bifrost](gateways/bifrost/README.md) | [Helm-based Kubernetes demo](gateways/bifrost/README.md) | Semantic caching, governance policies, rate limits, token usage, virtual keys |
 | [KrakenD Community Edition](gateways/krakend/README.md) | [Kubernetes demo](gateways/krakend/README.md) | OpenAI Chat Completions proxy using standard gateway features |
+| [agentgateway](gateways/agentgateway/README.md) | [Governed LLM access demo](gateways/agentgateway/README.md) | Client API keys, model authorization, request throttling, per-client token budgets, token usage |
 
 Envoy AI Gateway and agentgateway are covered in the
 [feature comparison](docs/feature-matrix.md); additional runnable demos can be
@@ -45,6 +46,14 @@ endpoint publicly without configuring authentication and TLS.
 
 Run `make help` for all targets and `make bifrost-uninstall` to remove the
 demo release.
+
+## agentgateway
+
+The agentgateway demo runs a locally port-forwarded, authenticated OpenAI
+Chat Completions route. It defaults to a pinned in-cluster httpbun mock and
+does not need a provider key. See the
+[agentgateway walkthrough](gateways/agentgateway/README.md) for secure client
+key setup, OpenAI mode, quota caveats, and cleanup.
 
 ## KrakenD Community Edition
 
