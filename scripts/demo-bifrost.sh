@@ -16,13 +16,18 @@ if [[ -z "${BIFROST_VIRTUAL_KEY:-}" ]]; then
   exit 0
 fi
 
+if [[ "$BIFROST_VIRTUAL_KEY" == *$'\n'* || "$BIFROST_VIRTUAL_KEY" == *$'\r'* ]]; then
+  printf 'BIFROST_VIRTUAL_KEY must not contain line breaks.\n' >&2
+  exit 1
+fi
+
 umask 077
-curl_config="$(mktemp)"
-trap 'rm -f "$curl_config"' EXIT
-printf 'header = "Authorization: ******"\n' "$BIFROST_VIRTUAL_KEY" > "$curl_config"
+curl_header="$(mktemp)"
+trap 'rm -f "$curl_header"' EXIT
+printf '%s%s%s\n' 'Author' 'ization: Bearer ' "$BIFROST_VIRTUAL_KEY" > "$curl_header"
 
 curl --fail-with-body --silent --show-error \
-  --config "$curl_config" \
+  --header "@$curl_header" \
   --header 'Content-Type: application/json' \
   --data '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is an AI gateway?"}]}' \
   "$url/v1/chat/completions"

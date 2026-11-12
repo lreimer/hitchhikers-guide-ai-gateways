@@ -18,7 +18,7 @@ fi
 
 kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f -
 
-openssl rand -base64 32 |
+openssl rand -hex 32 |
   kubectl create secret generic bifrost-encryption-key \
     --namespace "$namespace" \
     --from-file=encryption-key=/dev/stdin \
