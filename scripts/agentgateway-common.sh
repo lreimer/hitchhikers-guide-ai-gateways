@@ -20,7 +20,7 @@ agentgateway_validate_namespace() {
   if [[ ! "$namespace" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
     [[ ${#namespace} -gt 63 ]] ||
     [[ "$namespace" == "$agentgateway_system_namespace" ]]; then
-    printf 'NAMESPACE must be a DNS label of at most 63 characters and must not be %s.\n' \
+    printf 'AGENTGATEWAY_NAMESPACE must be a DNS label of at most 63 characters and must not be %s.\n' \
       "$agentgateway_system_namespace" >&2
     return 1
   fi

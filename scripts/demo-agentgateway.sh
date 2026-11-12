@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/agentgateway-common.sh
 source "$script_dir/agentgateway-common.sh"
 
-namespace="${NAMESPACE:-ai-gateway-demo}"
+namespace="${AGENTGATEWAY_NAMESPACE:-agentgateway-demo}"
 url="${AGENTGATEWAY_URL:-http://127.0.0.1:8080}"
 alice_key="${AGENTGATEWAY_ALICE_KEY:-}"
 bob_key="${AGENTGATEWAY_BOB_KEY:-}"

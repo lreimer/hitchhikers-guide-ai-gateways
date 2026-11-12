@@ -35,9 +35,10 @@ Prerequisites:
 - `OPENAI_API_KEY` only when explicitly installing and running OpenAI mode
 
 The agentgateway controller release is shared at the cluster level in the
-`agentgateway-system` namespace. Demo resources are installed in `NAMESPACE`,
-which defaults to `ai-gateway-demo`. The generated proxy Service is `ClusterIP`
-only, and routes are restricted to the Gateway's namespace.
+`agentgateway-system` namespace. Demo resources are installed in the dedicated
+`agentgateway-demo` namespace by default, separate from Bifrost. Set
+`AGENTGATEWAY_NAMESPACE` to override it. The generated proxy Service is
+`ClusterIP` only, and routes are restricted to the Gateway's namespace.
 
 ## Prepare client keys
 
@@ -143,7 +144,7 @@ configuration but is not part of unattended validation.
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `NAMESPACE` | `ai-gateway-demo` | Namespace for the Gateway, routes, backend, policies, client hashes, and mock workload |
+| `AGENTGATEWAY_NAMESPACE` | `agentgateway-demo` | Dedicated namespace for the Gateway, routes, backend, policies, client hashes, and mock workload |
 | `AGENTGATEWAY_MODE` | `mock` | `mock` or `openai`; choose during install. Reinstall to switch modes |
 | `AGENTGATEWAY_MODEL` | `gpt-4o-mini` | Model pinned in the backend and policy during install |
 | `AGENTGATEWAY_ALICE_KEY` | Required | Alice's stable client key |
@@ -173,12 +174,13 @@ make agentgateway-uninstall
 ```
 
 The uninstaller removes only resources labeled as owned by this demo and never
-deletes the `NAMESPACE`. It removes the controller Helm release only when this
-demo installed it and no other agentgateway Gateways, policies, backends, or
-parameters remain. It removes the GatewayClass only when it was labeled as
-demo-owned. The Gateway API CRDs and the `agentgateway-crds` Helm release are
-intentionally retained as shared cluster prerequisites. If the controller is
-retained because other resources use it, it remains in `agentgateway-system`.
+deletes `AGENTGATEWAY_NAMESPACE`. It removes the controller Helm release only
+when this demo installed it and no other agentgateway Gateways, policies,
+backends, or parameters remain. It removes the GatewayClass only when it was
+labeled as demo-owned. The Gateway API CRDs and the `agentgateway-crds` Helm
+release are intentionally retained as shared cluster prerequisites. If the
+controller is retained because other resources use it, it remains in
+`agentgateway-system`.
 
 ## Troubleshooting
 
@@ -186,13 +188,14 @@ retained because other resources use it, it remains in `agentgateway-system`.
   `agentgateway-system`.
 - Inspect `kubectl describe gateway agentgateway-proxy`, `kubectl describe
   httproute agentgateway-llm`, and `kubectl describe agentgatewaypolicy
-  agentgateway-demo` in `NAMESPACE` for rejected configuration or unresolved
-  references.
+  agentgateway-demo` in `AGENTGATEWAY_NAMESPACE` for rejected configuration or
+  unresolved references.
 - If installation reports an unknown GatewayClass, conflicting release, or
   partial/incompatible CRDs, resolve the existing cluster ownership/version
   conflict rather than forcing adoption.
-- Confirm the port-forward is running and uses the same `NAMESPACE` as
-  install. `AGENTGATEWAY_URL` must point to the forwarded port.
+- Confirm the port-forward is running and uses the same
+  `AGENTGATEWAY_NAMESPACE` as install. `AGENTGATEWAY_URL` must point to the
+  forwarded port.
 - In OpenAI mode, confirm `OPENAI_API_KEY` was set during installation and
   that the selected model is available to the provider.
 

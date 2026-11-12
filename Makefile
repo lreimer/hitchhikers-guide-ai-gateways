@@ -1,5 +1,6 @@
 NAMESPACE ?= ai-gateway-demo
 KRAKEND_NAMESPACE ?= krakend-demo
+AGENTGATEWAY_NAMESPACE ?= agentgateway-demo
 
 .PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall
 
@@ -49,13 +50,13 @@ krakend-uninstall:
 	kubectl delete namespace "$(KRAKEND_NAMESPACE)"
 
 agentgateway-install:
-	@NAMESPACE="$(NAMESPACE)" ./scripts/install-agentgateway.sh
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-agentgateway.sh
 
 agentgateway-port-forward:
-	kubectl port-forward -n "$(NAMESPACE)" svc/agentgateway-proxy 8080:80
+	kubectl port-forward -n "$(AGENTGATEWAY_NAMESPACE)" svc/agentgateway-proxy 8080:80
 
 agentgateway-demo:
-	@NAMESPACE="$(NAMESPACE)" ./scripts/demo-agentgateway.sh
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/demo-agentgateway.sh
 
 agentgateway-uninstall:
-	@NAMESPACE="$(NAMESPACE)" ./scripts/uninstall-agentgateway.sh
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/uninstall-agentgateway.sh

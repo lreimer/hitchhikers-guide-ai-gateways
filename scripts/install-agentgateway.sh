@@ -6,7 +6,7 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 # shellcheck source=scripts/agentgateway-common.sh
 source "$script_dir/agentgateway-common.sh"
 
-namespace="${NAMESPACE:-ai-gateway-demo}"
+namespace="${AGENTGATEWAY_NAMESPACE:-agentgateway-demo}"
 mode="${AGENTGATEWAY_MODE:-mock}"
 model="${AGENTGATEWAY_MODEL:-gpt-4o-mini}"
 gateway_api_version="1.6.3"
@@ -351,5 +351,5 @@ fi
 
 printf '\nagentgateway installed in namespace %s (mode: %s, model: %s).\n' \
   "$namespace" "$mode" "$model"
-printf 'Run `make agentgateway-port-forward NAMESPACE=%s` and then `make agentgateway-demo NAMESPACE=%s`.\n' \
+printf 'Run `make agentgateway-port-forward AGENTGATEWAY_NAMESPACE=%s` and then `make agentgateway-demo AGENTGATEWAY_NAMESPACE=%s`.\n' \
   "$namespace" "$namespace"
