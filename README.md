@@ -44,3 +44,12 @@ endpoint publicly without configuring authentication and TLS.
 
 Run `make help` for all targets and `make bifrost-uninstall` to remove the
 demo release.
+
+## Maintainer
+
+M.-Leander Reimer (@lreimer), <mario-leander.reimer@qaware.de>
+
+## License
+
+This software is provided under the MIT open source license, read the `LICENSE`
+file for details.
