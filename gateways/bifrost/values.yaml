@@ -1,0 +1,35 @@
+image:
+  tag: "v2.4.0"
+
+bifrost:
+  encryptionKeySecret:
+    name: "bifrost-encryption-key"
+    key: "encryption-key"
+  providers:
+    openai:
+      keys:
+        - name: "demo-openai"
+          value: "env.OPENAI_API_KEY"
+          weight: 1
+  providerSecrets:
+    openai:
+      existingSecret: "bifrost-provider-keys"
+      key: "openai-api-key"
+      envVar: "OPENAI_API_KEY"
+  plugins:
+    governance:
+      enabled: true
+      config:
+        is_vk_mandatory: true
+    semanticCache:
+      enabled: true
+      version: 1
+      config:
+        provider: "openai"
+        keys:
+          - value: "env.OPENAI_API_KEY"
+            weight: 1
+        embedding_model: "text-embedding-3-small"
+        dimension: 1536
+        threshold: 0.85
+        ttl: "1h"
