@@ -9,15 +9,16 @@ scripted walkthrough.
 | Gateway | Demo | Features shown |
 | --- | --- | --- |
 | [Bifrost](gateways/bifrost/README.md) | [Helm-based Kubernetes demo](gateways/bifrost/README.md) | Semantic caching, governance policies, rate limits, token usage, virtual keys |
+| [KrakenD Community Edition](gateways/krakend/README.md) | [Kubernetes demo](gateways/krakend/README.md) | OpenAI Chat Completions proxy using standard gateway features |
 
-The Bifrost demo is the first runnable example. KrakenD, Envoy AI Gateway, and
-agentgateway are covered in the [feature comparison](docs/feature-matrix.md);
-additional runnable demos can be added as their configurations are validated.
+Envoy AI Gateway and agentgateway are covered in the
+[feature comparison](docs/feature-matrix.md); additional runnable demos can be
+added as their configurations are validated.
 
 ## Quick start
 
-Requirements: `kubectl`, Helm 3, `openssl`, `curl`, access to a Kubernetes
-cluster, and an OpenAI API key.
+Requirements for Bifrost: `kubectl`, Helm 3, `openssl`, `curl`, access to a
+Kubernetes cluster, and an OpenAI API key.
 
 ```sh
 export OPENAI_API_KEY=...
@@ -44,6 +45,15 @@ endpoint publicly without configuring authentication and TLS.
 
 Run `make help` for all targets and `make bifrost-uninstall` to remove the
 demo release.
+
+## KrakenD Community Edition
+
+The KrakenD demo runs a standard `no-op` proxy for OpenAI Chat Completions.
+Install it with `make krakend-install`, forward the service with
+`make krakend-port-forward`, and run `OPENAI_API_KEY=... make krakend-demo` in
+another terminal. It uses a separate `krakend-demo` namespace by default;
+override it with `KRAKEND_NAMESPACE`. See the
+[KrakenD walkthrough](gateways/krakend/README.md) for details.
 
 ## Maintainer
 

@@ -1,6 +1,7 @@
 NAMESPACE ?= ai-gateway-demo
+KRAKEND_NAMESPACE ?= krakend-demo
 
-.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall
+.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall
 
 help:
 	@printf '%s\n' \
@@ -8,10 +9,15 @@ help:
 	  'bifrost-port-forward  Forward the Bifrost service to localhost:8080' \
 	  'bifrost-demo          Check health and optionally send a sample request' \
 	  'bifrost-uninstall     Remove the Bifrost Helm release and namespace' \
+	  'krakend-install       Install the KrakenD Community Edition demo' \
+	  'krakend-port-forward  Forward the KrakenD service to localhost:8080' \
+	  'krakend-demo          Check health and optionally send a sample request' \
+	  'krakend-uninstall     Remove the KrakenD demo namespace' \
 	  'validate              Check shell script syntax'
 
 validate:
-	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh
+	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh
+	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 
 bifrost-install:
 	@NAMESPACE="$(NAMESPACE)" ./scripts/install-bifrost.sh
@@ -25,3 +31,15 @@ bifrost-demo:
 bifrost-uninstall:
 	helm uninstall bifrost --namespace "$(NAMESPACE)"
 	kubectl delete namespace "$(NAMESPACE)"
+
+krakend-install:
+	@KRAKEND_NAMESPACE="$(KRAKEND_NAMESPACE)" ./scripts/install-krakend.sh
+
+krakend-port-forward:
+	kubectl port-forward -n "$(KRAKEND_NAMESPACE)" svc/krakend 8080:8080
+
+krakend-demo:
+	@./scripts/demo-krakend.sh
+
+krakend-uninstall:
+	kubectl delete namespace "$(KRAKEND_NAMESPACE)"

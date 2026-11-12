@@ -1,0 +1,28 @@
+{
+  "version": 3,
+  "name": "KrakenD Community Edition AI proxy demo",
+  "port": 8080,
+  "timeout": "60s",
+  "endpoints": [
+    {
+      "endpoint": "/v1/chat/completions",
+      "method": "POST",
+      "input_headers": [
+        "Authorization",
+        "Content-Type",
+        "OpenAI-Organization",
+        "OpenAI-Project"
+      ],
+      "output_encoding": "no-op",
+      "backend": [
+        {
+          "host": [
+            "https://api.openai.com"
+          ],
+          "url_pattern": "/v1/chat/completions",
+          "encoding": "no-op"
+        }
+      ]
+    }
+  ]
+}

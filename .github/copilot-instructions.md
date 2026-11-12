@@ -3,8 +3,9 @@
 ## Build, test, and lint
 
 There is no application build or automated test suite. Run `make validate` to
-check the syntax of both shell scripts. To check one script, use
-`bash -n scripts/install-bifrost.sh` or `bash -n scripts/demo-bifrost.sh`.
+check shell script syntax and the KrakenD JSON configuration. To check one
+script, use `bash -n scripts/install-bifrost.sh` or
+`bash -n scripts/demo-bifrost.sh`.
 
 Run `make help` to list the Kubernetes demo targets. The Bifrost flow is:
 
@@ -17,9 +18,16 @@ export BIFROST_VIRTUAL_KEY=...
 make bifrost-demo
 ```
 
+The KrakenD Community Edition demo can be installed with
+`make krakend-install`, exposed locally with `make krakend-port-forward`, and
+tried with `OPENAI_API_KEY=... make krakend-demo`. Its namespace defaults to
+`krakend-demo` and can be overridden with `KRAKEND_NAMESPACE`.
+
 `NAMESPACE` can override the default `ai-gateway-demo` namespace for the
 install, port-forward, and uninstall targets. `BIFROST_URL` can override the
 demo script's default `http://127.0.0.1:8080`.
+`KRAKEND_NAMESPACE` can override the KrakenD demo namespace, and `KRAKEND_URL`
+can override the demo script's default `http://127.0.0.1:8080`.
 
 ## Architecture
 
@@ -29,13 +37,14 @@ high-level, version-sensitive comparison, not a feature certification.
 
 Each runnable demo is organized under `gateways/<gateway>/` with gateway
 configuration and usage documentation. The root `Makefile` exposes common demo
-operations, while `scripts/` contains the operational shell scripts. Bifrost
-is currently the runnable demo: its values file configures the official Helm
-chart, and `scripts/install-bifrost.sh` creates the Kubernetes namespace and
-credential Secrets before installing that chart. The provider and encryption
-credentials are supplied through Secrets rather than committed to Helm
-values. The demo script checks health and sends a sample completion only when
-`BIFROST_VIRTUAL_KEY` is set.
+operations, while `scripts/` contains the operational shell scripts. Bifrost's
+values file configures the official Helm chart, and
+`scripts/install-bifrost.sh` creates the Kubernetes namespace and credential
+Secrets before installing that chart. The provider and encryption credentials
+are supplied through Secrets rather than committed to Helm values. The
+KrakenD CE demo uses `gateways/krakend/krakend.json` and a Kubernetes ConfigMap
+to run a standard OpenAI proxy; its sample request forwards the API key without
+storing it in Kubernetes.
 
 ## Repository-specific conventions
 
