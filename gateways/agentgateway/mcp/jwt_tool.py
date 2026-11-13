@@ -14,8 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 
 
-ISSUER = "https://agentgateway.demo"
-AUDIENCE = "agentgateway-mcp"
+ISSUER = "https://agentgateway.demo.invalid"
+AUDIENCE = "agentgateway-mcp-demo"
 KEY_ID = "agentgateway-mcp-demo"
 
 
@@ -29,7 +29,11 @@ def restricted_directory(path: Path) -> Path:
         raise ValueError("Credential directory must be an explicit absolute external path")
     # Resolve both paths to reject a symlink pointing into repository artifacts.
     directory = path.resolve()
-    repository = Path(__file__).resolve().parents[3]
+    source = Path(__file__).resolve()
+    repository = next(
+        (ancestor for ancestor in source.parents if (ancestor / ".git").exists()),
+        source.parent,
+    )
     if directory == repository or repository in directory.parents:
         raise ValueError("Credential directory must be outside the repository")
     if path.is_symlink():
@@ -43,13 +47,14 @@ def restricted_directory(path: Path) -> Path:
 
 
 def write_private(path: Path, data: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
         info = os.fstat(fd)
         if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode):
             raise ValueError("Credential files must be regular files owned by you")
         os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
         with os.fdopen(fd, "wb", closefd=False) as output:
             output.write(data)
     finally:

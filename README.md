@@ -40,7 +40,8 @@ key setup, OpenAI mode, quota caveats, and cleanup.
 The [MCP add-on](gateways/agentgateway/mcp/README.md) extends that installation
 with a local SDK-backed calculator and fictional product catalog, without
 provider keys or inference calls. Its MCP coverage is separate from the
-LLM-focused feature comparison.
+LLM-focused feature comparison. Gateway end-to-end validation remains pending
+because the implementation sandbox could not resolve the official chart registry.
 
 ### KrakenD Community Edition
 

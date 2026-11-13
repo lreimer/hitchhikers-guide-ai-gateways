@@ -18,7 +18,7 @@ PRODUCTS = {
 mcp = server("catalog")
 
 
-def product(product_id: str) -> dict:
+def product(product_id: str) -> dict[str, str | float]:
     try:
         return PRODUCTS[product_id]
     except KeyError as exc:
@@ -26,7 +26,7 @@ def product(product_id: str) -> dict:
 
 
 @mcp.tool()
-def lookup_product(product_id: str) -> dict:
+def lookup_product(product_id: str) -> dict[str, str | float]:
     """Return public information about a fictional product."""
     entry = product(product_id)
     return {
@@ -37,7 +37,7 @@ def lookup_product(product_id: str) -> dict:
 
 
 @mcp.tool()
-def lookup_internal_note(product_id: str) -> dict:
+def lookup_internal_note(product_id: str) -> dict[str, str]:
     """Return a synthetic internal note; the gateway controls access."""
     return {"product_id": product_id, "note": product(product_id)["internal_note"]}
 

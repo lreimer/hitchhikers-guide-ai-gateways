@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -40,6 +41,7 @@ def token(directory: Path, identity: str) -> str:
     path = directory / f"{identity}.jwt"
     info = path.lstat()
     check(stat.S_ISREG(info.st_mode), "Token must be a regular, non-symlink file")
+    check(info.st_uid == os.getuid(), "Token must be owned by you")
     check(not stat.S_IMODE(info.st_mode) & 0o077, "Token permissions must be restricted")
     value = path.read_text().strip()
     check(bool(value), "Token file is empty")
@@ -131,7 +133,7 @@ async def rate_call(session):
     return False
 
 
-async def assertions(args) -> None:
+async def authentication_assertions(args) -> None:
     directory = restricted_directory(args.token_directory)
     credentials = {name: token(directory, name) for name in ("alice", "bob", "invalid", "expired")}
     await rejected(args.url, None, "missing JWT")
@@ -139,7 +141,8 @@ async def assertions(args) -> None:
     await rejected(args.url, credentials["expired"], "expired JWT")
 
     # Each phase gets a fresh bucket allowance; limits count transport requests.
-    await asyncio.sleep(args.rate_window_seconds + 1)
+    if args.phase == "all":
+        await asyncio.sleep(args.rate_window_seconds + 1)
     async with connect(args.url, credentials["alice"]) as (alice, protocol):
         names = {tool.name for tool in (await alice.list_tools()).tools}
         check(names == TOOLS, f"Alice tools: expected {sorted(TOOLS)}, got {sorted(names)}")
@@ -159,7 +162,8 @@ async def assertions(args) -> None:
             check(result.isError and fragment in text, f"{name}: expected specific input/tool error")
             print(f"PASS {name}: expected input/tool error ({fragment})")
 
-    await asyncio.sleep(args.rate_window_seconds + 1)
+    if args.phase == "all":
+        await asyncio.sleep(args.rate_window_seconds + 1)
     async with connect(args.url, credentials["bob"]) as (bob, _):
         names = {tool.name for tool in (await bob.list_tools()).tools}
         check(names == TOOLS - {INTERNAL}, f"Bob tools: expected permitted tools, got {sorted(names)}")
@@ -177,7 +181,11 @@ async def assertions(args) -> None:
             raise AssertionError("Bob direct call was not denied by gateway authorization")
         print("PASS Bob direct call: authorization denial (-32602, unknown resource)")
 
-    await asyncio.sleep(args.rate_window_seconds + 1)
+async def rate_assertions(args) -> None:
+    directory = restricted_directory(args.token_directory)
+    credentials = {name: token(directory, name) for name in ("alice", "bob")}
+    if args.phase == "all":
+        await asyncio.sleep(args.rate_window_seconds + 1)
     async with connect(args.url, credentials["alice"]) as (alice, _):
         async with connect(args.url, credentials["bob"]) as (bob, _):
             limited = False
@@ -198,23 +206,41 @@ async def assertions(args) -> None:
             print("PASS Alice refill recovery; Bob remained usable")
 
 
+async def assertions(args) -> None:
+    if args.phase == "ready":
+        directory = restricted_directory(args.token_directory)
+        async with connect(args.url, token(directory, "alice")) as (session, protocol):
+            names = {tool.name for tool in (await session.list_tools()).tools}
+            check(names == TOOLS, "Readiness: expected all four federated tools")
+            print(f"PASS MCP readiness: all four federated tools; protocol {protocol}")
+    if args.phase in ("auth", "all"):
+        await authentication_assertions(args)
+    if args.phase in ("rate", "all"):
+        await rate_assertions(args)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080/mcp")
-    parser.add_argument("--token-directory", required=True, type=Path)
+    parser.add_argument("--token-directory", "--token-dir", required=True, type=Path)
+    parser.add_argument("--phase", choices=("ready", "auth", "rate", "all"), default="all")
     parser.add_argument("--rate-capacity", type=int, default=30)
-    parser.add_argument("--rate-window-seconds", type=float, default=10)
+    parser.add_argument("--rate-window-seconds", type=float, default=30)
     parser.add_argument("--timeout-seconds", type=float, default=240)
     args = parser.parse_args()
     url = urlsplit(args.url)
     if (
         url.scheme not in ("http", "https") or url.hostname not in ("127.0.0.1", "localhost", "::1")
         or url.username or url.password or url.path != "/mcp" or url.query or url.fragment
-        or not 15 <= args.rate_capacity <= 100
+        or not 8 <= args.rate_capacity <= 100
+        or (args.phase == "all" and args.rate_capacity < 15)
         or not 1 <= args.rate_window_seconds <= 30
         or not 30 <= args.timeout_seconds <= 600
     ):
-        parser.error("Use a localhost /mcp URL, capacity 15..100, refill 1..30s, timeout 30..600s")
+        parser.error(
+            "Use a localhost /mcp URL, capacity 8..100 (at least 15 for all phases), "
+            "refill 1..30s, timeout 30..600s"
+        )
     try:
         asyncio.run(asyncio.wait_for(assertions(args), timeout=args.timeout_seconds))
     except (Exception, BaseExceptionGroup) as error:
@@ -223,7 +249,7 @@ def main() -> int:
         if isinstance(error, AssertionError):
             print(str(error), file=sys.stderr)
         return 1
-    print("PASS all MCP authentication, federation, authorization, and rate assertions")
+    print(f"PASS MCP {args.phase} assertions")
     return 0
 
 

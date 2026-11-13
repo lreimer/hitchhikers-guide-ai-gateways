@@ -22,6 +22,13 @@ agentgateway_write_policy test gpt-4o-mini install-abcd
         self.assertIn("name: agentgateway-llm", result.stdout)
         self.assertIn("name: agentgateway-readiness", result.stdout)
         self.assertNotIn("name: agentgateway-mcp", result.stdout)
+        self.assertIn(
+            "      name: agentgateway-llm\n"
+            "    - group: gateway.networking.k8s.io\n"
+            "      kind: HTTPRoute\n"
+            "      name: agentgateway-readiness\n",
+            result.stdout,
+        )
 
     def test_namespace_alias_and_explicit_namespace_override(self):
         for arguments, expected in [

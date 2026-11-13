@@ -32,12 +32,12 @@ spec:
               containerPort: 8000
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: mcp
             periodSeconds: 2
           livenessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: mcp
             initialDelaySeconds: 10
           resources:
@@ -107,12 +107,12 @@ spec:
               containerPort: 8000
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: mcp
             periodSeconds: 2
           livenessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: mcp
             initialDelaySeconds: 10
           resources:

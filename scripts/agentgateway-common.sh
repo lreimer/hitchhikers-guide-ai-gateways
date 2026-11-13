@@ -152,7 +152,7 @@ spec:
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
       name: agentgateway-llm
-     - group: gateway.networking.k8s.io
+    - group: gateway.networking.k8s.io
       kind: HTTPRoute
       name: agentgateway-readiness
   traffic:

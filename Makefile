@@ -29,7 +29,7 @@ help:
 	  'envoy-ai-gateway-port-forward Forward the generated Gateway to localhost:8080' \
 	  'envoy-ai-gateway-demo         Run the authenticated token-limit walkthrough' \
 	  'envoy-ai-gateway-uninstall    Remove demo resources and Helm releases' \
-	  'validate              Check shell script syntax'
+	  'validate              Check shell/Python syntax and KrakenD JSON'
 
 validate:
 	@for script in scripts/*.sh; do bash -n "$$script" || exit $$?; done
