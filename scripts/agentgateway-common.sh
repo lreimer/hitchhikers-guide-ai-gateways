@@ -138,6 +138,7 @@ agentgateway_check_client_keys() {
 agentgateway_write_policy() {
   local namespace="$1"
   local model="$2"
+  local phase="$3"
 
   cat <<EOF | kubectl apply --namespace "$namespace" -f -
 apiVersion: agentgateway.dev/v1alpha1
@@ -161,15 +162,82 @@ spec:
       action: Require
       policy:
         matchExpressions:
-          - 'has(json(request.body).model) && json(request.body).model == "$model"'
+          - 'has(json(request.body).model) && ((request.path == "/v1/chat/completions" && json(request.body).model == "$model") || (request.path == "/anything" && json(request.body).model == "$phase"))'
     rateLimit:
       local:
         - requests: 120
           unit: Minutes
           burst: 120
-          key: apiKey.user_id
+          key: 'request.path == "/anything" ? "readiness-$phase" : apiKey.user_id + "-$phase"'
         - tokens: 10000
           unit: Hours
-          key: apiKey.user_id
+          key: 'request.path == "/anything" ? "readiness-$phase" : apiKey.user_id + "-$phase"'
 EOF
+}
+
+agentgateway_wait_policy() {
+  local namespace="$1"
+  local generation="$2"
+  local attempt
+
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    if kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" -o json |
+      jq -e --argjson generation "$generation" '
+        .metadata.generation == $generation and
+        any(.status.ancestors[]?;
+          any(.conditions[]?; .type == "Accepted" and .status == "True" and .observedGeneration == $generation) and
+          any(.conditions[]?; .type == "Attached" and .status == "True" and .observedGeneration == $generation))' >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'Timed out waiting for policy generation %s to be accepted and attached.\n' "$generation" >&2
+  return 1
+}
+
+# A phase-specific authorization result proves the proxy loaded this update,
+# unlike controller status alone. The echo route never contacts an AI provider.
+agentgateway_wait_dataplane() {
+  local url="$1"
+  local key="$2"
+  local phase="$3"
+  local directory="$4"
+  local attempt status
+
+  printf 'Authorization: Bearer %s\n' "$key" > "$directory/readiness-header"
+  printf '{"model":"%s"}' "$phase" > "$directory/readiness-request"
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    status="$(curl --silent --show-error --max-time 5 \
+      --header "@$directory/readiness-header" --header 'Content-Type: application/json' \
+      --data-binary "@$directory/readiness-request" \
+      --output "$directory/readiness-response" --write-out '%{http_code}' \
+      "$url/anything")" || status=000
+    if [[ "$status" == 200 ]] &&
+      jq -e --arg phase "$phase" '.json.model == $phase' "$directory/readiness-response" >/dev/null; then
+      # Authentication must still reject a missing or invalid key.
+      for key in "" invalid-agentgateway-client-key; do
+        printf 'Authorization: Bearer %s\n' "$key" > "$directory/readiness-header"
+        status="$(curl --silent --show-error --max-time 5 \
+          --header "@$directory/readiness-header" --header 'Content-Type: application/json' \
+          --data-binary "@$directory/readiness-request" --output /dev/null \
+          --write-out '%{http_code}' "$url/anything")" || return 1
+        if [[ "$status" != 401 ]]; then
+          printf 'Readiness authentication check expected 401, got %s.\n' "$status" >&2
+          return 1
+        fi
+      done
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'Timed out waiting for data-plane policy phase %s (last HTTP %s).\n' "$phase" "$status" >&2
+  return 1
+}
+
+agentgateway_release_uid() {
+  local release="$1"
+  local revision
+  revision="$(jq -r '.revision' <<<"$release")"
+  kubectl get secret "sh.helm.release.v1.agentgateway.v$revision" \
+    --namespace "$agentgateway_system_namespace" -o json | jq -r '.metadata.uid'
 }

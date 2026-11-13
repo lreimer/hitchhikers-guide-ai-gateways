@@ -40,6 +40,16 @@ The agentgateway controller release is shared at the cluster level in the
 `AGENTGATEWAY_NAMESPACE` to override it. The generated proxy Service is
 `ClusterIP` only, and routes are restricted to the Gateway's namespace.
 
+Installation first shuts down any previous proxy, then writes the strict policy
+before creating a new Gateway. A protected local httpbun echo route proves that
+the current policy generation reached the proxy: a unique readiness model must
+be echoed, missing/invalid keys must return `401`, and a forbidden model must
+return `403`. Only then is the inference route created. Its authentication and
+model rejection are checked against the mock before enabling a real provider.
+An installation failure removes the Gateway and inference route. Reinstallation
+therefore briefly interrupts access. These checks make no provider inference
+calls; the installer starts and cleans up its own localhost-only port-forward.
+
 ## Prepare client keys
 
 Generate and retain local keys once; the installer hashes them with SHA-256
@@ -102,10 +112,17 @@ The walkthrough checks, in order:
 
 The request-limit phase uses one request per minute plus a burst of one. The
 token-budget phase uses 20 tokens per second and a nonbinding request limit.
-The phases change only the rate-limit section of the same policy.
-Authentication and model authorization remain enabled. The script uses
+Each phase updates the limits and a unique authorization marker for the protected
+`POST /anything` echo route in the same policy. The script waits for `Accepted`
+and `Attached` conditions for the current generation, then verifies the new
+marker through the proxy and checks that authentication still rejects missing
+and invalid keys. Controller status alone is not treated as data-plane readiness.
+Phase-specific per-client bucket keys isolate counters from preceding phases;
+readiness probes use a separate bucket and never contact a provider.
+Authentication and the inference model allowlist remain enabled. The script uses
 bounded request counts and waits up to 30 seconds for token refill; on success,
-failure, or interruption it restores the initial policy and both client keys.
+failure, or interruption it restores the initial policy and both client keys and
+verifies policy restoration through the echo route.
 A transport error, unexpected response, timeout, or provider-side `429` fails
 the demo.
 
@@ -127,8 +144,9 @@ unset OPENAI_API_KEY
 
 The installer writes the provider key to a namespaced Kubernetes Secret
 referenced by the OpenAI backend. Client virtual keys remain distinct from
-that provider key. The mock backend and its Deployment are removed when
-switching to OpenAI mode; no provider Secret is created in mock mode.
+that provider key. The local httpbun Deployment remains for protected readiness
+checks in both modes; inference uses the real provider only after the installer verifies
+security. No provider Secret is created in mock mode.
 
 The default model is `gpt-4o-mini`. To choose another provider model, set
 `AGENTGATEWAY_MODEL` during installation. The same value is used by the
@@ -175,12 +193,28 @@ make agentgateway-uninstall
 
 The uninstaller removes only resources labeled as owned by this demo and never
 deletes `AGENTGATEWAY_NAMESPACE`. It removes the controller Helm release only
-when this demo installed it and no other agentgateway Gateways, policies,
-backends, or parameters remain. It removes the GatewayClass only when it was
+when this demo installed it and no other tracked demo installations or
+agentgateway Gateways, policies, backends, parameters, or models remain. Ownership
+is stored in a shared `agentgateway-demo-controller` ConfigMap in
+`agentgateway-system`, rather than in the namespace that first installed it.
+The last demo uninstaller can therefore remove the controller regardless of
+namespace uninstall order. It verifies the chart version, deployed status, and
+Helm release Secret UID before removal; a replaced or upgraded release is never
+removed based on stale ownership state. A compatible pre-existing release
+without this shared ownership record is reused but never adopted or removed.
+It removes the GatewayClass only when it was
 labeled as demo-owned. The Gateway API CRDs and the `agentgateway-crds` Helm
 release are intentionally retained as shared cluster prerequisites. If the
 controller is retained because other resources use it, it remains in
-`agentgateway-system`.
+`agentgateway-system` with its shared ownership record.
+
+Focused regression checks use only Python's standard library and local shell
+tools:
+
+```sh
+make validate
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
 
 ## Troubleshooting
 

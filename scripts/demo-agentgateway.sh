@@ -37,7 +37,8 @@ if [[ ! "$model" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
 fi
 
 umask 077
-temp_dir="$(mktemp -d)"
+temp_dir="$PWD/.agentgateway-demo-$(openssl rand -hex 12)"
+mkdir "$temp_dir"
 policy_patch="$temp_dir/policy-patch.json"
 policy_backup="$temp_dir/policy-backup.json"
 request_header="$temp_dir/request-header"
@@ -49,14 +50,18 @@ keys_may_be_revoked=false
 
 cleanup() {
   local exit_status=$?
+  local restored=false generation
   trap - EXIT
 
-  if [[ "$policy_saved" == true ]] &&
-    ! kubectl patch agentgatewaypolicy agentgateway-demo --namespace "$namespace" \
+  if [[ "$policy_saved" == true ]]; then
+    if kubectl patch agentgatewaypolicy agentgateway-demo --namespace "$namespace" \
       --type=merge --patch-file="$policy_backup" >/dev/null; then
-    printf 'Failed to restore the original rate-limit policy; inspect AgentgatewayPolicy/agentgateway-demo in namespace %s.\n' \
-      "$namespace" >&2
-    exit_status=1
+      restored=true
+    else
+      printf 'Failed to restore the original policy; inspect AgentgatewayPolicy/agentgateway-demo in namespace %s.\n' \
+        "$namespace" >&2
+      exit_status=1
+    fi
   fi
   if [[ "$keys_may_be_revoked" == true ]] &&
     ! agentgateway_apply_client_keys "$namespace" "$alice_key" "$bob_key" >/dev/null; then
@@ -64,9 +69,17 @@ cleanup() {
       "$namespace" >&2
     exit_status=1
   fi
+  if [[ "$restored" == true ]]; then
+    if ! generation="$(kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" -o json | jq '.metadata.generation')" ||
+      ! agentgateway_wait_policy "$namespace" "$generation" ||
+      ! agentgateway_wait_dataplane "$url" "$alice_key" "$original_phase" "$temp_dir"; then
+      printf 'Could not verify restoration of the original policy in the data plane.\n' >&2
+      exit_status=1
+    fi
+  fi
 
   rm -f "$policy_patch" "$policy_backup" "$request_header" "$response_body" \
-    "$response_headers" "$request_body"
+    "$response_headers" "$request_body" "$temp_dir"/readiness-*
   rmdir "$temp_dir"
   exit "$exit_status"
 }
@@ -147,7 +160,7 @@ assert_completion() {
 assert_gateway_rate_limit() {
   local description="$1"
 
-  if ! grep -Eiq '^x-ratelimit-remaining:[[:space:]]*0\r?$' "$response_headers" ||
+  if ! grep -Eiq '^x-ratelimit-remaining:[[:space:]]*0[[:space:]]*$' "$response_headers" ||
     ! grep -Eiq 'rate limit exceeded' "$response_body"; then
     printf '%s: HTTP 429 did not have the expected gateway rate-limit body and remaining-token header.\n' \
       "$description" >&2
@@ -158,9 +171,21 @@ assert_gateway_rate_limit() {
 
 set_rate_limit() {
   local patch_json="$1"
-  printf '%s\n' "$patch_json" > "$policy_patch"
+  local phase generation authorization bucket
+  phase="scenario-$(openssl rand -hex 16)"
+  authorization="$(jq -c '.authorization' <<<"$original_traffic")"
+  bucket="request.path == \"/anything\" ? \"readiness-$phase\" : apiKey.user_id + \"-$phase\""
+  jq --arg phase "$phase" --argjson authorization "$authorization" --arg bucket "$bucket" '
+    .spec.traffic.authorization = $authorization |
+    .spec.traffic.authorization.policy.matchExpressions |= map(
+      gsub("(?<prefix>request.path == \"/anything\" && json\\(request.body\\).model == \")(install|scenario)-[a-f0-9]+\""; "\(.prefix)\($phase)\"")) |
+    .spec.traffic.rateLimit.local |= map(.key = $bucket)' <<<"$patch_json" > "$policy_patch"
   kubectl patch agentgatewaypolicy agentgateway-demo --namespace "$namespace" \
     --type=merge --patch-file="$policy_patch" >/dev/null
+  generation="$(kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" -o json | jq '.metadata.generation')"
+  agentgateway_wait_policy "$namespace" "$generation"
+  agentgateway_wait_dataplane "$url" "$alice_key" "$phase" "$temp_dir"
+  printf 'Scenario policy generation %s synchronized; fresh per-client buckets, authentication preserved.\n' "$generation"
 }
 
 if [[ "$mode" != "mock" && "$mode" != "openai" ]]; then
@@ -201,13 +226,15 @@ assert_model_input_rejected "$status" 'Malformed-model request'
 status="$(write_request "$bob_key" 'agentgateway-forbidden-model')"
 assert_status 403 "$status" 'Forbidden-model request'
 
-original_rate_limit="$(kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" \
-  -o json | jq -c '.spec.traffic.rateLimit')"
-if [[ "$original_rate_limit" == "null" ]]; then
+original_traffic="$(kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" \
+  -o json | jq -c '.spec.traffic | {rateLimit,authorization}')"
+if [[ "$(jq '.rateLimit' <<<"$original_traffic")" == "null" ]]; then
   printf 'The installed policy has no rate-limit configuration to restore.\n' >&2
   exit 1
 fi
-printf '{"spec":{"traffic":{"rateLimit":%s}}}\n' "$original_rate_limit" > "$policy_backup"
+printf '{"spec":{"traffic":%s}}\n' "$original_traffic" > "$policy_backup"
+original_phase="$(jq -er '.authorization.policy.matchExpressions[] |
+  capture("request.path == \"/anything\" && json\\(request.body\\).model == \"(?<phase>(install|scenario)-[a-f0-9]+)\"").phase' <<<"$original_traffic")"
 policy_saved=true
 
 set_rate_limit '{"spec":{"traffic":{"rateLimit":{"local":[{"requests":1,"unit":"Minutes","burst":1,"key":"apiKey.user_id"}]}}}}'

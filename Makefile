@@ -21,7 +21,7 @@ help:
 	  'validate              Check shell script syntax'
 
 validate:
-	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh scripts/agentgateway-common.sh scripts/install-agentgateway.sh scripts/demo-agentgateway.sh scripts/uninstall-agentgateway.sh
+	@for script in scripts/*.sh; do bash -n "$$script" || exit $$?; done
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 
 bifrost-install:
