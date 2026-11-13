@@ -120,16 +120,19 @@ binds to `127.0.0.1:8080`.
 The installer refuses namespaces without its ownership label, pre-existing
 Helm releases in other namespaces, and a pre-existing demo `GatewayClass` it
 does not own. Reinstalling reuses the client key. The generated data-plane
-Service is discovered by its owning-Gateway labels. The rate-limit state
-expires with its one-minute window; rerun the demo after recovery rather than
-resetting shared Redis state.
+Service is discovered across namespaces by its owning-Gateway labels. After
+the recovery request, the demo waits 65 seconds to let the shared one-minute
+token bucket cool down before another run. This assumes no other clients use
+the same `demo-chat` quota during that quiet window; shared traffic can extend
+the cooldown. Do not reset shared Redis state.
 
 ```sh
 make envoy-ai-gateway-uninstall
 ```
 
 Uninstall removes the demo's namespaced resources and Secrets, Redis, and the
-three Helm releases. It retains the empty demo namespaces and cluster-scoped
+Envoy Gateway and Agent Router controller Helm releases. It retains the
+`ai-gateway-crds` Helm release, the empty demo namespaces, and cluster-scoped
 Gateway API, Envoy Gateway, and Agent Router CRDs. This avoids deleting CRDs
 that may be used by other software. Remove retained CRDs only when you have
 verified that the cluster is dedicated to this demo and no other workloads

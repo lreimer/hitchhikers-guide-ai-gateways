@@ -134,6 +134,9 @@ while (( SECONDS < deadline )); do
 done
 [[ "${status:-}" == 200 ]] || fail "The token window did not recover within 85 seconds."
 
+printf 'Waiting 65 seconds for the shared one-minute token bucket to cool down before the next run...\n'
+sleep 65
+
 if [[ "$mode" == openai ]]; then
   expect_status 200 "Opt-in OpenAI completion (one request, max_tokens=16)" "$key_file" "$live_body"
   python3 - "$response_file" <<'PY'

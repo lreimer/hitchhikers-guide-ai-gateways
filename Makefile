@@ -23,7 +23,9 @@ help:
 	  'validate              Check shell script syntax'
 
 validate:
-	@bash -n scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh scripts/install-envoy-ai-gateway.sh scripts/demo-envoy-ai-gateway.sh scripts/port-forward-envoy-ai-gateway.sh scripts/uninstall-envoy-ai-gateway.sh
+	@for script in scripts/install-bifrost.sh scripts/demo-bifrost.sh scripts/install-krakend.sh scripts/demo-krakend.sh scripts/install-envoy-ai-gateway.sh scripts/demo-envoy-ai-gateway.sh scripts/port-forward-envoy-ai-gateway.sh scripts/uninstall-envoy-ai-gateway.sh; do \
+	  bash -n "$$script" || exit 1; \
+	done
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
 

@@ -14,9 +14,10 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 service=""
+service_namespace=""
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
-  service="$(kubectl get services --namespace "$namespace" -o json |
+  service_info="$(kubectl get services --all-namespaces -o json |
     python3 -c '
 import json,sys
 items=json.load(sys.stdin)["items"]
@@ -30,24 +31,27 @@ for item in items:
     if item["spec"].get("type") != "ClusterIP":
         raise SystemExit(f"Data-plane Service {item['metadata']['name']} is not ClusterIP-only")
     if any(port.get("port") == 80 for port in item["spec"].get("ports", [])):
-        matches.append(item["metadata"]["name"])
+        matches.append((item["metadata"]["namespace"], item["metadata"]["name"]))
 if len(matches) > 1:
     raise SystemExit(f"Expected one data-plane Service for Gateway, found: {matches}")
-print(matches[0] if matches else "")
+print("\t".join(matches[0]) if matches else "")
 ' "$gateway_name" "$namespace")"
-  [[ -n "$service" ]] && break
+  if [[ -n "$service_info" ]]; then
+    IFS=$'\t' read -r service_namespace service <<< "$service_info"
+    break
+  fi
   sleep 2
 done
 
 if [[ -z "$service" ]]; then
-  printf 'Could not discover the data-plane Service for Gateway %s/%s within 120 seconds.\n' \
+  printf 'Could not discover the data-plane Service for Gateway %s/%s across namespaces within 120 seconds.\n' \
     "$namespace" "$gateway_name" >&2
   kubectl get gateway "$gateway_name" --namespace "$namespace" -o yaml >&2 || true
-  kubectl get services --namespace "$namespace" --show-labels >&2 || true
+  kubectl get services --all-namespaces --show-labels >&2 || true
   exit 1
 fi
 
-printf 'Forwarding Gateway %s/%s through Service %s to 127.0.0.1:8080.\n' \
-  "$namespace" "$gateway_name" "$service"
+printf 'Forwarding Gateway %s/%s through Service %s/%s to 127.0.0.1:8080.\n' \
+  "$namespace" "$gateway_name" "$service_namespace" "$service"
 exec kubectl port-forward --address 127.0.0.1 \
-  --namespace "$namespace" "service/$service" 8080:80
+  --namespace "$service_namespace" "service/$service" 8080:80

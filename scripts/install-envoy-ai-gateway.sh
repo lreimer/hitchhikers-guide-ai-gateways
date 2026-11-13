@@ -218,6 +218,34 @@ wait_for_release_deployments() {
     --timeout="$timeout"
 }
 
+wait_for_policy_accepted() {
+  local resource="$1"
+  local name="$2"
+  local namespace="$3"
+  local ancestor_name="$4"
+  local deadline=$((SECONDS + 180))
+  local accepted
+
+  while (( SECONDS < deadline )); do
+    accepted="$(kubectl get "$resource" "$name" --namespace "$namespace" -o json |
+      python3 -c '
+import json,sys
+policy=json.load(sys.stdin)
+for ancestor in policy.get("status", {}).get("ancestors", []):
+    if ancestor.get("ancestorRef", {}).get("name") == sys.argv[1] and any(
+           condition.get("type") == "Accepted" and condition.get("status") == "True"
+           for condition in ancestor.get("conditions", [])):
+        print("true")
+        break
+' "$ancestor_name")"
+    [[ "$accepted" == true ]] && return 0
+    sleep 2
+  done
+
+  kubectl get "$resource" "$name" --namespace "$namespace" -o yaml >&2 || true
+  fail "$resource/$name did not report an Accepted ancestor within 180 seconds."
+}
+
 diagnostics() {
   printf '\nDeployment diagnostics (resource metadata only):\n' >&2
   kubectl get deployments,pods -n "$app_namespace" -o wide >&2 || true
@@ -371,17 +399,13 @@ kubectl wait --for=condition=Programmed gateway/envoy-ai-gateway-demo \
   --namespace "$app_namespace" --timeout=3m
 kubectl wait --for=condition=Accepted aigatewayroute/envoy-ai-gateway-mock \
   --namespace "$app_namespace" --timeout=3m
-kubectl wait --for=condition=Accepted securitypolicy/envoy-ai-gateway-client-key \
-  --namespace "$app_namespace" --timeout=3m
-kubectl wait --for=condition=Accepted backendtrafficpolicy/envoy-ai-gateway-token-limit \
-  --namespace "$app_namespace" --timeout=3m
+wait_for_policy_accepted securitypolicy envoy-ai-gateway-client-key "$app_namespace" envoy-ai-gateway-demo
+wait_for_policy_accepted backendtrafficpolicy envoy-ai-gateway-token-limit "$app_namespace" envoy-ai-gateway-demo
 if [[ "$mode" == openai ]]; then
   kubectl wait --for=condition=Accepted aigatewayroute/envoy-ai-gateway-openai \
     --namespace "$app_namespace" --timeout=3m
-  kubectl wait --for=condition=Accepted backendsecuritypolicy/envoy-ai-gateway-openai-key \
-    --namespace "$app_namespace" --timeout=3m
-  kubectl wait --for=condition=Accepted backendtlspolicy/envoy-ai-gateway-openai-tls \
-    --namespace "$app_namespace" --timeout=3m
+  wait_for_policy_accepted backendsecuritypolicy envoy-ai-gateway-openai-key "$app_namespace" envoy-ai-gateway-demo
+  wait_for_policy_accepted backendtlspolicy envoy-ai-gateway-openai-tls "$app_namespace" envoy-ai-gateway-demo
 fi
 
 printf '\nEnvoy AI Gateway demo installed in namespace %s (%s mode).\n' "$app_namespace" "$mode"

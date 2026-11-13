@@ -61,7 +61,7 @@ if kubectl get namespace "$gateway_namespace" >/dev/null 2>&1; then
   kubectl delete deployment/redis service/redis --namespace "$gateway_namespace" --ignore-not-found
 fi
 
-for release in "ai-gateway:$controller_namespace" "ai-gateway-crds:$controller_namespace" "eg:$gateway_namespace"; do
+for release in "ai-gateway:$controller_namespace" "eg:$gateway_namespace"; do
   name="${release%%:*}"
   namespace="${release#*:}"
   if helm status "$name" --namespace "$namespace" >/dev/null 2>&1; then
@@ -69,5 +69,6 @@ for release in "ai-gateway:$controller_namespace" "ai-gateway-crds:$controller_n
   fi
 done
 
-printf '\nEnvoy AI Gateway demo resources, credentials, Redis, and Helm releases were removed.\n'
+printf '\nEnvoy AI Gateway demo resources, credentials, Redis, and controller Helm releases were removed.\n'
 printf 'Demo namespaces and cluster-scoped Gateway API / Envoy Gateway / AI Gateway CRDs were retained.\n'
+printf 'The ai-gateway-crds Helm release was retained to prevent deleting cluster-scoped CRDs.\n'
