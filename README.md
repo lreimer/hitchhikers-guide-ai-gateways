@@ -17,7 +17,7 @@ Agent Router and agentgateway are covered in the
 [feature comparison](docs/feature-matrix.md); additional runnable demos can be
 added as their configurations are validated.
 
-## Bifrost
+### Bifrost
 
 The Bifrost demo installs the official Helm chart with OpenAI. Install it with
 `OPENAI_API_KEY=... make bifrost-install`, forward the service with
@@ -28,7 +28,7 @@ the [Bifrost walkthrough](gateways/bifrost/README.md) for setup and cleanup.
 This is a local evaluation setup; do not expose the dashboard or inference
 endpoint publicly without authentication and TLS.
 
-## agentgateway
+### agentgateway
 
 The agentgateway demo runs a locally port-forwarded, authenticated OpenAI
 Chat Completions route. It defaults to a pinned in-cluster httpbun mock and
@@ -36,7 +36,7 @@ does not need a provider key. See the
 [agentgateway walkthrough](gateways/agentgateway/README.md) for secure client
 key setup, OpenAI mode, quota caveats, and cleanup.
 
-## KrakenD Community Edition
+### KrakenD Community Edition
 
 The KrakenD demo runs a standard `no-op` proxy for OpenAI Chat Completions.
 Install it with `make krakend-install`, forward the service with
@@ -45,7 +45,7 @@ another terminal. It uses a separate `krakend-demo` namespace by default;
 override it with `KRAKEND_NAMESPACE`. See the
 [KrakenD walkthrough](gateways/krakend/README.md) for details.
 
-## Agent Router (formerly Envoy AI Gateway)
+### Agent Router (formerly Envoy AI Gateway)
 
 The Agent Router demo is configured for mock mode without a provider account
 or API key. It checks authentication, rewrites `demo-chat` to a fixture model,
