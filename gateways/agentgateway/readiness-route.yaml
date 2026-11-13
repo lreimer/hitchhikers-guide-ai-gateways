@@ -1,0 +1,18 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: agentgateway-readiness
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-demo
+spec:
+  parentRefs:
+    - name: agentgateway-proxy
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /anything
+          method: POST
+      backendRefs:
+        - name: agentgateway-httpbun
+          port: 3090

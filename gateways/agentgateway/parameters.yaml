@@ -1,0 +1,13 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: agentgateway-demo
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-demo
+spec:
+  deployment:
+    spec:
+      replicas: 1
+  service:
+    spec:
+      type: ClusterIP
