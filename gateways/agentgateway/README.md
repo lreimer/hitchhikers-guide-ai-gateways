@@ -40,12 +40,13 @@ The agentgateway controller release is shared at the cluster level in the
 `AGENTGATEWAY_NAMESPACE` (or `NAMESPACE`) to override it. The generated proxy Service is
 `ClusterIP` only, and routes are restricted to the Gateway's namespace.
 
-Installation first shuts down any previous proxy, then writes the strict policy
-before creating a new Gateway. A protected local httpbun echo route proves that
+Installation first shuts down any previous proxy, then writes the strict
+route-scoped policy and both routes before creating a new Gateway. A protected
+local httpbun echo route proves that
 the current policy generation reached the proxy: a unique readiness model must
 be echoed, missing/invalid keys must return `401`, and a forbidden model must
-return `403`. Only then is the inference route created. Its authentication and
-model rejection are checked against the mock before enabling a real provider.
+return `403`. The inference route's authentication and model rejection are
+checked against the mock before enabling a real provider.
 An installation failure removes the Gateway and inference route. Reinstallation
 therefore briefly interrupts access. These checks make no provider inference
 calls; the installer starts and cleans up its own localhost-only port-forward.
@@ -219,7 +220,7 @@ tools:
 
 ```sh
 make validate
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_agentgateway.py -v
 ```
 
 ## Troubleshooting

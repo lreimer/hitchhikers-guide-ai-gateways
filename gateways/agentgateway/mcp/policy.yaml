@@ -10,6 +10,12 @@ spec:
       kind: HTTPRoute
       name: agentgateway-mcp
   traffic:
+    rateLimit:
+      local:
+        - requests: 120
+          unit: Minutes
+          burst: 120
+          key: 'jwt.sub'
     jwtAuthentication:
       mode: Strict
       providers:

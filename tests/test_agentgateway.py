@@ -11,6 +11,16 @@ SOURCE = 'source scripts/agentgateway-common.sh\nsleep() { :; }\n'
 
 
 class AgentgatewayReadinessTests(unittest.TestCase):
+    def test_routes_are_prepared_before_starting_proxy(self):
+        script = (ROOT / "scripts/install-agentgateway.sh").read_text()
+        gateway = script.index('-f "$root_dir/gateways/agentgateway/gateway.yaml"')
+        for route in ("route.yaml", "readiness-route.yaml"):
+            self.assertLess(
+                script.index(f'-f "$root_dir/gateways/agentgateway/{route}"'),
+                gateway,
+            )
+        self.assertLess(script.index('agentgateway_write_policy "$namespace"'), gateway)
+
     def test_llm_policy_targets_only_llm_and_readiness_routes(self):
         result = self.run_shell("""
 kubectl() { cat; }

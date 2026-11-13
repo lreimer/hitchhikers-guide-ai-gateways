@@ -45,6 +45,12 @@ containers using the official SDK. Direct `/mcp` negotiation, `/readyz`,
 deterministic outputs, invalid numeric inputs, and unknown products passed.
 These checks do not prove gateway authentication, federation, or policy behavior.
 
+Installation stages the MCP route without exposing the fixture tools, checks
+authentication through a temporary localhost-only proxy port-forward, and only
+then enables the real backend. It requires the external key directory and an
+SDK-enabled Python (`AGENTGATEWAY_MCP_PYTHON`, default `python3`); only the public
+JWKS enters Kubernetes. Reinstallation briefly detaches only the MCP route.
+
 ## Local build and setup
 
 Prerequisites are the base demo's tools and credentials, Docker, Kind, and
@@ -108,8 +114,13 @@ Only the public verification key is embedded in the route policy. JWT validation
 is strict and checks signature, issuer, audience, and required expiration and
 subject claims. Authorization uses verified `jwt.sub`, not LLM virtual-key
 metadata. The issuer is `https://agentgateway.demo.invalid` and audience is
-`agentgateway-mcp-demo`. Issuer and audience defaults in `jwt_tool.py` must match `policy.yaml`;
-custom helper values require corresponding policy changes.
+`agentgateway-mcp-demo`. Use these defaults for the Make installation flow;
+issuer and audience in `jwt_tool.py` and `policy.yaml` must remain consistent.
+
+The pinned gateway uses `jsonwebtoken 11.1.0`'s built-in 60-second expiration
+leeway; its Kubernetes schema has no skew override. This is not zero-skew
+expiration enforcement. The expired negative fixture is signed with an
+expiration 120 seconds in the past, beyond that allowance.
 
 Renew tokens before running again:
 
@@ -186,6 +197,8 @@ in one Authorization header, or add an unauthenticated bypass route.
 
 Local MCP request limits are keyed by verified JWT subject. Limits count HTTP
 requests, including initialization and discovery, **not just tool executions**.
+The installed interactive policy allows 120 requests/minute plus burst 120
+(initial capacity 240), independently for each subject.
 The walkthrough gives connection setup adequate headroom, separates policy
 checks from throttling, uses bounded requests and short refill periods, and
 checks MCP response content rather than assuming HTTP 429. A throttled tool
@@ -202,7 +215,8 @@ tool authorization.
 Counters are in memory and per proxy replica, not durable or fleet-wide.
 Restarting the proxy resets them. No Redis or external limit service is used.
 The wrapper restores temporary MCP policy settings on success, failure, and
-interruption; restoration failure is itself a nonzero failure.
+interruption and checks data-plane quota-header convergence; restoration failure
+is itself a nonzero failure.
 
 Run the complete acceptance sequence twice, once in an alternate namespace:
 
@@ -243,6 +257,7 @@ by this implementation.
 ```sh
 make agentgateway-mcp-uninstall
 # Explicitly remove user-managed credentials when no longer needed:
+: "${AGENTGATEWAY_MCP_KEY_DIR:?Set the external credential directory first}"
 rm -f "$AGENTGATEWAY_MCP_KEY_DIR"/{private.pem,jwks.json,alice.jwt,bob.jwt,invalid.jwt,expired.jwt}
 rmdir "$AGENTGATEWAY_MCP_KEY_DIR"
 unset AGENTGATEWAY_MCP_KEY_DIR

@@ -100,8 +100,8 @@ def generate(directory: Path, issuer: str, audience: str, lifetime: int) -> None
         claims = {
             "iss": issuer, "aud": audience,
             "sub": identity if identity in ("alice", "bob") else "alice",
-            "iat": now - 120 if identity == "expired" else now,
-            "exp": now - 60 if identity == "expired" else now + lifetime,
+            "iat": now - 240 if identity == "expired" else now,
+            "exp": now - 120 if identity == "expired" else now + lifetime,
         }
         signing_key = (
             rsa.generate_private_key(public_exponent=65537, key_size=2048)

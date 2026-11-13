@@ -42,6 +42,10 @@ fi
 
 original_spec="$(jq -c '.spec' <<<"$original")"
 current_spec="$original_spec"
+restored_limit="$(jq -r '
+  [.traffic.rateLimit.local[]? | select(.requests != null) |
+    .requests + (.burst // 0)] |
+  if length == 0 then "absent" else min | tostring end' <<<"$original_spec")"
 policy_changed=false
 apply_spec() {
   local next="$1" generation
@@ -55,12 +59,19 @@ apply_spec() {
   generation="$(kubectl get agentgatewaypolicy agentgateway-mcp -n "$namespace" -o jsonpath='{.metadata.generation}')" || return 1
   agentgateway_mcp_wait_policy "$namespace" "$generation" || return 1
 }
+restore_policy() {
+  apply_spec "$original_spec" || return 1
+  "$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+    --url "$url" --token-directory "$key_directory" --phase quota \
+    --expected-rate-limit "$restored_limit" --timeout-seconds 120 || return 1
+  policy_changed=false
+}
 cleanup() {
   local status=$?
   trap - EXIT
   if [[ "$policy_changed" == true ]]; then
-    if ! apply_spec "$original_spec"; then
-      printf 'Could not restore the original MCP policy (possibly changed concurrently). Review agentgatewaypolicy/agentgateway-mcp; no LLM or Gateway policy was modified.\n' >&2
+    if ! restore_policy; then
+      printf 'Could not verify restoration of the original MCP policy in the live proxy (possibly changed concurrently). Review agentgatewaypolicy/agentgateway-mcp; no LLM or Gateway policy was modified.\n' >&2
       status=1
     else
       printf 'Restored original MCP policy settings.\n'
@@ -77,17 +88,22 @@ if [[ "$auth_spec" != "$current_spec" ]]; then
   apply_spec "$auth_spec"
 fi
 "$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+  --url "$url" --token-directory "$key_directory" --phase quota \
+  --expected-rate-limit absent --timeout-seconds 120
+"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase auth
 
 # The only quota is installed in a separate assertion phase on the SAME policy.
 # A new bucket namespace avoids previous runs consuming this run's allowance.
 phase="$(openssl rand -hex 12)"
 rate_spec="$(jq -c --arg key "jwt.sub + \"-mcp-$phase\"" '
-  .traffic.rateLimit = {local:[{requests:1,unit:"Seconds",burst:30,key:$key}]}' <<<"$auth_spec")"
+  .traffic.rateLimit = {local:[{requests:1,unit:"Seconds",burst:29,key:$key}]}' <<<"$auth_spec")"
 apply_spec "$rate_spec"
+"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+  --url "$url" --token-directory "$key_directory" --phase quota \
+  --expected-rate-limit 30 --timeout-seconds 120
 "$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase rate \
   --rate-capacity 30 --rate-window-seconds 30
-apply_spec "$original_spec"
-policy_changed=false
+restore_policy
 printf 'PASS MCP walkthrough; original policy restored. No LLM credentials or inference calls were used.\n'
