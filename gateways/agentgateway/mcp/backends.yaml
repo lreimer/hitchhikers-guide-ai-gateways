@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgateway-mcp-calculator
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgateway-mcp-calculator
+  template:
+    metadata:
+      labels:
+        app: agentgateway-mcp-calculator
+        app.kubernetes.io/managed-by: agentgateway-mcp-demo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: calculator
+          image: agentgateway-mcp:demo
+          imagePullPolicy: Never
+          command: ["python", "/app/calculator.py"]
+          ports:
+            - name: mcp
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: mcp
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: mcp
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-mcp-calculator
+  labels:
+    app: agentgateway-mcp-calculator
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+  annotations:
+    agentgateway.dev/mcp-path: /mcp
+    agentgateway.dev/mcp-target-name: calculator
+spec:
+  type: ClusterIP
+  selector:
+    app: agentgateway-mcp-calculator
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
+      appProtocol: agentgateway.dev/mcp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgateway-mcp-catalog
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgateway-mcp-catalog
+  template:
+    metadata:
+      labels:
+        app: agentgateway-mcp-catalog
+        app.kubernetes.io/managed-by: agentgateway-mcp-demo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: catalog
+          image: agentgateway-mcp:demo
+          imagePullPolicy: Never
+          command: ["python", "/app/catalog.py"]
+          ports:
+            - name: mcp
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: mcp
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: mcp
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-mcp-catalog
+  labels:
+    app: agentgateway-mcp-catalog
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+  annotations:
+    agentgateway.dev/mcp-path: /mcp
+    agentgateway.dev/mcp-target-name: catalog
+spec:
+  type: ClusterIP
+  selector:
+    app: agentgateway-mcp-catalog
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
+      appProtocol: agentgateway.dev/mcp

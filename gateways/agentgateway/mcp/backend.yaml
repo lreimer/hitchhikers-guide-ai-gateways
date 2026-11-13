@@ -1,0 +1,24 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: agentgateway-mcp
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+spec:
+  mcp:
+    prefixMode: Always
+    failureMode: FailClosed
+    sessionRouting: Stateful
+    targets:
+      - name: calculator
+        selector:
+          services:
+            matchLabels:
+              app: agentgateway-mcp-calculator
+              app.kubernetes.io/managed-by: agentgateway-mcp-demo
+      - name: catalog
+        selector:
+          services:
+            matchLabels:
+              app: agentgateway-mcp-catalog
+              app.kubernetes.io/managed-by: agentgateway-mcp-demo

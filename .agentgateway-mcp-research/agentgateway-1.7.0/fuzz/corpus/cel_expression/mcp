@@ -1,1 +1,0 @@
-mcp.tool.arguments.userId == "123" && mcp.tool.result.structuredContent.status == "ok"

@@ -1,6 +1,0 @@
-#refresh=false
-# The node pods are scheduled on.
-apiVersion: v1
-kind: Node
-metadata:
-  name: node

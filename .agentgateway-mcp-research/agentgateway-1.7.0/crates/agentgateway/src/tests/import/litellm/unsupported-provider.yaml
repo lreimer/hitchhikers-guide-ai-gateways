@@ -1,4 +1,0 @@
-model_list:
-- model_name: unsupported
-  litellm_params:
-    model: unknown/model

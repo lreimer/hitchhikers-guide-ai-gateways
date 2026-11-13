@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .agentgateway-demo-*/
 .agentgateway-install-*/
+.agentgateway-mcp-research/

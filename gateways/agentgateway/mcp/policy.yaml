@@ -1,0 +1,30 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: agentgateway-mcp
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: agentgateway-mcp
+  traffic:
+    jwtAuthentication:
+      mode: Strict
+      providers:
+        - issuer: https://agentgateway.demo.invalid
+          audiences:
+            - agentgateway-mcp-demo
+          validation:
+            requiredClaims: [exp, aud, sub]
+          jwks:
+            # Replaced with the locally generated public JWKS before applying.
+            inline: '{"keys":[]}'
+  backend:
+    mcp:
+      authorization:
+        action: Require
+        policy:
+          matchExpressions:
+            - 'jwt.sub in ["alice", "bob"] && ((mcp.tool.target == "calculator" && mcp.tool.name in ["add", "multiply"]) || (mcp.tool.target == "catalog" && (mcp.tool.name == "lookup_product" || (mcp.tool.name == "lookup_internal_note" && jwt.sub == "alice"))))'
