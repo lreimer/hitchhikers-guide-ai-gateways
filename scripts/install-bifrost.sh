@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-namespace="${NAMESPACE:-ai-gateway-demo}"
+namespace="${BIFROST_NAMESPACE:-bifrost-demo}"
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 for command in kubectl helm openssl; do
@@ -39,4 +39,4 @@ helm upgrade --install bifrost bifrost/bifrost \
   --values "$root_dir/gateways/bifrost/values.yaml"
 
 printf '\nBifrost installed in namespace %s.\n' "$namespace"
-printf 'Run `make bifrost-port-forward NAMESPACE=%s` to access it locally.\n' "$namespace"
+printf 'Run `make bifrost-port-forward BIFROST_NAMESPACE=%s` to access it locally.\n' "$namespace"

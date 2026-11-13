@@ -1,4 +1,4 @@
-NAMESPACE ?= ai-gateway-demo
+BIFROST_NAMESPACE ?= bifrost-demo
 KRAKEND_NAMESPACE ?= krakend-demo
 AGENTGATEWAY_NAMESPACE ?= agentgateway-demo
 ENVOY_AI_GATEWAY_NAMESPACE ?= envoy-ai-gateway-demo
@@ -33,17 +33,17 @@ validate:
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
 
 bifrost-install:
-	@NAMESPACE="$(NAMESPACE)" ./scripts/install-bifrost.sh
+	@BIFROST_NAMESPACE="$(BIFROST_NAMESPACE)" ./scripts/install-bifrost.sh
 
 bifrost-port-forward:
-	kubectl port-forward -n "$(NAMESPACE)" svc/bifrost 8080:8080
+	kubectl port-forward -n "$(BIFROST_NAMESPACE)" svc/bifrost 8080:8080
 
 bifrost-demo:
 	@./scripts/demo-bifrost.sh
 
 bifrost-uninstall:
-	helm uninstall bifrost --namespace "$(NAMESPACE)"
-	kubectl delete namespace "$(NAMESPACE)"
+	helm uninstall bifrost --namespace "$(BIFROST_NAMESPACE)"
+	kubectl delete namespace "$(BIFROST_NAMESPACE)"
 
 krakend-install:
 	@KRAKEND_NAMESPACE="$(KRAKEND_NAMESPACE)" ./scripts/install-krakend.sh
