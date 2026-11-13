@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-ai-gateway-mock
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+    app.kubernetes.io/name: envoy-ai-gateway-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: envoy-ai-gateway-mock
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: envoy-ai-gateway-mock
+    spec:
+      containers:
+        - name: mock
+          image: docker.io/library/python@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - /app/mock_backend.py
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+          volumeMounts:
+            - name: mock-source
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: mock-source
+          configMap:
+            name: envoy-ai-gateway-mock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-ai-gateway-mock
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: envoy-ai-gateway-mock
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: envoy-ai-gateway-mock
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  schema:
+    name: OpenAI
+  backendRef:
+    name: envoy-ai-gateway-mock
+    kind: Backend
+    group: gateway.envoyproxy.io
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: envoy-ai-gateway-mock
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  endpoints:
+    - fqdn:
+        hostname: envoy-ai-gateway-mock.@@ENVOY_AI_GATEWAY_NAMESPACE@@.svc.cluster.local
+        port: 8080
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: envoy-ai-gateway-mock
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  parentRefs:
+    - name: envoy-ai-gateway-demo
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: demo-chat
+      backendRefs:
+        - name: envoy-ai-gateway-mock
+          modelNameOverride: fixture-model
+          headerMutation:
+            remove:
+              - x-api-key
+              - authorization
+  llmRequestCosts:
+    - metadataKey: llm_total_token
+      type: TotalToken
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: envoy-ai-gateway-token-limit
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: envoy-ai-gateway-demo
+  rateLimit:
+    type: Global
+    global:
+      rules:
+        - clientSelectors:
+            - headers:
+                - name: x-ai-eg-model
+                  type: Exact
+                  value: demo-chat
+          limit:
+            requests: 100
+            unit: Minute
+          cost:
+            request:
+              from: Number
+              number: 0
+            response:
+              from: Metadata
+              metadata:
+                namespace: io.envoy.ai_gateway
+                key: llm_total_token

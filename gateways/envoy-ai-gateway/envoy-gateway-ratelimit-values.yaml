@@ -1,0 +1,20 @@
+config:
+  envoyGateway:
+    provider:
+      kubernetes:
+        rateLimitDeployment:
+          patch:
+            type: StrategicMerge
+            value:
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: envoy-ratelimit
+                        image: docker.io/envoyproxy/ratelimit@sha256:5fdd8e3ae335ab6d64316f8d2fd9a886830075cbbb40a1d8065c869275909162
+                        imagePullPolicy: IfNotPresent
+    rateLimit:
+      backend:
+        type: Redis
+        redis:
+          url: redis.envoy-gateway-system.svc.cluster.local:6379

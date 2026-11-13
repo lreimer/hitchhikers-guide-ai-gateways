@@ -10,9 +10,10 @@ scripted walkthrough.
 | --- | --- | --- |
 | [Bifrost](gateways/bifrost/README.md) | [Helm-based Kubernetes demo](gateways/bifrost/README.md) | Semantic caching, governance policies, rate limits, token usage, virtual keys |
 | [KrakenD Community Edition](gateways/krakend/README.md) | [Kubernetes demo](gateways/krakend/README.md) | OpenAI Chat Completions proxy using standard gateway features |
+| [Agent Router (formerly Envoy AI Gateway)](gateways/envoy-ai-gateway/README.md) | [Kubernetes demo](gateways/envoy-ai-gateway/README.md) | API-key authentication, model virtualization, token-based limits and recovery |
 | [agentgateway](gateways/agentgateway/README.md) | [Governed LLM access demo](gateways/agentgateway/README.md) | Client API keys, model authorization, request throttling, per-client token budgets, token usage |
 
-Envoy AI Gateway and agentgateway are covered in the
+Agent Router and agentgateway are covered in the
 [feature comparison](docs/feature-matrix.md); additional runnable demos can be
 added as their configurations are validated.
 
@@ -63,6 +64,18 @@ Install it with `make krakend-install`, forward the service with
 another terminal. It uses a separate `krakend-demo` namespace by default;
 override it with `KRAKEND_NAMESPACE`. See the
 [KrakenD walkthrough](gateways/krakend/README.md) for details.
+
+## Agent Router (formerly Envoy AI Gateway)
+
+The Agent Router demo is configured for mock mode without a provider account
+or API key. It checks authentication, rewrites `demo-chat` to a fixture model,
+and demonstrates response-time token charging against a shared
+100-token/minute allowance. Start with `make envoy-ai-gateway-install`, then use
+`make envoy-ai-gateway-port-forward` and `make envoy-ai-gateway-demo`. Live
+OpenAI mode is a separate, explicitly opted-in option. See the
+[Agent Router walkthrough](gateways/envoy-ai-gateway/README.md) for pinned
+versions, credentials, quota overshoot behavior, overrides, cleanup, and
+validation status.
 
 ## Maintainer
 

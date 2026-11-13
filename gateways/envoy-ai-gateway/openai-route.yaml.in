@@ -1,0 +1,86 @@
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: envoy-ai-gateway-openai
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  schema:
+    name: OpenAI
+  backendRef:
+    name: envoy-ai-gateway-openai
+    kind: Backend
+    group: gateway.envoyproxy.io
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: envoy-ai-gateway-openai
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  endpoints:
+    - fqdn:
+        hostname: api.openai.com
+        port: 443
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: BackendSecurityPolicy
+metadata:
+  name: envoy-ai-gateway-openai-key
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  targetRefs:
+    - group: aigateway.envoyproxy.io
+      kind: AIServiceBackend
+      name: envoy-ai-gateway-openai
+  type: APIKey
+  apiKey:
+    secretRef:
+      name: envoy-ai-gateway-openai-key
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: envoy-ai-gateway-openai-tls
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  targetRefs:
+    - group: gateway.envoyproxy.io
+      kind: Backend
+      name: envoy-ai-gateway-openai
+  validation:
+    wellKnownCACertificates: System
+    hostname: api.openai.com
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: envoy-ai-gateway-openai
+  namespace: @@ENVOY_AI_GATEWAY_NAMESPACE@@
+  labels:
+    app.kubernetes.io/managed-by: envoy-ai-gateway-demo
+spec:
+  parentRefs:
+    - name: envoy-ai-gateway-demo
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: live-chat
+      backendRefs:
+        - name: envoy-ai-gateway-openai
+          modelNameOverride: __OPENAI_MODEL__
+          headerMutation:
+            remove:
+              - x-api-key
+              - authorization
