@@ -150,8 +150,11 @@ metadata:
 spec:
   targetRefs:
     - group: gateway.networking.k8s.io
-      kind: Gateway
-      name: agentgateway-proxy
+      kind: HTTPRoute
+      name: agentgateway-llm
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: agentgateway-readiness
   traffic:
     apiKeyAuthentication:
       mode: Strict

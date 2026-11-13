@@ -6,7 +6,7 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 # shellcheck source=scripts/agentgateway-common.sh
 source "$script_dir/agentgateway-common.sh"
 
-namespace="${AGENTGATEWAY_NAMESPACE:-agentgateway-demo}"
+namespace="${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}"
 mode="${AGENTGATEWAY_MODE:-mock}"
 model="${AGENTGATEWAY_MODEL:-gpt-4o-mini}"
 gateway_api_version="1.6.3"
@@ -332,8 +332,9 @@ phase="install-$(openssl rand -hex 16)"
 agentgateway_write_policy "$namespace" "$model" "$phase"
 generation="$(kubectl get agentgatewaypolicy agentgateway-demo --namespace "$namespace" -o json | jq '.metadata.generation')"
 kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/parameters.yaml"
-kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/gateway.yaml"
 kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/readiness-route.yaml"
+kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/route.yaml"
+kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/gateway.yaml"
 
 kubectl wait --for=condition=Programmed --timeout=180s "gateway/agentgateway-proxy" \
   --namespace "$namespace"
@@ -378,8 +379,6 @@ if [[ "$status" != 403 ]]; then
   exit 1
 fi
 printf 'Current-generation policy verified in the data plane without inference calls.\n'
-kubectl apply --namespace "$namespace" -f "$root_dir/gateways/agentgateway/route.yaml"
-
 route_ready=false
 for ((attempt = 0; attempt < 60; attempt++)); do
   if kubectl get httproute agentgateway-llm --namespace "$namespace" -o json |

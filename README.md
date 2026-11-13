@@ -12,6 +12,7 @@ scripted walkthrough.
 | [KrakenD Community Edition](gateways/krakend/README.md) | [Kubernetes demo](gateways/krakend/README.md) | OpenAI Chat Completions proxy using standard gateway features |
 | [Agent Router (formerly Envoy AI Gateway)](gateways/envoy-ai-gateway/README.md) | [Kubernetes demo](gateways/envoy-ai-gateway/README.md) | API-key authentication, model virtualization, token-based limits and recovery |
 | [agentgateway](gateways/agentgateway/README.md) | [Governed LLM access demo](gateways/agentgateway/README.md) | Client API keys, model authorization, request throttling, per-client token budgets, token usage |
+| [agentgateway MCP add-on](gateways/agentgateway/mcp/README.md) | [MCP federation and tool authorization](gateways/agentgateway/mcp/README.md) | Two SDK-backed servers, JWT identities, tool discovery/call authorization, per-user local request limits |
 
 Agent Router and agentgateway are covered in the
 [feature comparison](docs/feature-matrix.md); additional runnable demos can be
@@ -35,6 +36,12 @@ Chat Completions route. It defaults to a pinned in-cluster httpbun mock and
 does not need a provider key. See the
 [agentgateway walkthrough](gateways/agentgateway/README.md) for secure client
 key setup, OpenAI mode, quota caveats, and cleanup.
+
+The [MCP add-on](gateways/agentgateway/mcp/README.md) extends that installation
+with a local SDK-backed calculator and fictional product catalog, without
+provider keys or inference calls. Its MCP coverage is separate from the
+LLM-focused feature comparison. Gateway end-to-end validation remains pending
+because the implementation sandbox could not resolve the official chart registry.
 
 ### KrakenD Community Edition
 

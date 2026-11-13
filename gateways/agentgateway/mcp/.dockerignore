@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!requirements.txt
+!common.py
+!calculator.py
+!catalog.py
+!assertion_client.py
+!jwt_tool.py

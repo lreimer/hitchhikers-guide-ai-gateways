@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+.agentgateway-demo-*/
+.agentgateway-install-*/
+.agentgateway-mcp-research/
