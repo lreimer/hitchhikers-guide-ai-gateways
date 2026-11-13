@@ -1,0 +1,541 @@
+use std::sync::Arc;
+
+use ::http::header::InvalidHeaderName;
+use ::http::response;
+use ::http::uri::InvalidUri;
+
+use crate::cel::Expression;
+use crate::http::uri::Scheme;
+use crate::http::{
+	HeaderMap, HeaderName, HeaderValue, PolicyResponse, Request, Response, StatusCode, Uri,
+};
+use crate::proxy::ProxyResponse;
+use crate::proxy::dtrace::{Severity, pol_result};
+use crate::proxy::httpproxy::PolicyClient;
+use crate::store::{BackendPolicyTrait, RequestPolicyTrait};
+use crate::telemetry::log::RequestLog;
+use crate::types::agent::{HostRedirect, PathMatch, PathRedirect, SimpleBackendReference};
+use crate::*;
+
+#[cfg(test)]
+#[path = "filters_test.rs"]
+mod tests;
+
+const REQUEST_REDIRECT_TRACE_KIND: &str = "request_redirect";
+const URL_REWRITE_TRACE_KIND: &str = "url_rewrite";
+const DIRECT_RESPONSE_TRACE_KIND: &str = "direct_response";
+
+#[apply(schema!)]
+#[derive(Default)]
+pub struct HeaderModifier {
+	/// Headers to append without replacing existing values.
+	#[serde(default, skip_serializing_if = "is_default")]
+	#[serde_as(as = "serde_with::Map<crate::serdes::SerAsStr, crate::serdes::SerAsHeaderValue>")]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "std::collections::BTreeMap<String, String>")
+	)]
+	pub add: Vec<(HeaderName, HeaderValue)>,
+	/// Headers to set, replacing any existing values.
+	#[serde(default, skip_serializing_if = "is_default")]
+	#[serde_as(as = "serde_with::Map<crate::serdes::SerAsStr, crate::serdes::SerAsHeaderValue>")]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "std::collections::BTreeMap<String, String>")
+	)]
+	pub set: Vec<(HeaderName, HeaderValue)>,
+	/// Header names to remove.
+	#[serde(default, skip_serializing_if = "is_default")]
+	#[serde_as(as = "Vec<crate::serdes::SerAsStr>")]
+	#[cfg_attr(feature = "schema", schemars(with = "Vec<String>"))]
+	pub remove: Vec<HeaderName>,
+	/// Set when an xDS header failed to parse. The entries before it are kept, and applying the
+	/// modifier fails after them.
+	#[serde(skip)]
+	pub invalid: Option<Strng>,
+}
+
+impl HeaderModifier {
+	fn check_invalid(&self) -> Result<(), Error> {
+		match &self.invalid {
+			Some(e) => Err(Error::InvalidFilterConfiguration(e.to_string())),
+			None => Ok(()),
+		}
+	}
+
+	pub fn apply(&self, headers: &mut HeaderMap<HeaderValue>) -> Result<(), Error> {
+		for (k, v) in &self.add {
+			headers.append(k, v.clone());
+		}
+		for (k, v) in &self.set {
+			headers.insert(k, v.clone());
+		}
+		for k in &self.remove {
+			headers.remove(k);
+		}
+		self.check_invalid()
+	}
+
+	pub fn apply_request(&self, req: &mut Request) -> Result<(), Error> {
+		for (k, v) in &self.add {
+			let mut rr = crate::http::RequestOrResponse::Request(req);
+			rr.apply_header(
+				&crate::http::HeaderOrPseudo::Header(k.clone()),
+				Some(crate::http::HeaderOrPseudoValue::Header(v.clone())),
+				crate::http::HeaderMutationAction::AppendIfExistsOrAdd,
+			);
+		}
+		for (k, v) in &self.set {
+			let mut rr = crate::http::RequestOrResponse::Request(req);
+			rr.apply_header(
+				&crate::http::HeaderOrPseudo::Header(k.clone()),
+				Some(crate::http::HeaderOrPseudoValue::Header(v.clone())),
+				crate::http::HeaderMutationAction::OverwriteIfExistsOrAdd,
+			);
+		}
+		for k in &self.remove {
+			req.headers_mut().remove(k);
+		}
+		self.check_invalid()
+	}
+}
+
+impl store::ResponsePolicyTrait for HeaderModifier {
+	async fn apply(
+		&self,
+		_log: &mut RequestLog,
+		resp: &mut Response,
+	) -> Result<PolicyResponse, ProxyResponse> {
+		self
+			.apply(resp.headers_mut())
+			.map_err(proxy::ProxyError::from)?;
+		Ok(PolicyResponse::default())
+	}
+}
+
+impl BackendPolicyTrait for HeaderModifier {
+	async fn apply(
+		&self,
+		_client: &PolicyClient,
+		_log: &mut Option<&mut RequestLog>,
+		req: &mut Request,
+	) -> Result<PolicyResponse, ProxyResponse> {
+		self.apply_request(req).map_err(proxy::ProxyError::from)?;
+		Ok(PolicyResponse::default())
+	}
+}
+
+impl RequestPolicyTrait for HeaderModifier {
+	async fn apply(
+		&self,
+		_client: &proxy::httpproxy::PolicyClient,
+		_log: &mut RequestLog,
+		req: &mut Request,
+	) -> Result<PolicyResponse, ProxyResponse> {
+		self.apply_request(req).map_err(proxy::ProxyError::from)?;
+		Ok(PolicyResponse::default())
+	}
+}
+
+#[apply(schema!)]
+pub struct RequestRedirect {
+	/// Scheme to use in the redirect URL, such as `http` or `https`.
+	#[serde(
+		default,
+		skip_serializing_if = "is_default",
+		serialize_with = "ser_display_option",
+		deserialize_with = "de_parse_option"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub scheme: Option<http::uri::Scheme>,
+	/// Host or port rewrite to apply to the redirect URL.
+	#[serde(skip_serializing_if = "is_default")]
+	pub authority: Option<HostRedirect>,
+	/// Path rewrite to apply to the redirect URL.
+	#[serde(skip_serializing_if = "is_default")]
+	pub path: Option<PathRedirect>,
+	/// HTTP status code to return for the redirect.
+	#[serde(
+		default,
+		skip_serializing_if = "is_default",
+		with = "http_serde::option::status_code"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<std::num::NonZeroU16>"))]
+	pub status: Option<http::StatusCode>,
+}
+
+impl RequestRedirect {
+	pub fn apply(&self, req: &mut Request) -> Result<PolicyResponse, Error> {
+		const DEFAULT_PATH: &PathMatch = &PathMatch::PathPrefix(strng::literal!("/"));
+		let path_match = req.extensions().get::<PathMatch>().unwrap_or(DEFAULT_PATH);
+		let RequestRedirect {
+			scheme,
+			authority,
+			path,
+			status,
+		} = self;
+		let new_scheme = scheme
+			.as_ref()
+			.or_else(|| req.uri().scheme())
+			.cloned()
+			.unwrap_or(Scheme::HTTP);
+		let authority = match authority {
+			// An explicit scheme without a port uses the scheme's well-known port.
+			None | Some(HostRedirect::None)
+				if scheme == &Some(Scheme::HTTP) || scheme == &Some(Scheme::HTTPS) =>
+			{
+				req.uri().host().ok_or(Error::InvalidURI)?.parse()?
+			},
+			_ => rewrite_host(authority, req.uri(), scheme.as_ref(), &new_scheme)?,
+		};
+		let path_and_query = rewrite_path(path, path_match, req.uri())?;
+		let new = Uri::builder()
+			.scheme(new_scheme)
+			.authority(authority)
+			.path_and_query(path_and_query)
+			.build()?;
+		pol_result!(
+			REQUEST_REDIRECT_TRACE_KIND,
+			Severity::Info,
+			Apply,
+			"applied request redirect to {new}",
+		);
+		let dr = ::http::Response::builder()
+			.status(status.unwrap_or(StatusCode::FOUND))
+			.header(http::header::LOCATION, new.to_string())
+			.body(http::Body::empty())?;
+
+		Ok(PolicyResponse::default().with_response(dr))
+	}
+}
+
+impl crate::store::RequestPolicyTrait for RequestRedirect {
+	async fn apply(
+		&self,
+		_client: &crate::proxy::httpproxy::PolicyClient,
+		_log: &mut crate::telemetry::log::RequestLog,
+		req: &mut Request,
+	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
+		self
+			.apply(req)
+			.map_err(crate::proxy::ProxyError::from)
+			.map_err(Into::into)
+	}
+}
+
+#[apply(schema!)]
+pub struct UrlRewrite {
+	/// Host or port rewrite to apply before forwarding the request.
+	#[serde(skip_serializing_if = "is_default")]
+	pub authority: Option<HostRedirect>,
+	/// Path rewrite to apply before forwarding the request.
+	#[serde(skip_serializing_if = "is_default")]
+	pub path: Option<PathRedirect>,
+}
+
+/// OriginalUrl is an HTTP Extension that signals the original URI when a URI was rewritten
+#[derive(Debug, Clone)]
+pub struct OriginalUrl(pub Uri);
+
+/// AppliedUrlRewrite records the path-rewrite configuration that produced the current URI.
+#[derive(Debug, Clone)]
+pub struct AppliedUrlRewrite {
+	pub path: Option<PathRedirect>,
+	pub path_match: PathMatch,
+}
+
+/// AutoHostname is an HTTP Extension that signals that auto-hostname rewrite should be used.
+#[derive(Debug, Clone)]
+pub struct AutoHostname {
+	/// True when auto-hostname rewrite was explicitly configured, rather than only applied as the
+	/// default.
+	pub explicit: bool,
+	/// Hostname to use when the network target is not itself hostname-based.
+	pub target: Option<Strng>,
+}
+
+/// BackendRequestTimeout is an HTTP Extension that signals the backend request timeout to use for backend calls.
+#[derive(Debug, Clone)]
+pub struct BackendRequestTimeout(pub Duration);
+
+/// RequestDeadline is an HTTP Extension that signals the deadline of the route's request timeout.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestDeadline(pub std::time::Instant);
+
+impl UrlRewrite {
+	pub fn apply(&self, req: &mut Request) -> Result<(), Error> {
+		const DEFAULT_PATH: &PathMatch = &PathMatch::PathPrefix(strng::literal!("/"));
+		let path_match = req
+			.extensions()
+			.get::<PathMatch>()
+			.unwrap_or(DEFAULT_PATH)
+			.clone();
+		let UrlRewrite { authority, path } = self;
+		let orig = req.uri().clone();
+		req.extensions_mut().insert(OriginalUrl(orig));
+		req.extensions_mut().insert(AppliedUrlRewrite {
+			path: path.clone(),
+			path_match: path_match.clone(),
+		});
+		let scheme = req.uri().scheme().cloned().unwrap_or(Scheme::HTTP);
+
+		let new_authority = rewrite_host(authority, req.uri(), Some(&scheme), &scheme)?;
+		// AutoHostname is the default, so if they explicitly set something (other than Auto), disable it.
+		if !matches!(authority, Some(HostRedirect::Auto) | None) {
+			req.extensions_mut().remove::<AutoHostname>();
+		}
+		let path_and_query = rewrite_path(path, &path_match, req.uri())?;
+		let new = Uri::builder()
+			.scheme(scheme)
+			.authority(new_authority)
+			.path_and_query(path_and_query)
+			.build()
+			.map_err(|e| Error::InvalidFilterConfiguration(e.to_string()))?;
+		*req.uri_mut() = new;
+		pol_result!(
+			URL_REWRITE_TRACE_KIND,
+			Severity::Info,
+			Apply,
+			"rewrote request URL"
+		);
+		Ok(())
+	}
+}
+
+impl crate::store::RequestPolicyTrait for UrlRewrite {
+	async fn apply(
+		&self,
+		_client: &crate::proxy::httpproxy::PolicyClient,
+		_log: &mut crate::telemetry::log::RequestLog,
+		req: &mut Request,
+	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
+		self.apply(req).map_err(crate::proxy::ProxyError::from)?;
+		Ok(PolicyResponse::default())
+	}
+}
+
+#[apply(schema!)]
+pub struct DirectResponse {
+	/// Static response body, encoded as bytes.
+	#[serde(default, skip_serializing_if = "is_default")]
+	#[serde(serialize_with = "serdes::serde_base64::serialize")]
+	pub body: Bytes,
+	/// CEL expression that computes the response body.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub body_expression: Option<Arc<Expression>>,
+	/// Response headers computed from CEL expressions.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[serde_as(as = "serde_with::Map<serde_with::DisplayFromStr, _>")]
+	pub headers: Vec<(HeaderName, Arc<Expression>)>,
+	/// HTTP status code to return.
+	#[serde(with = "http_serde::status_code")]
+	#[cfg_attr(feature = "schema", schemars(with = "std::num::NonZeroU16"))]
+	pub status: StatusCode,
+}
+
+impl DirectResponse {
+	pub fn validate(&self) -> anyhow::Result<()> {
+		if self.body_expression.is_some() && !self.body.is_empty() {
+			anyhow::bail!("directResponse body and bodyExpression may not both be set");
+		}
+		Ok(())
+	}
+
+	pub fn apply(&self, req: &Request) -> Result<Response, Error> {
+		pol_result!(
+			DIRECT_RESPONSE_TRACE_KIND,
+			Severity::Info,
+			Apply,
+			"applied direct response"
+		);
+		let body = if let Some(expr) = &self.body_expression {
+			let exec = crate::cel::Executor::new_request(req);
+			let value = exec
+				.eval(expr.as_ref())
+				.map_err(|e| Error::InvalidFilterConfiguration(e.to_string()))?;
+			crate::cel::value_as_byte_or_json(value)
+				.map_err(|e| Error::InvalidFilterConfiguration(e.to_string()))?
+		} else {
+			self.body.clone()
+		};
+		let mut response = response::Builder::new()
+			.status(self.status)
+			.body(http::Body::from(body))
+			.map_err(Error::from)?;
+		if !self.headers.is_empty() {
+			let exec = crate::cel::Executor::new_request(req);
+			for (name, expr) in &self.headers {
+				let Some(value) = exec.eval(expr).ok().and_then(|value| {
+					let value = value.always_materialize_owned();
+					value
+						.as_bytes_pre_materialized()
+						.ok()
+						.and_then(|bytes| HeaderValue::from_bytes(bytes).ok())
+				}) else {
+					continue;
+				};
+				response.headers_mut().insert(name, value);
+			}
+		}
+		Ok(response)
+	}
+}
+
+impl crate::store::RequestPolicyTrait for DirectResponse {
+	async fn apply(
+		&self,
+		_client: &crate::proxy::httpproxy::PolicyClient,
+		_log: &mut crate::telemetry::log::RequestLog,
+		req: &mut Request,
+	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
+		Ok(
+			PolicyResponse::default()
+				.with_response(self.apply(req).map_err(crate::proxy::ProxyError::from)?),
+		)
+	}
+
+	fn expressions(&self) -> impl Iterator<Item = &Expression> {
+		self
+			.body_expression
+			.as_ref()
+			.map(|expr| expr.as_ref())
+			.into_iter()
+			.chain(self.headers.iter().map(|(_, expr)| expr.as_ref()))
+	}
+}
+
+#[apply(schema!)]
+pub struct RequestMirror {
+	/// Backend that receives mirrored request copies.
+	pub backend: SimpleBackendReference,
+	/// Fraction of matching requests to mirror, from 0.0 to 1.0.
+	#[serde(deserialize_with = "de_mirror_percentage")]
+	pub percentage: f64,
+}
+
+fn de_mirror_percentage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+	let percentage = <f64 as serde::Deserialize>::deserialize(d)?;
+	if !(0.0..=1.0).contains(&percentage) {
+		return Err(serde::de::Error::custom(format!(
+			"requestMirror percentage must be between 0.0 and 1.0, got {percentage}"
+		)));
+	}
+	Ok(percentage)
+}
+
+fn rewrite_host(
+	rewrite: &Option<HostRedirect>,
+	orig: &Uri,
+	original_scheme: Option<&Scheme>,
+	new_scheme: &Scheme,
+) -> Result<http::uri::Authority, Error> {
+	match &rewrite {
+		// For Auto, we need to handle it later after we pick the backend!
+		None | Some(HostRedirect::None) | Some(HostRedirect::Auto) => {
+			orig.authority().cloned().ok_or(Error::InvalidURI)
+		},
+		Some(HostRedirect::Full(hp)) => Ok(hp.clone()),
+		Some(HostRedirect::Host(h)) => {
+			if original_scheme == Some(&Scheme::HTTP) || original_scheme == Some(&Scheme::HTTPS) {
+				Ok(h.clone())
+			} else {
+				let new_port = orig
+					.port_u16()
+					.and_then(|p| port_respecting_default(new_scheme, p));
+				match new_port {
+					Some(p) => Ok(format!("{h}:{p}").try_into()?),
+					None => Ok(h.clone()),
+				}
+			}
+		},
+		Some(HostRedirect::Port(p)) => {
+			match port_respecting_default(new_scheme, p.get()) {
+				// We need to set port here
+				Some(p) if Some(p) != orig.port_u16() => {
+					Ok(format!("{}:{}", orig.host().ok_or(Error::InvalidURI)?, p).try_into()?)
+				},
+
+				// Strip the port
+				None if orig.port().is_some() => Ok(orig.host().ok_or(Error::InvalidURI)?.parse()?),
+
+				// Keep it as-is
+				_ => Ok(orig.authority().ok_or(Error::InvalidURI)?.clone()),
+			}
+		},
+	}
+}
+
+fn port_respecting_default(scheme: &http::uri::Scheme, port: u16) -> Option<u16> {
+	if *scheme == http::uri::Scheme::HTTP && port == 80 {
+		return None;
+	}
+	if *scheme == http::uri::Scheme::HTTPS && port == 443 {
+		return None;
+	}
+	Some(port)
+}
+
+fn rewrite_path(
+	rewrite: &Option<PathRedirect>,
+	path_match: &PathMatch,
+	orig: &http::Uri,
+) -> Result<http::uri::PathAndQuery, Error> {
+	match rewrite {
+		None => Ok(orig.path_and_query().ok_or(Error::InvalidURI).cloned()?),
+		Some(PathRedirect::Full(r)) => {
+			let mut new_path = r.to_string();
+			if new_path.is_empty() {
+				new_path.push('/');
+			}
+			// Preserve query parameters from the original URI
+			if let Some(q) = orig.query() {
+				new_path.push('?');
+				new_path.push_str(q);
+			}
+			Ok(new_path.try_into()?)
+		},
+		Some(PathRedirect::Prefix(r)) => {
+			let PathMatch::PathPrefix(match_pfx) = path_match else {
+				return Err(Error::InvalidFilterConfiguration(
+					"path prefix rewrite requires a PathPrefix route match".to_string(),
+				));
+			};
+			let Some(rest) = crate::http::route::strip_path_prefix(orig.path(), match_pfx.as_str())
+			else {
+				return Err(Error::InvalidURI);
+			};
+			let mut new_path = r.to_string();
+			if !new_path.ends_with('/') && !rest.is_empty() && !rest.starts_with('/') {
+				new_path.push('/');
+			}
+			if new_path.ends_with('/') && rest.starts_with('/') {
+				new_path.pop();
+			}
+			new_path.push_str(rest);
+			if new_path.is_empty() {
+				new_path.push('/');
+			}
+			if let Some(q) = orig.query() {
+				new_path.push('?');
+				new_path.push_str(q);
+			}
+			Ok(new_path.try_into()?)
+		},
+	}
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+	#[error("invalid URI")]
+	InvalidURI,
+	#[error("invalid URI: {0}")]
+	InvalidHTTPURI(#[from] InvalidUri),
+	#[error("invalid header name: {0}")]
+	InvalidHeaderName(#[from] InvalidHeaderName),
+	#[error("invalid header value: {0}")]
+	InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
+	#[error("invalid filter configuration: {0}")]
+	InvalidFilterConfiguration(String),
+	#[error("http error: {0}")]
+	Http(#[from] ::http::Error),
+}

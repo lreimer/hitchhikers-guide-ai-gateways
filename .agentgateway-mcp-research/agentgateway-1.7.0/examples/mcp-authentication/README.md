@@ -1,0 +1,283 @@
+## MCP Authentication Example
+
+This example shows how to protect MCP servers with agentgateway using the MCP Authorization spec.
+
+> Note: The current MCP Authorization spec primarily covers authentication and protected resource metadata.
+
+### Running the example
+
+```bash
+cargo run -- -f examples/mcp-authentication/config.yaml
+```
+
+Let's look at the config to understand what's going on.
+
+### Validation dependencies
+Start the lightweight authorization server. It serves the mock authorization endpoints on
+`http://localhost:9000` and the Keycloak-compatible discovery/JWKS endpoints on
+`http://localhost:7080`:
+
+```bash
+make run-validation-deps
+```
+
+> You can stop the dependencies with the command `make stop-validation-deps`
+
+---
+
+### Scenario A: External Authorization Server (spec-compliant)
+
+Agentgateway acts as the resource server. Point to your Authorization Server’s issuer and JWKS, set the expected audience, and expose resource metadata. No provider adaptation is required.
+
+Taken from `examples/mcp-authentication/config.yaml`:
+
+```yaml
+- backends:
+  - mcp:
+      targets:
+      - name: everything
+        stdio:
+          cmd: npx
+          args:
+          - '@modelcontextprotocol/server-everything'
+  matches:
+  - path:
+      exact: /stdio/mcp
+  - path:
+      exact: /.well-known/oauth-protected-resource/stdio/mcp
+  policies:
+    cors:
+      allowHeaders:
+      - mcp-protocol-version
+      - content-type
+      allowOrigins:
+      - '*'
+      exposeHeaders:
+      - "Mcp-Session-Id"
+    mcpAuthentication:
+      mode: strict
+      issuer: http://localhost:9000
+      audiences:
+      - http://localhost:3000/stdio/mcp
+      jwks:
+        url: http://localhost:9000/.well-known/jwks.json
+      resourceMetadata:
+        resource: http://localhost:3000/stdio/mcp
+        scopesSupported:
+        - read:all
+        bearerMethodsSupported:
+        - header
+        - body
+        - query
+        resourceDocumentation: http://localhost:3000/stdio/docs
+        resourcePolicyUri: http://localhost:3000/stdio/policies
+```
+
+- Resource metadata: `GET http://localhost:3000/.well-known/oauth-protected-resource/stdio/mcp`
+- MCP server entry point: `POST/GET http://localhost:3000/stdio/mcp`
+
+Unauthenticated requests receive `401 Unauthorized` with `WWW-Authenticate` and a link to the resource metadata.
+
+---
+
+### Scenario B: Remote MCP + External Authorization Server
+
+Also in `examples/mcp-authentication/config.yaml`:
+
+```yaml
+- backends:
+  - mcp:
+      targets:
+      - name: mcpbin
+        mcp:
+          host: https://mcpbin.is.solo.io/remote/mcp
+  matches:
+  - path:
+      exact: /remote/mcp
+  - path:
+      exact: /.well-known/oauth-protected-resource/remote/mcp
+  policies:
+    cors:
+      allowHeaders:
+      - mcp-protocol-version
+      - content-type
+      allowOrigins:
+      - '*'
+      exposeHeaders:
+      - "Mcp-Session-Id"
+    mcpAuthentication:
+      issuer: http://localhost:9000
+      audiences:
+      - http://localhost:3000/remote/mcp
+      jwks:
+        url: http://localhost:9000/.well-known/jwks.json
+      resourceMetadata:
+        resource: http://localhost:3000/remote/mcp
+        scopesSupported:
+        - offline_access
+        bearerMethodsSupported:
+        - header
+        - body
+        - query
+        resourceDocumentation: http://localhost:3000/remote/docs
+        resourcePolicyUri: http://localhost:3000/remote/policies
+```
+
+---
+
+### Scenario C: Adapting a vendor Authorization Server (e.g., Keycloak)
+
+When your Authorization Server doesn’t implement the spec as-is, agentgateway can fill in the gaps.
+Currently, six providers are supported: Keycloak, Auth0, Okta, Descope, authentik, and Microsoft Entra ID (Azure AD).
+
+Excerpt from `examples/mcp-authentication/config.yaml`:
+
+```yaml
+- backends:
+  - mcp:
+      targets:
+      - name: everything
+        stdio:
+          cmd: npx
+          args:
+          - '@modelcontextprotocol/server-everything'
+  matches:
+  - path: { exact: /keycloak/mcp }
+  - path: { exact: /.well-known/oauth-protected-resource/keycloak/mcp }
+  - path: { exact: /.well-known/oauth-authorization-server/keycloak/mcp }
+  - path: { exact: /.well-known/oauth-authorization-server/keycloak/mcp/client-registration }
+  policies:
+    cors:
+      allowHeaders: [mcp-protocol-version, content-type]
+      allowOrigins: ['*']
+    mcpAuthentication:
+      issuer: http://localhost:7080/realms/mcp
+      audiences:
+      - mcp_proxy
+      jwks:
+        url: http://localhost:7080/realms/mcp/protocol/openid-connect/certs
+      provider:
+        keycloak: {}
+      resourceMetadata:
+        resource: http://localhost:3000/keycloak/mcp
+        scopesSupported: [profile, offline_access, openid]
+        bearerMethodsSupported: [header, body, query]
+        resourceDocumentation: http://localhost:3000/keycloak/docs
+        resourcePolicyUri: http://localhost:3000/keycloak/policies
+```
+
+What setting a provider does (high level):
+- Agentgateway acts as an Authorization Server facade for the MCP client and exposes the well-known endpoints itself:
+  - Resource metadata at `/.well-known/oauth-protected-resource/...`
+  - Authorization Server metadata at `/.well-known/oauth-authorization-server/...`
+- In the resource metadata it returns, the `authorization_servers` value is set to the gateway’s own URL (not the upstream issuer) so clients talk to the gateway, and the gateway adapts things as needed.
+- The AS metadata is fetched from your configured `issuer` and minimally rewritten per provider to smooth over incompatibilities.
+- If `jwksUrl` is omitted, the gateway derives it from the provider:
+  - Auth0 → `<issuer>/.well-known/jwks.json`
+  - Keycloak → `<issuer>/protocol/openid-connect/certs`
+  - Okta → `<issuer>/.well-known/jwks.json`
+  - Descope → `https://api.descope.com/{project-id}/.well-known/jwks.json` (derived from agentic issuer path)
+  - authentik → `<issuer>/jwks/`
+  - Entra → `https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys` (tenant derived from the issuer)
+
+Auth0-specific notes:
+- Gateway appends `?audience=...` to the authorization endpoint it exposes.
+
+Keycloak-specific notes:
+- No RFC 8707 support; use a fixed audience in config.
+- Client registration is proxied by the gateway at `.../client-registration` to forward to Keycloak’s `clients-registrations/openid-connect`.
+
+Okta-specific notes:
+- Okta supports RFC 8414 (like Auth0), so the gateway uses standard AS metadata discovery.
+- No RFC 8707 support; gateway appends `?audience=...` to the authorization endpoint (same workaround as Auth0).
+- Client registration is proxied by the gateway at `.../client-registration` to forward to Okta’s `oauth2/v1/clients`.
+- Okta DCR requires an SSWS API token; the gateway proxies the request and the MCP client must provide the token.
+
+authentik-specific notes:
+- Uses OIDC discovery (`{issuer}/.well-known/openid-configuration`), not RFC 8414. The issuer is per-application: `https://<host>/application/o/<app-slug>/`.
+- No RFC 8707 support, and no audience query parameter workaround. authentik sets `aud` to the OAuth client ID, so configure `audiences` with the pre-registered client ID.
+- No Dynamic Client Registration support ([goauthentik/authentik#8751](https://github.com/goauthentik/authentik/issues/8751)). **Setting `clientId` is required**: the gateway injects a `registration_endpoint` into the AS metadata it exposes and answers registration requests itself with the pre-registered client.
+- The pre-registered authentik client must be a **public** client (the mock registration response advertises `token_endpoint_auth_method: none`) with PKCE, and its redirect URIs must cover your MCP clients (authentik supports regex redirect URIs).
+
+Entra (Azure AD)-specific notes:
+- Entra only serves OIDC Discovery metadata (no RFC 8414); the gateway fetches the tenant's v2.0 `openid-configuration` and serves it as AS metadata. Both the v2 issuer (`https://login.microsoftonline.com/<tenant>/v2.0`) and the v1 issuer (`https://sts.windows.net/<tenant>/`) forms are accepted in `issuer`.
+- Entra's v2.0 endpoints reject the RFC 8707 `resource` parameter that MCP clients are required to send (`AADSTS9010010: invalid_target`). The gateway advertises proxied `.../authorize` and `.../token` endpoints in the served AS metadata and strips `resource` before forwarding to Entra, so make sure the route also matches the `/.well-known/oauth-authorization-server/...` path prefix.
+- No Dynamic Client Registration (RFC 7591); set `clientId` to a pre-registered app registration id and the gateway short-circuits registration requests with it.
+- MCP clients always remain public clients using PKCE (the registration short-circuit advertises `token_endpoint_auth_method: none`). `clientSecret` is not a credential for MCP clients — it is the credential of the gateway operator's own Entra app registration, and it pairs with `clientId`.
+- Entra decides confidential-vs-public per app registration platform. When the app's redirect URIs are registered under the **Web** platform, Entra treats it as a confidential client and requires client authentication at the token endpoint *in addition to* PKCE (`AADSTS7000218` otherwise). Set `clientSecret` and the gateway attaches it server-side — only to `authorization_code`/`refresh_token` requests for the configured `clientId`, never to other grant types (e.g. `client_credentials`).
+- If the app registration is a genuine public client ("Mobile and desktop applications" platform with public client flows allowed), omit `clientSecret` — the flow is pure PKCE end to end.
+- The SPA platform does not work behind the gateway's token proxy: Entra only redeems SPA-issued authorization codes via browser cross-origin requests (`AADSTS9002327`).
+- PKCE (`S256`) is advertised in the served metadata even though Entra omits `code_challenge_methods_supported` from its discovery document.
+- List both `api://<client-id>` and the bare client id in `audiences` to accept the `aud` formats Entra mints for v1 and v2 tokens.
+
+Descope-specific notes:
+- Uses OIDC discovery (`{issuer}/.well-known/openid-configuration`), not RFC 8414.
+- Supports RFC 8707 resource indicators — no audience workaround needed.
+- DCR requires a management key belonging to the server operator (not the MCP client). **Prefer setting `clientId` in config to skip DCR entirely.**
+- Client registration is proxied by the gateway at `.../client-registration` to forward to Descope’s management DCR endpoint.
+
+Notes:
+- Omit the `provider` block for spec-compliant servers. Use it only when adaptation is needed.
+
+---
+
+### Quick test
+
+- Without a token:
+  ```bash
+  curl -i http://localhost:3000/stdio/mcp
+  ```
+  Expect `401 Unauthorized` and a `WWW-Authenticate` header referencing the well-known resource metadata.
+
+- With MCP Inspector:
+  ```bash
+  npx @modelcontextprotocol/inspector
+  ```
+  Set transport to "Streamable" and URL to `http://localhost:3000/stdio/mcp` (`/remote/mcp` or `/keycloak/mcp`).
+
+  The MCP Authorization flow starts after the initial unauthorized request. The mock server redirects back to the MCP client automatically, meanwhile for Keycloak use the credentials `testuser` and `testpass` to authenticate.
+
+---
+
+### Customizing required claims
+
+By default, the `exp` (expiration) claim is required. You can customize which
+claims must be present via `jwtValidationOptions.requiredClaims`. Only the
+five RFC 7519 registered claims are recognized: `exp`, `nbf`, `aud`, `iss`,
+`sub`. Any other value is silently ignored by the underlying library. This
+only enforces **presence**; standard claims like `exp` have their values
+validated independently.
+
+```yaml
+# Allow tokens without exp (e.g., enterprise IDPs that omit it)
+mcpAuthentication:
+  issuer: https://enterprise-idp.example.com
+  audiences:
+    - https://api.mycompany.com/mcp
+  jwks:
+    url: https://enterprise-idp.example.com/.well-known/jwks.json
+  jwtValidationOptions:
+    requiredClaims: []
+
+# Require both exp and nbf
+mcpAuthentication:
+  issuer: https://strict-idp.example.com
+  audiences:
+    - https://api.mycompany.com/mcp
+  jwks:
+    url: https://strict-idp.example.com/.well-known/jwks.json
+  jwtValidationOptions:
+    requiredClaims: ["exp", "nbf"]
+```
+
+Claims present in the token are still validated even if not listed as required.
+For example, an expired `exp` is rejected regardless of `requiredClaims`.
+
+> **Note:** Tokens without `exp` remain valid until the signing key is rotated.
+
+---
+
+### Troubleshooting
+- Ensure `issuer` and `jwksUrl` match your Authorization Server.
+- Ensure `audience` equals the resource URL clients will request.
+- Verify resource metadata is reachable at `/.well-known/oauth-protected-resource/...` and reflects the same `resource` value used in `audience`.

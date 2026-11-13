@@ -1,0 +1,56 @@
+---
+# Source: agentgateway/templates/horizontalpodautoscaler.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: test-release-agentgateway
+  namespace: default
+  labels:
+    helm.sh/chart: agentgateway-0.0.2
+    agentgateway: agentgateway
+    app.kubernetes.io/name: agentgateway
+    app.kubernetes.io/instance: test-release
+    app.kubernetes.io/version: "0.0.0-dev"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: test-release-agentgateway
+  maxReplicas: 5
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 80
+        type: Utilization
+    type: Resource
+  minReplicas: 1
+
+---
+# Source: agentgateway/templates/verticalpodautoscaler.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: test-release-agentgateway
+  namespace: default
+  labels:
+    helm.sh/chart: agentgateway-0.0.2
+    agentgateway: agentgateway
+    app.kubernetes.io/name: agentgateway
+    app.kubernetes.io/instance: test-release
+    app.kubernetes.io/version: "0.0.0-dev"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: test-release-agentgateway
+  resourcePolicy:
+    containerPolicies:
+    - containerName: '*'
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+  updatePolicy:
+    updateMode: Auto

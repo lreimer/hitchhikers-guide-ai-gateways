@@ -37,7 +37,7 @@ Prerequisites:
 The agentgateway controller release is shared at the cluster level in the
 `agentgateway-system` namespace. Demo resources are installed in the dedicated
 `agentgateway-demo` namespace by default, separate from Bifrost. Set
-`AGENTGATEWAY_NAMESPACE` to override it. The generated proxy Service is
+`AGENTGATEWAY_NAMESPACE` (or `NAMESPACE`) to override it. The generated proxy Service is
 `ClusterIP` only, and routes are restricted to the Gateway's namespace.
 
 Installation first shuts down any previous proxy, then writes the strict policy
@@ -159,6 +159,12 @@ cost and quota usage. Real-provider key substitution is supported by the
 configuration but is not part of unattended validation.
 
 ## Configuration and limits
+
+The combined LLM authentication, model authorization, and quota policy targets
+only `agentgateway-llm` and `agentgateway-readiness` HTTPRoutes, not the Gateway.
+The [MCP federation add-on](mcp/README.md) reuses the same controller and proxy
+with a separate `/mcp` route and JWT policy. It does not use LLM client keys,
+provider credentials, inference calls, or token budgets.
 
 | Setting | Default | Description |
 | --- | --- | --- |

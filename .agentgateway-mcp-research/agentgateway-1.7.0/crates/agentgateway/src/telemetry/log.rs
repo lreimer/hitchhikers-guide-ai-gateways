@@ -1,0 +1,3950 @@
+use std::borrow::Cow;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use agent_core::metrics::CustomField;
+use agent_core::strng::{RichStrng, Strng};
+use agent_core::telemetry::{
+	OptionExt, ValueBag, current_connection_id, current_request_id, debug, display, quoted,
+};
+use agent_core::{Timestamp, strng};
+use bytes::{Buf, Bytes};
+use crossbeam::atomic::AtomicCell;
+use frozen_collections::FzHashSet;
+use http_body::Frame;
+use indexmap::IndexMap;
+use itertools::Itertools;
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
+use opentelemetry::trace::{SpanKind, Status};
+use opentelemetry::{Key, KeyValue};
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use rust_decimal::prelude::ToPrimitive;
+use serde::de::DeserializeOwned;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+use tracing::{Level, debug, trace};
+use value_bag::visit::Visit;
+
+use crate::cel::{ContextBuilder, Expression, LLMContext};
+use crate::http::substrate::ateattr;
+use crate::http::substrate::ateattr::{ResumeDisposition, RouteOutcome};
+use crate::http::{Request, health};
+use crate::llm::catalog::{CostLookupStatus, ModelCatalog};
+use crate::llm::{DetectedOperation, InputFormat};
+use crate::mcp::{MCPInfo, MCPOperation};
+use crate::proxy::{ProxyResponseReason, dtrace};
+use crate::telemetry::metrics::{
+	CostCatalogLookupLabels, ErrorTypeLabel, GenAIErrorType, GenAILabels, GenAILabelsTokenUsage,
+	GenAIRequestDurationLabels, HTTPLabels, MCPCall, Metrics, OutboundCallLabels, RouteIdentifier,
+	SubstrateRouteLabels,
+};
+use crate::telemetry::trc::TraceParent;
+use crate::telemetry::{log_store, semconv, trc};
+use crate::transport::stream::{TCPConnectionInfo, TLSConnectionInfo};
+use crate::types::agent::{BackendInfo, BindKey, ListenerName, RouteName, Target};
+use crate::types::loadbalancer::ActiveHandle;
+use crate::{a2a, cel, llm, mcp};
+
+fn u64_to_i64(value: Option<u64>) -> Option<i64> {
+	value.map(|value| value.min(i64::MAX as u64) as i64)
+}
+
+fn u128_to_i64(value: u128) -> i64 {
+	value.min(i64::MAX as u128) as i64
+}
+
+struct DatabaseAttributes {
+	json: Box<str>,
+	agentgateway_user: Option<String>,
+	agentgateway_group: Option<String>,
+	user_agent_name: Option<String>,
+}
+
+struct HttpSemconvAttributes<'a> {
+	client_address: String,
+	server_address: Option<&'a str>,
+	server_port: Option<u16>,
+	url_scheme: &'a str,
+	url_path: Option<&'a str>,
+	url_query: Option<&'a str>,
+	network_protocol_version: Option<&'static str>,
+}
+
+impl<'a> HttpSemconvAttributes<'a> {
+	fn new(log: &'a RequestLog) -> Self {
+		let (url_path, url_query) = log.path.as_deref().map_or((None, None), |path| {
+			let (path, query) = semconv::path_and_query(path);
+			(Some(path), query)
+		});
+
+		Self {
+			client_address: log.tcp_info.peer_addr.ip().to_string(),
+			server_address: log.host.as_deref(),
+			server_port: log.server_port,
+			url_scheme: log.scheme.as_ref().map_or_else(
+				|| {
+					if log.tls_info.is_some() {
+						"https"
+					} else {
+						"http"
+					}
+				},
+				|scheme| scheme.as_str(),
+			),
+			url_path,
+			url_query,
+			network_protocol_version: log.version.as_ref().and_then(semconv::protocol_version),
+		}
+	}
+
+	fn apply<'b>(&'b self, attributes: &mut Vec<(&'b str, Option<ValueBag<'b>>)>) {
+		attributes
+			.reserve(1 + usize::from(self.server_port.is_some()) + usize::from(self.url_query.is_some()));
+
+		for (key, value) in &mut *attributes {
+			*key = semconv::http_attribute(key);
+			match *key {
+				semconv::attribute::CLIENT_ADDRESS => {
+					*value = Some(self.client_address.as_str().into());
+				},
+				semconv::attribute::SERVER_ADDRESS => {
+					*value = self.server_address.map(Into::into);
+				},
+				semconv::attribute::URL_PATH => {
+					*value = self.url_path.map(Into::into);
+				},
+				semconv::attribute::NETWORK_PROTOCOL_VERSION => {
+					*value = self.network_protocol_version.map(Into::into);
+				},
+				_ => {},
+			}
+		}
+
+		attributes.push((semconv::attribute::URL_SCHEME, Some(self.url_scheme.into())));
+
+		if let Some(port) = self.server_port {
+			attributes.push((
+				semconv::attribute::SERVER_PORT,
+				Some(i64::from(port).into()),
+			));
+		}
+
+		if let Some(query) = self.url_query {
+			attributes.push((semconv::attribute::URL_QUERY, Some(query.into())));
+		}
+	}
+}
+
+pub(super) fn database_llm_payload(
+	mode: Option<crate::types::frontend::DatabaseLlmMode>,
+	input_messages: Option<&[agent_llm::types::NormalizedMessage]>,
+	info: Option<&LLMContext>,
+) -> Option<log_store::StoredRequestLogPayload> {
+	if mode == Some(crate::types::frontend::DatabaseLlmMode::Metadata) {
+		return None;
+	}
+	let request_prompt_json = if mode == Some(crate::types::frontend::DatabaseLlmMode::Full) {
+		input_messages
+			.and_then(|messages| serde_json::to_value(messages).ok())
+			.or_else(|| {
+				info?
+					.prompt
+					.as_ref()
+					.and_then(|prompt| serde_json::to_value(prompt.as_ref()).ok())
+			})
+	} else {
+		info?
+			.prompt
+			.as_ref()
+			.and_then(|prompt| serde_json::to_value(prompt.as_ref()).ok())
+	};
+	let response_completion_json = if mode == Some(crate::types::frontend::DatabaseLlmMode::Full) {
+		info.and_then(|info| {
+			// Response capture exposes visible text and structured tool calls separately. Recombine them
+			// into the same provider-neutral message shape used for the stored request.
+			let mut parts = info
+				.completion
+				.iter()
+				.flatten()
+				// Tool-call-only responses may initialize completion capture with an empty string. Omitting
+				// it prevents a phantom empty assistant message in the conversation view.
+				.filter(|completion| !completion.trim().is_empty())
+				.map(|completion| agent_llm::types::NormalizedMessagePart::text(completion.as_str().into()))
+				.collect::<Vec<_>>();
+			parts.extend(info.tool_calls.iter().flatten().map(|call| {
+				agent_llm::types::NormalizedMessagePart::tool_call(
+					call.id.clone(),
+					call.name.clone(),
+					call.arguments.clone(),
+				)
+			}));
+			if parts.is_empty() {
+				return None;
+			}
+			serde_json::to_value([agent_llm::types::NormalizedMessage {
+				role: "assistant".into(),
+				parts,
+			}])
+			.ok()
+		})
+	} else {
+		info.and_then(|info| {
+			info
+				.completion
+				.as_ref()
+				.and_then(|completion| serde_json::to_value(completion).ok())
+		})
+	};
+	(request_prompt_json.is_some() || response_completion_json.is_some()).then_some(
+		log_store::StoredRequestLogPayload {
+			request_prompt_json,
+			response_completion_json,
+		},
+	)
+}
+
+fn database_attributes(kv: &[(&str, Option<ValueBag>)]) -> DatabaseAttributes {
+	let mut agentgateway_user = None;
+	let mut agentgateway_group = None;
+	let mut user_agent_name = None;
+	for (key, value) in kv {
+		let Some(value) = value else {
+			continue;
+		};
+		match *key {
+			"agentgateway.user" => {
+				agentgateway_user = string_attribute(value);
+			},
+			"agentgateway.group" => {
+				agentgateway_group = string_attribute(value);
+			},
+			"user_agent.name" => {
+				user_agent_name = string_attribute(value);
+			},
+			_ => {},
+		}
+	}
+	let json = serde_json::to_string(&DatabaseAttributeMap(kv))
+		.unwrap_or_else(|_| "{}".to_string())
+		.into_boxed_str();
+	DatabaseAttributes {
+		json,
+		agentgateway_user,
+		agentgateway_group,
+		user_agent_name,
+	}
+}
+
+struct DatabaseAttributeMap<'a>(&'a [(&'a str, Option<ValueBag<'a>>)]);
+
+impl Serialize for DatabaseAttributeMap<'_> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let len = self.0.iter().filter(|(_, value)| value.is_some()).count();
+		let mut map = serializer.serialize_map(Some(len))?;
+		for (key, value) in self.0 {
+			if let Some(value) = value {
+				map.serialize_entry(key, value)?;
+			}
+		}
+		map.end()
+	}
+}
+
+fn string_attribute(value: &ValueBag) -> Option<String> {
+	struct StringVisitor(Option<String>);
+
+	impl<'v> Visit<'v> for StringVisitor {
+		fn visit_any(&mut self, _value: ValueBag) -> Result<(), value_bag::Error> {
+			Ok(())
+		}
+
+		fn visit_str(&mut self, value: &str) -> Result<(), value_bag::Error> {
+			let value = value.trim();
+			if !value.is_empty() {
+				self.0 = Some(value.to_string());
+			}
+			Ok(())
+		}
+	}
+
+	let mut visitor = StringVisitor(None);
+	let _ = value.visit(&mut visitor);
+	visitor.0
+}
+
+fn user_agent_name(req: Option<&cel::RequestSnapshot>) -> Option<String> {
+	let value = req?
+		.headers
+		.get(::http::header::USER_AGENT)?
+		.to_str()
+		.ok()?
+		.trim();
+	if value.is_empty() {
+		return None;
+	}
+	let end = value
+		.find(|c: char| c == '/' || c.is_ascii_whitespace() || c == ';' || c == '(')
+		.unwrap_or(value.len());
+	let name = value[..end].trim();
+	(!name.is_empty()).then(|| name.to_string())
+}
+
+fn api_key_name(req: Option<&cel::RequestSnapshot>) -> Option<String> {
+	req?
+		.api_key
+		.as_ref()?
+		.metadata
+		.get("name")?
+		.as_str()
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(ToOwned::to_owned)
+}
+
+/// AsyncLog is a wrapper around an item that can be atomically set.
+/// The intent is to provide additional info to the log after we have lost the RequestLog reference,
+/// generally for things that rely on the response body.
+#[derive(Clone)]
+pub struct AsyncLog<T>(Arc<AtomicCell<Option<T>>>);
+
+impl<T: Clone> AsyncLog<T> {
+	// load_clone is only a best-effort snapshot. It temporarily removes the value so it can clone it,
+	// then stores the clone back. A concurrent store/non_atomic_mutate between those operations can be
+	// lost when we restore `cur`, so callers must not rely on this as an atomic read.
+	pub fn load_clone(&self) -> Option<T> {
+		let cur = self.0.take();
+		self.0.store(cur.clone());
+		cur
+	}
+}
+
+impl<T> AsyncLog<T> {
+	// non_atomic_mutate is a racey method to modify the current value.
+	// If there is no current value, a default is used.
+	// This is NOT atomically safe; during the mutation, loads() on the item will be empty.
+	// This is ok for our usage cases
+	pub fn non_atomic_mutate(&self, f: impl FnOnce(&mut T)) {
+		let Some(mut cur) = self.0.take() else {
+			return;
+		};
+		f(&mut cur);
+		self.0.store(Some(cur));
+	}
+}
+
+impl<T: Default> AsyncLog<T> {
+	// Like non_atomic_mutate, but initializes with T::default() when the cell is empty
+	// instead of skipping the mutation.
+	pub fn mutate_or_default(&self, f: impl FnOnce(&mut T)) {
+		let mut cur = self.0.take().unwrap_or_default();
+		f(&mut cur);
+		self.0.store(Some(cur));
+	}
+}
+
+impl<T> AsyncLog<T> {
+	pub fn store(&self, v: Option<T>) {
+		self.0.store(v)
+	}
+	pub fn take(&self) -> Option<T> {
+		self.0.take()
+	}
+}
+
+impl<T: Copy> AsyncLog<T> {
+	pub fn load(&self) -> Option<T> {
+		self.0.load()
+	}
+}
+
+impl<T> Default for AsyncLog<T> {
+	fn default() -> Self {
+		AsyncLog(Arc::new(AtomicCell::new(None)))
+	}
+}
+
+impl<T: Debug> Debug for AsyncLog<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AsyncLog").finish_non_exhaustive()
+	}
+}
+
+/// Per-request accumulator of prompt-guard guardrail evaluations.
+pub type GuardrailLog = AsyncLog<Vec<cel::GuardrailInfo>>;
+
+/// Per-request accumulator of mcpGuardrails dynamic metadata.
+pub type McpGuardrailsLog = AsyncLog<mcp::guardrails::McpGuardrailsDynamicMetadata>;
+
+#[derive(serde::Serialize, Debug, Default, Clone)]
+pub struct MetricsConfig {
+	pub metric_fields: MetricFields,
+	pub excluded_metrics: FzHashSet<String>,
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct Config {
+	/// Deprecated: use frontendPolicies.accessLog
+	pub filter: Option<Arc<cel::Expression>>,
+	/// Deprecated: use frontendPolicies.accessLog
+	pub fields: LoggingFields,
+	/// Compiled standard attributes, replaced on config reload and snapshotted per request.
+	#[serde(skip)]
+	pub database_fields: Arc<arc_swap::ArcSwap<LoggingFields>>,
+	/// Compiled `standardAttributes.session`, replaced on config reload.
+	#[serde(skip)]
+	pub session: Arc<arc_swap::ArcSwapOption<cel::Expression>>,
+	/// Level sets the level for logs
+	pub level: String,
+	/// Format sets the logging format (text or json)
+	pub format: crate::LoggingFormat,
+	/// Optional request log database sink.
+	pub database: Option<crate::telemetry::log_store::Config>,
+}
+
+#[derive(serde::Serialize, Default, Clone, Debug)]
+pub struct LoggingFields {
+	pub remove: Arc<FzHashSet<String>>,
+	pub add: Arc<OrderedStringMap<Arc<cel::Expression>>>,
+}
+
+#[derive(serde::Serialize, Default, Clone, Debug)]
+pub struct MetricFields {
+	pub add: Arc<OrderedStringMap<Arc<cel::Expression>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderedStringMap<V> {
+	map: std::collections::HashMap<Box<str>, V>,
+	order: Box<[Box<str>]>,
+}
+
+impl<V> OrderedStringMap<V> {}
+
+impl<V> OrderedStringMap<V> {
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+	pub fn len(&self) -> usize {
+		self.map.len()
+	}
+	pub fn contains_key(&self, k: &str) -> bool {
+		self.map.contains_key(k)
+	}
+	pub fn values_unordered(&self) -> impl Iterator<Item = &V> {
+		self.map.values()
+	}
+	pub fn iter(&self) -> impl Iterator<Item = (&Box<str>, &V)> {
+		self
+			.order
+			.iter()
+			.map(|k| (k, self.map.get(k).expect("key must be present")))
+	}
+}
+
+impl<V> Default for OrderedStringMap<V> {
+	fn default() -> Self {
+		Self {
+			map: Default::default(),
+			order: Default::default(),
+		}
+	}
+}
+
+impl<V: Serialize> Serialize for OrderedStringMap<V> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let mut m = serializer.serialize_map(Some(self.len()))?;
+		for (k, v) in self.iter() {
+			m.serialize_entry(k.as_ref(), v)?;
+		}
+		m.end()
+	}
+}
+
+impl<'de, V: DeserializeOwned> Deserialize<'de> for OrderedStringMap<V> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let im = IndexMap::<String, V>::deserialize(deserializer)?;
+		Ok(OrderedStringMap::from_iter(im))
+	}
+}
+
+#[cfg(feature = "schema")]
+impl<V: schemars::JsonSchema> schemars::JsonSchema for OrderedStringMap<V> {
+	fn schema_name() -> std::borrow::Cow<'static, str> {
+		format!("OrderedStringMap_{}", V::schema_name()).into()
+	}
+
+	fn json_schema(schema_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		<std::collections::BTreeMap<String, V>>::json_schema(schema_gen)
+	}
+}
+
+impl<K, V> FromIterator<(K, V)> for OrderedStringMap<V>
+where
+	K: AsRef<str>,
+{
+	fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+		let items = iter.into_iter().collect_vec();
+		let order: Box<[Box<str>]> = items.iter().map(|(k, _)| k.as_ref().into()).collect();
+		let map: std::collections::HashMap<Box<str>, V> = items
+			.into_iter()
+			.map(|(k, v)| (k.as_ref().into(), v))
+			.collect();
+		Self { map, order }
+	}
+}
+
+impl LoggingFields {
+	pub fn has(&self, k: &str) -> bool {
+		self.remove.contains(k) || self.add.contains_key(k)
+	}
+}
+
+fn json_value_to_value_bag(v: &Value) -> ValueBag<'_> {
+	// serde_json::Number::as_f64 also succeeds for integers; only convert numbers
+	// that were actually stored as f64 so large integers stay exact.
+	if let Value::Number(n) = v
+		&& n.is_f64()
+		&& let Some(f) = n.as_f64()
+	{
+		ValueBag::from_f64(f)
+	} else {
+		ValueBag::capture_serde1(v)
+	}
+}
+
+/// The incoming trace context picks which setting applies: `random_sampling` when the request has
+/// no trace, `client_sampling` when it has one that is sampled, `parent_not_sampled` when it has
+/// one that is not.
+#[derive(Debug, Default)]
+pub struct TraceSampler {
+	pub random_sampling: Option<Arc<cel::Expression>>,
+	pub client_sampling: Option<Arc<cel::Expression>>,
+	pub parent_not_sampled: Option<Arc<cel::Expression>>,
+}
+
+impl TraceSampler {
+	/// Exactly one of the three settings applies to any given request.
+	pub fn trace_sampled(&self, req: &Request, tp: Option<&TraceParent>) -> (bool, &'static str) {
+		let TraceSampler {
+			random_sampling,
+			client_sampling,
+			parent_not_sampled,
+		} = &self;
+		let eval = |expr: &Option<Arc<cel::Expression>>, default: bool| match expr {
+			Some(e) => cel::Executor::new_request(req).eval_rng(e.as_ref()),
+			None => default,
+		};
+
+		match tp {
+			None => match eval(random_sampling, false) {
+				true => (true, "sample (random)"),
+				false => (false, "not sampled (random)"),
+			},
+			Some(tp) if tp.is_sampled() => match eval(client_sampling, true) {
+				true => (true, "sample (client)"),
+				false => (false, "not sampled (client)"),
+			},
+			Some(_) => match eval(parent_not_sampled, false) {
+				true => (true, "sample (unsampled parent)"),
+				false => (false, "not sampled (unsampled parent)"),
+			},
+		}
+	}
+}
+
+#[derive(Debug)]
+pub struct CelLogging {
+	pub cel_context: cel::ContextBuilder,
+	pub filter: Option<Arc<cel::Expression>>,
+	pub fields: LoggingFields,
+	pub otlp_filter: Option<Arc<cel::Expression>>,
+	pub otlp_fields: LoggingFields,
+	pub database_fields: LoggingFields,
+	pub metric_fields: MetricFields,
+}
+
+pub struct CelLoggingExecutor<'a> {
+	pub executor: cel::Executor<'a>,
+	pub filter: &'a Option<Arc<cel::Expression>>,
+	pub fields: &'a LoggingFields,
+	pub otlp_filter: &'a Option<Arc<cel::Expression>>,
+	pub otlp_fields: &'a LoggingFields,
+	pub database_fields: &'a LoggingFields,
+	pub metric_fields: &'a MetricFields,
+}
+
+impl<'a> CelLoggingExecutor<'a> {
+	fn eval_filter(&self) -> bool {
+		self.eval_filter_with(self.filter)
+	}
+
+	fn eval_otlp_filter(&self) -> bool {
+		self.eval_filter_with(self.otlp_filter)
+	}
+
+	fn eval_filter_with(&self, filter: &Option<Arc<cel::Expression>>) -> bool {
+		match filter.as_deref() {
+			Some(f) => self.executor.eval_bool(f),
+			None => true,
+		}
+	}
+
+	pub fn eval(
+		&self,
+		fields: &'a OrderedStringMap<Arc<Expression>>,
+	) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval_keep_empty(fields, false)
+	}
+
+	pub fn eval_keep_empty(
+		&self,
+		fields: &'a OrderedStringMap<Arc<Expression>>,
+		keep_empty: bool,
+	) -> Vec<(Cow<str>, Option<Value>)> {
+		let mut raws = Vec::with_capacity(fields.len());
+		for (k, v) in fields.iter() {
+			let field = self.executor.eval(v.as_ref());
+			if let Err(err) = &field {
+				trace!(target: "cel", ?err, expression=?v, "expression failed");
+			}
+			if let Ok(cel::Value::Null) = &field {
+				trace!(target: "cel",  expression=?v, "expression evaluated to null");
+			}
+			let celv = field.ok().filter(|v| !matches!(v, cel::Value::Null));
+
+			// We return Option here to match the schema but don't bother adding None values since they
+			// will be dropped anyways
+			if let Some(celv) = celv {
+				Self::resolve_value(&mut raws, Cow::Borrowed(k.as_ref()), &celv, false);
+			} else if keep_empty {
+				raws.push((Cow::Borrowed(k.as_ref()), None));
+			}
+		}
+		raws
+	}
+
+	fn resolve_value(
+		raws: &mut Vec<(Cow<'a, str>, Option<Value>)>,
+		k: Cow<'a, str>,
+		celv: &cel::Value,
+		always_flatten: bool,
+	) {
+		match agent_celx::FlattenSignal::from_value(celv) {
+			Some(agent_celx::FlattenSignal::List(li)) => {
+				raws.reserve(li.len());
+				for (idx, v) in li.as_ref().iter().enumerate() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{idx}")), v, false);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::ListRecursive(li)) => {
+				raws.reserve(li.len());
+				for (idx, v) in li.as_ref().iter().enumerate() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{idx}")), v, true);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::Map(m)) => {
+				raws.reserve(m.len());
+				for (mk, mv) in m.iter() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{mk}")), mv, false);
+				}
+				return;
+			},
+			Some(agent_celx::FlattenSignal::MapRecursive(m)) => {
+				raws.reserve(m.len());
+				for (mk, mv) in m.iter() {
+					Self::resolve_value(raws, Cow::Owned(format!("{k}.{mk}")), mv, true);
+				}
+				return;
+			},
+			None => {},
+		}
+
+		if always_flatten {
+			match celv {
+				cel::Value::List(li) => {
+					raws.reserve(li.len());
+					for (idx, v) in li.as_ref().iter().enumerate() {
+						let nk = Cow::Owned(format!("{k}.{idx}"));
+						Self::resolve_value(raws, nk, v, true);
+					}
+				},
+				cel::Value::Map(m) => {
+					raws.reserve(m.len());
+					for (mk, mv) in m.iter() {
+						let nk = Cow::Owned(format!("{k}.{mk}"));
+						Self::resolve_value(raws, nk, mv, true);
+					}
+				},
+				_ => raws.push((k, celv.json().ok())),
+			}
+		} else {
+			raws.push((k, celv.json().ok()));
+		}
+	}
+
+	fn eval_additions(&self) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval(&self.fields.add)
+	}
+
+	fn eval_otlp_additions(&self) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval(&self.otlp_fields.add)
+	}
+
+	fn eval_database_additions(&self) -> Vec<(Cow<str>, Option<Value>)> {
+		self.eval(&self.database_fields.add)
+	}
+}
+
+impl CelLogging {
+	pub fn new(cfg: Config, metrics: MetricsConfig) -> Self {
+		let database_fields = if cfg.database.is_some() {
+			cfg.database_fields.load().as_ref().clone()
+		} else {
+			LoggingFields::default()
+		};
+		let mut cel_context = cel::ContextBuilder::new();
+		if let Some(f) = &cfg.filter {
+			cel_context.register_log_expression(f.as_ref());
+		}
+		for v in cfg.fields.add.values_unordered() {
+			cel_context.register_log_expression(v.as_ref());
+		}
+		for v in database_fields.add.values_unordered() {
+			cel_context.register_log_expression(v.as_ref());
+		}
+		for v in metrics.metric_fields.add.values_unordered() {
+			cel_context.register_log_expression(v.as_ref());
+		}
+		if cfg.database.is_some() {
+			cel_context.register_log_request();
+		}
+
+		Self {
+			cel_context,
+			filter: cfg.filter,
+			fields: cfg.fields,
+			otlp_filter: None,
+			otlp_fields: LoggingFields::default(),
+			database_fields,
+			metric_fields: metrics.metric_fields,
+		}
+	}
+
+	pub fn register(&mut self, fields: &LoggingFields) {
+		for v in fields.add.values_unordered() {
+			self.cel_context.register_log_expression(v.as_ref());
+		}
+	}
+
+	pub fn ctx(&mut self) -> &mut ContextBuilder {
+		&mut self.cel_context
+	}
+
+	pub fn build<'a>(&'a self, inputs: CelLoggingBuildInputs<'a>) -> CelLoggingExecutor<'a> {
+		let CelLogging {
+			cel_context: _,
+			filter,
+			fields,
+			otlp_filter,
+			otlp_fields,
+			database_fields,
+			metric_fields,
+		} = self;
+		let mut executor = if inputs.req.is_none() && inputs.source_context.is_some() {
+			// TCP case: use new_tcp_logger
+			cel::Executor::new_tcp_logger(inputs.source_context, inputs.end_time)
+		} else {
+			// HTTP case: use new_logger
+			cel::Executor::new_logger(
+				inputs.req,
+				inputs.resp,
+				inputs.llm_response,
+				inputs.mcp,
+				inputs.guardrails,
+				Some(inputs.end_time),
+				inputs.proxy,
+			)
+		};
+		if let Some(md) = inputs.mcp_guardrails {
+			executor.mcp_guardrails = cel::ExtensionOrDirect::Direct(Some(md));
+		}
+		CelLoggingExecutor {
+			executor,
+			filter,
+			fields,
+			otlp_filter,
+			otlp_fields,
+			database_fields,
+			metric_fields,
+		}
+	}
+}
+
+pub struct CelLoggingBuildInputs<'a> {
+	pub req: Option<&'a cel::RequestSnapshot>,
+	pub resp: Option<&'a cel::ResponseSnapshot>,
+	pub llm_response: Option<&'a LLMContext>,
+	pub mcp: Option<&'a MCPInfo>,
+	pub guardrails: Option<&'a Vec<cel::GuardrailInfo>>,
+	pub mcp_guardrails: Option<&'a mcp::guardrails::McpGuardrailsDynamicMetadata>,
+	pub end_time: &'a cel::RequestTime,
+	pub proxy: Option<&'a cel::ProxyContext>,
+	pub source_context: Option<&'a cel::SourceContext>,
+}
+
+#[derive(Debug)]
+pub struct DropOnLog {
+	log: Option<RequestLog>,
+	debug_tracer: Option<dtrace::DebugTracer>,
+}
+
+impl DropOnLog {
+	pub fn as_mut(&mut self) -> Option<&mut RequestLog> {
+		self.log.as_mut()
+	}
+	pub fn as_ref(&self) -> Option<&RequestLog> {
+		self.log.as_ref()
+	}
+	pub fn with(&mut self, f: impl FnOnce(&mut RequestLog)) {
+		if let Some(l) = self.log.as_mut() {
+			f(l)
+		}
+	}
+
+	/// Computes (health, eviction_duration, restore_health) for finish_request.
+	/// `unhealthy` should already be evaluated (preferably with the shared CEL executor when available).
+	/// When no CEL expression is set, the default treats 5xx, connection failures, or server-side
+	/// gRPC failures as unhealthy.
+	#[cfg(test)]
+	fn default_unhealthy(log: &RequestLog) -> bool {
+		Self::default_unhealthy_for_status(log, log.status)
+	}
+
+	fn default_unhealthy_for_status(
+		log: &RequestLog,
+		status: Option<crate::http::StatusCode>,
+	) -> bool {
+		status.is_none_or(|s| s.is_server_error())
+			|| log.grpc_status.load().is_some_and(|status| {
+				// Only codes indicating a backend failure; client-induced codes (INVALID_ARGUMENT,
+				// NOT_FOUND, UNIMPLEMENTED, etc.) must not degrade backend health.
+				matches!(
+					tonic::Code::from(status as i32),
+					tonic::Code::Unknown
+						| tonic::Code::DeadlineExceeded
+						| tonic::Code::Internal
+						| tonic::Code::Unavailable
+						| tonic::Code::DataLoss
+				)
+			})
+	}
+
+	fn eviction_unhealthy(
+		log: &RequestLog,
+		status: Option<crate::http::StatusCode>,
+		cel_exec: &CelLoggingExecutor<'_>,
+	) -> bool {
+		let default_unhealthy = Self::default_unhealthy_for_status(log, status);
+		let Some(policy) = &log.health_policy else {
+			return default_unhealthy;
+		};
+		let Some(expr) = &policy.unhealthy_expression else {
+			return default_unhealthy;
+		};
+		cel_exec.executor.eval_bool(expr.as_ref())
+	}
+
+	/// Returns (health, eviction_duration, restore_health).
+	fn eviction_decision(
+		health_policy: &Option<health::Policy>,
+		retry_backoff: Option<Duration>,
+		retry_after: Option<Duration>,
+		current_health: f64,
+		consecutive_failure_count: u64,
+		times_ejected: u64,
+		unhealthy: bool,
+	) -> (bool, Option<Duration>, Option<f64>) {
+		let Some(policy) = health_policy else {
+			let health = !unhealthy;
+			return (health, None, None);
+		};
+		let fallback_duration = retry_after.or(retry_backoff);
+		policy.eviction_decision(
+			current_health,
+			consecutive_failure_count,
+			times_ejected,
+			unhealthy,
+			fallback_duration,
+		)
+	}
+
+	fn add_llm_metrics(
+		log: &RequestLog,
+		route_identifier: &RouteIdentifier,
+		duration: Duration,
+		llm_response: Option<&LLMContext>,
+		custom_metric_fields: &CustomField,
+	) {
+		let request = log.llm_request.as_ref();
+		let Some(provider) = llm_response
+			.map(|response| response.provider.clone())
+			.or_else(|| request.map(|request| request.provider.clone()))
+		else {
+			return;
+		};
+		let request_model = llm_response
+			.map(|response| response.request_model.clone())
+			.or_else(|| request.map(|request| request.request_model.clone()));
+		let gen_ai_labels = Arc::new(GenAILabels {
+			gen_ai_operation_name: request
+				.map(|request| gen_ai_operation_name(request.input_format))
+				.map(RichStrng::from)
+				.into(),
+			gen_ai_system: provider.into(),
+			gen_ai_request_model: request_model.into(),
+			gen_ai_response_model: llm_response
+				.and_then(|response| response.response_model.clone())
+				.into(),
+			custom: custom_metric_fields.clone(),
+			route: route_identifier.clone(),
+		});
+
+		log
+			.metrics
+			.gen_ai_request_duration
+			.get_or_create(&GenAIRequestDurationLabels {
+				common: gen_ai_labels.clone().into(),
+				error: gen_ai_operation_failed(log)
+					.then_some(ErrorTypeLabel {
+						error_type: GenAIErrorType::Other,
+					})
+					.into(),
+			})
+			.observe(duration.as_secs_f64());
+
+		if let Some(llm_response) = llm_response {
+			if let Some(status) = llm_response.cost_status {
+				log
+					.metrics
+					.cost_catalog_lookups
+					.get_or_create(&CostCatalogLookupLabels {
+						status,
+						common: gen_ai_labels.clone().into(),
+					})
+					.inc();
+				// Pair the lookup metric with a debug line so an operator can see *why* a
+				// request wasn't priced (e.g. response model "gpt-5.5-2026-04-23" vs catalog
+				// "gpt-5.5") without scraping metrics.
+				match status {
+					CostLookupStatus::Missing => debug!(
+						provider = %llm_response.provider,
+						request_model = %llm_response.request_model,
+						response_model = ?llm_response.response_model,
+						"no model cost: model not found in catalog"
+					),
+					CostLookupStatus::Unpriced => debug!(
+						provider = %llm_response.provider,
+						request_model = %llm_response.request_model,
+						response_model = ?llm_response.response_model,
+						"no model cost: model found but has no rates"
+					),
+					CostLookupStatus::Exact | CostLookupStatus::NoCatalog => {},
+				}
+			}
+			if let Some(cost) = llm_response
+				.cost
+				.as_ref()
+				.and_then(|cost| cost.total().to_f64())
+			{
+				log
+					.metrics
+					.gen_ai_cost
+					.get_or_create(&gen_ai_labels)
+					.inc_by(cost);
+			}
+			if let Some(it) = llm_response.input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(it as f64)
+			}
+			if let Some(ot) = llm_response.output_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("output").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(ot as f64)
+			}
+			if let Some(crt) = llm_response.cached_input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input_cache_read").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(crt as f64)
+			}
+			if let Some(cwt) = llm_response.cache_creation_input_tokens {
+				log
+					.metrics
+					.gen_ai_token_usage
+					.get_or_create(&GenAILabelsTokenUsage {
+						gen_ai_token_type: strng::literal!("input_cache_write").into(),
+						common: gen_ai_labels.clone().into(),
+					})
+					.observe(cwt as f64)
+			}
+			if let Some(ttft) = llm_response
+				.time_to_first_token
+				.and_then(|duration| duration.0.to_std().ok())
+			{
+				log
+					.metrics
+					.gen_ai_time_to_first_token
+					.get_or_create(&gen_ai_labels)
+					.observe(ttft.as_secs_f64());
+			}
+			if let Some(time_per_output_token) = llm_response
+				.time_per_output_token
+				.and_then(|duration| duration.0.to_std().ok())
+			{
+				log
+					.metrics
+					.gen_ai_time_per_output_token
+					.get_or_create(&gen_ai_labels)
+					.observe(time_per_output_token.as_secs_f64());
+			}
+			if !llm_response.inter_chunk_latencies.is_empty() {
+				let hist = log
+					.metrics
+					.gen_ai_inter_chunk_latency
+					.get_or_create(&gen_ai_labels);
+				// Replay the bucketed summary: each bucket's mean is observed `count`
+				// times, so the resulting histogram's per-bucket counts and sum are
+				// identical to what observing every raw gap would have produced.
+				for (count, mean) in llm_response.inter_chunk_latencies.iter() {
+					for _ in 0..count {
+						hist.observe(mean);
+					}
+				}
+			}
+		}
+	}
+}
+
+impl From<RequestLog> for DropOnLog {
+	fn from(log: RequestLog) -> Self {
+		Self {
+			log: Some(log),
+			debug_tracer: dtrace::DebugTracer::active(),
+		}
+	}
+}
+
+fn proxy_context(log: &RequestLog) -> cel::ProxyContext {
+	cel::ProxyContext {
+		error: log
+			.error
+			.as_ref()
+			.zip(log.reason)
+			.map(|(message, reason)| cel::ErrorContext {
+				reason: reason.to_string(),
+				message: message.clone(),
+			}),
+		bind: log.bind_name.clone(),
+		gateway: log
+			.listener_name
+			.as_ref()
+			.map(|l| cel::ProxyGatewayContext {
+				namespace: l.gateway_namespace.clone(),
+				name: l.gateway_name.clone(),
+			}),
+		listener: log
+			.listener_name
+			.as_ref()
+			.map(|l| cel::ProxyListenerContext {
+				name: l.listener_name.clone(),
+			}),
+		route: log.route_name.as_ref().map(|r| cel::ProxyRouteContext {
+			namespace: r.namespace.clone(),
+			name: r.name.clone(),
+			kind: r.kind.clone(),
+			rule: r.rule_name.clone(),
+		}),
+		request_processing_duration: log
+			.request_processing_duration
+			.and_then(cel::CelDuration::from_std),
+		upstream_duration: log.upstream_duration.and_then(cel::CelDuration::from_std),
+		response_processing_duration: log
+			.response_processing_duration
+			.and_then(cel::CelDuration::from_std),
+	}
+}
+
+impl RequestLog {
+	pub fn new(
+		cel: CelLogging,
+		metrics: Arc<Metrics>,
+		model_catalog: Arc<ModelCatalog>,
+		start: Timestamp,
+		tcp_info: TCPConnectionInfo,
+	) -> Self {
+		RequestLog {
+			cel,
+			access_log_preset: None,
+			database_llm: Default::default(),
+			input_messages: Default::default(),
+			metrics,
+			model_catalog,
+			start,
+			request_processing_start: Instant::now(),
+			request_processing_duration: None,
+			upstream_duration: None,
+			response_processing_start: None,
+			response_processing_duration: None,
+			connection_id: current_connection_id(),
+			request_id: current_request_id(),
+			tcp_info,
+			tls_info: None,
+			tracer: None,
+			trace_spans: Arc::new(Mutex::new(Default::default())),
+			otel_logger: None,
+			endpoint: None,
+			bind_name: None,
+			listener_name: None,
+			route_name: None,
+			backend_info: None,
+			backend_protocol: None,
+			host: None,
+			server_port: None,
+			scheme: None,
+			method: None,
+			path: None,
+			path_match: None,
+			version: None,
+			status: None,
+			reason: None,
+			retry_after: None,
+			health_policy: None,
+			retry_backoff: None,
+			jwt_sub: None,
+			retry_attempt: None,
+			error: None,
+			grpc_status: Default::default(),
+			mcp_status: Default::default(),
+			incoming_span: None,
+			outgoing_span: None,
+			llm_request: None,
+			llm_response: Default::default(),
+			original_model: None,
+			guardrails: Default::default(),
+			mcp_guardrails: Default::default(),
+			budgets: Vec::new(),
+			a2a_method: None,
+			a2a_response: None,
+			inference_pool: None,
+			ate_actor_name: None,
+			ate_actor_uid: None,
+			ate_atespace: None,
+			ate_router_resume: None,
+			ate_router_route_duration: None,
+			ate_router_outcome: None,
+			request_handle: None,
+			request_snapshot: None,
+			response_snapshot: None,
+			source_context: None,
+			response_bytes: 0,
+		}
+	}
+
+	pub fn span_writer(&self) -> SpanWriter {
+		let inner = self.span_writer_inner().map(Arc::new);
+		SpanWriter { inner }
+	}
+	pub fn insert_span_writer(&self, extensions: &mut ::http::Extensions) {
+		if let Some(inner) = self.span_writer_inner() {
+			extensions.insert(SpanWriter {
+				inner: Some(Arc::new(inner)),
+			});
+		}
+	}
+	fn span_writer_inner(&self) -> Option<SpanWriterInner> {
+		// Early return if there is no tracer enabled at all
+		self.tracer.as_ref()?;
+		let tp = self.outgoing_span.clone()?;
+		if !tp.is_sampled() {
+			return None;
+		}
+
+		Some(SpanWriterInner {
+			parent: tp,
+			inner: self.trace_spans.clone(),
+		})
+	}
+
+	fn finish_request_handle(
+		&self,
+		rh: ActiveHandle,
+		end_time: Timestamp,
+		cel_exec: &CelLoggingExecutor<'_>,
+	) {
+		self.finish_request_handle_with_attempt(rh, end_time, self.status, self.retry_after, cel_exec);
+	}
+
+	fn finish_request_handle_with_attempt(
+		&self,
+		rh: ActiveHandle,
+		end_time: Timestamp,
+		status: Option<crate::http::StatusCode>,
+		retry_after: Option<Duration>,
+		cel_exec: &CelLoggingExecutor<'_>,
+	) {
+		let unhealthy = DropOnLog::eviction_unhealthy(self, status, cel_exec);
+		let (health, eviction_duration, restore_health) = DropOnLog::eviction_decision(
+			&self.health_policy,
+			self.retry_backoff,
+			retry_after,
+			rh.health_score(),
+			rh.consecutive_failures(),
+			rh.times_ejected(),
+			unhealthy,
+		);
+		rh.finish_request(
+			health,
+			end_time.duration_since(&self.start),
+			eviction_duration,
+			restore_health,
+		);
+	}
+
+	pub(crate) fn finalize_request_handle_for_attempt(
+		&mut self,
+		end_time: Timestamp,
+		status: Option<crate::http::StatusCode>,
+		retry_after: Option<Duration>,
+		response_snapshot: Option<&cel::ResponseSnapshot>,
+		llm_response: Option<&LLMContext>,
+		mcp: Option<&MCPInfo>,
+	) {
+		let cel_end_time = cel::RequestTime(end_time.as_datetime());
+		let proxy_timing = proxy_context(self);
+		let cel_exec = self.cel.build(CelLoggingBuildInputs {
+			req: self.request_snapshot.as_deref(),
+			resp: response_snapshot,
+			llm_response,
+			mcp: mcp.filter(|m| !m.is_empty()),
+			guardrails: None,
+			mcp_guardrails: None,
+			end_time: &cel_end_time,
+			source_context: self.source_context.as_ref(),
+			proxy: Some(&proxy_timing),
+		});
+		let Some(rh) = self.request_handle.take() else {
+			return;
+		};
+		self.finish_request_handle_with_attempt(rh, end_time, status, retry_after, &cel_exec);
+	}
+}
+
+#[derive(Debug)]
+pub struct RequestLog {
+	pub cel: CelLogging,
+	pub access_log_preset: Option<crate::types::frontend::AccessLogPreset>,
+	/// Controls whether normalized LLM prompt/completion content is persisted in the database's
+	/// dedicated payload table. `None` preserves the legacy behavior of persisting content captured
+	/// by CEL expressions. This is independent from CEL attribute capture.
+	pub database_llm: Option<crate::types::frontend::DatabaseLlmMode>,
+	/// Provider-neutral input messages retained for full database payload logging.
+	pub input_messages: Option<Arc<Vec<agent_llm::types::NormalizedMessage>>>,
+	pub metrics: Arc<Metrics>,
+	pub model_catalog: Arc<ModelCatalog>,
+	pub start: Timestamp,
+	pub request_processing_start: Instant,
+	pub request_processing_duration: Option<Duration>,
+	pub upstream_duration: Option<Duration>,
+	pub response_processing_start: Option<Instant>,
+	pub response_processing_duration: Option<Duration>,
+	pub connection_id: Option<u64>,
+	pub request_id: Option<u64>,
+	pub tcp_info: TCPConnectionInfo,
+
+	// Set only for TLS traffic
+	pub tls_info: Option<TLSConnectionInfo>,
+
+	// Set only if the trace is sampled
+	pub tracer: Option<std::sync::Arc<trc::Tracer>>,
+	/// Additional spans created during the request (e.g. upstream call spans).
+	/// These are flushed on drop when tracing is enabled.
+	pub trace_spans: Arc<Mutex<Vec<BufferedSpan>>>,
+
+	// Set only if OTLP logging is configured
+	pub otel_logger: Option<std::sync::Arc<OtelAccessLogger>>,
+
+	pub endpoint: Option<Target>,
+
+	pub bind_name: Option<BindKey>,
+	pub listener_name: Option<ListenerName>,
+	pub route_name: Option<RouteName>,
+	pub backend_info: Option<BackendInfo>,
+	pub backend_protocol: Option<cel::BackendProtocol>,
+
+	pub host: Option<String>,
+	pub scheme: Option<::http::uri::Scheme>,
+	pub method: Option<::http::Method>,
+	pub server_port: Option<u16>,
+	pub path: Option<String>,
+	pub path_match: Option<Strng>,
+	pub version: Option<::http::Version>,
+	pub status: Option<crate::http::StatusCode>,
+	pub reason: Option<ProxyResponseReason>,
+	pub retry_after: Option<Duration>,
+
+	/// Health policy for backend (e.g. AI provider) failover. Set from route policies when request_handle is used.
+	pub health_policy: Option<health::Policy>,
+	/// Retry backoff from route policy; used as fallback eviction duration when health_policy has no explicit duration.
+	pub retry_backoff: Option<Duration>,
+
+	pub jwt_sub: Option<String>,
+
+	pub retry_attempt: Option<u8>,
+	pub error: Option<String>,
+
+	pub grpc_status: AsyncLog<u8>,
+	pub mcp_status: AsyncLog<mcp::MCPInfo>,
+
+	pub incoming_span: Option<trc::TraceParent>,
+	pub outgoing_span: Option<trc::TraceParent>,
+
+	pub llm_request: Option<llm::LLMRequest>,
+	pub llm_response: AsyncLog<llm::LLMInfo>,
+	pub original_model: Option<String>,
+	pub guardrails: GuardrailLog,
+	pub mcp_guardrails: McpGuardrailsLog,
+	pub budgets: Vec<crate::http::budget::BudgetSettlement>,
+
+	pub a2a_method: Option<Strng>,
+	pub a2a_response: Option<a2a::ResponseInfo>,
+
+	pub inference_pool: Option<Target>,
+
+	pub ate_actor_name: Option<String>,
+	pub ate_actor_uid: Option<String>,
+	pub ate_atespace: Option<String>,
+	pub ate_router_resume: Option<ResumeDisposition>,
+	pub ate_router_route_duration: Option<Duration>,
+	pub ate_router_outcome: Option<RouteOutcome>,
+
+	pub request_handle: Option<ActiveHandle>,
+	pub request_snapshot: Option<Arc<cel::RequestSnapshot>>,
+	pub response_snapshot: Option<cel::ResponseSnapshot>,
+	/// Source context for TCP connections (where we don't have an HTTP request)
+	pub source_context: Option<cel::SourceContext>,
+
+	pub response_bytes: u64,
+}
+
+fn request_log_level(error: Option<&str>) -> &'static str {
+	if error.is_some() { "error" } else { "info" }
+}
+
+fn gen_ai_operation_failed(request: &RequestLog) -> bool {
+	// A provider 4xx (such as rate limiting) fails the GenAI operation even though
+	// an inbound HTTP server span does not classify client errors as server failures.
+	request.error.is_some()
+		|| request.status.is_some_and(|status| {
+			status.is_server_error()
+				|| (status.is_client_error() && request.reason == Some(ProxyResponseReason::Upstream))
+		})
+}
+
+fn gen_ai_operation_name(input_format: InputFormat) -> &'static str {
+	match input_format {
+		InputFormat::Completions | InputFormat::Messages | InputFormat::Responses => "chat",
+		InputFormat::Gemini => "generate_content",
+		InputFormat::Embeddings => "embeddings",
+		// These operations have no standard GenAI operation name. Keep the custom values bounded.
+		InputFormat::Realtime => "realtime",
+		InputFormat::Rerank => "rerank",
+		InputFormat::Decisions | InputFormat::SystemOne => "decisions",
+		InputFormat::CountTokens | InputFormat::GeminiCountTokens => "count_tokens",
+		InputFormat::Detect(Some(operation)) => match operation {
+			DetectedOperation::Chat => "chat",
+			DetectedOperation::GenerateContent => "generate_content",
+			DetectedOperation::Embeddings => "embeddings",
+			DetectedOperation::CountTokens => "count_tokens",
+			DetectedOperation::Rerank => "rerank",
+			DetectedOperation::Decisions => "decisions",
+			DetectedOperation::Image => "image_generation",
+			DetectedOperation::Ocr => "ocr",
+			DetectedOperation::Compaction => "compaction",
+			DetectedOperation::Transcription => "transcription",
+			DetectedOperation::Speech => "speech",
+		},
+		// The path is not a known serving endpoint; do not assume it is chat.
+		InputFormat::Detect(None) => "unknown",
+	}
+}
+
+impl Drop for DropOnLog {
+	fn drop(&mut self) {
+		let status = self
+			.log
+			.as_ref()
+			.and_then(|log| log.status.map(|status| status.as_u16()));
+		if let Some(debug_tracer) = &self.debug_tracer {
+			let error = self.log.as_ref().and_then(|log| log.error.clone());
+			debug_tracer.request_completed(status, error);
+		} else {
+			dtrace::trace(|t| {
+				let error = self.log.as_ref().and_then(|log| log.error.clone());
+				t.request_completed(status, error);
+			});
+		}
+		let debug_tracer = self.debug_tracer.clone();
+		dtrace::with_trace(debug_tracer, || {
+			let Some(mut log) = self.log.take() else {
+				return;
+			};
+
+			let route_identifier = RouteIdentifier {
+				bind: (&log.bind_name).into(),
+				gateway: log
+					.listener_name
+					.as_ref()
+					.map(|l| l.as_gateway_name())
+					.into(),
+				listener: log.listener_name.as_ref().map(|l| &l.listener_name).into(),
+				route: log.route_name.as_ref().map(|l| l.as_route_name()).into(),
+				route_rule: log
+					.route_name
+					.as_ref()
+					.and_then(|l| l.rule_name.as_ref())
+					.into(),
+			};
+
+			let is_tcp = matches!(&log.backend_protocol, &Some(cel::BackendProtocol::tcp));
+
+			let mut http_labels = HTTPLabels {
+				backend: log
+					.backend_info
+					.as_ref()
+					.map(|info| info.backend_name.clone())
+					.into(),
+				protocol: log.backend_protocol.into(),
+				route: route_identifier.clone(),
+				method: log.method.clone().into(),
+				status: log.status.as_ref().map(|s| s.as_u16()).into(),
+				reason: log.reason.into(),
+				custom: CustomField::default(),
+			};
+
+			// Always run request_handle/finish_request first so LLM provider eviction (failover) runs
+			// even when logging/tracing/metrics are disabled.
+			let end_time = Timestamp::now();
+			let duration = end_time.duration_since(&log.start);
+			let enable_trace = log.tracer.is_some();
+
+			let mut llm_response: Option<LLMContext> = log
+				.llm_response
+				.take()
+				.map(|llm_info| LLMContext::from_llm_info(llm_info, Some(log.model_catalog.as_ref())));
+			if let Some(llm_response) = llm_response.as_mut() {
+				llm_response.set_token_timing(log.start.as_instant(), end_time.as_instant());
+			}
+			if let Some(llm_response) = llm_response.as_ref() {
+				for budgets in std::mem::take(&mut log.budgets) {
+					budgets.settle(llm_response);
+				}
+			}
+
+			let mcp = log.mcp_status.take();
+			let guardrails = log.guardrails.take().filter(|g| !g.is_empty());
+			let mcp_guardrails = log.mcp_guardrails.take();
+			let request_handle = log.request_handle.take();
+			let cel_end_time = cel::RequestTime(end_time.as_datetime());
+			// The response snapshot is captured before the response body is drained, so
+			// Trailer-only grpc-status values are learned later by the body observer. Copy the final
+			// value back into the snapshot before evaluating access-log CEL fields.
+			if let Some(grpc_status) = log.grpc_status.load()
+				&& let Some(resp) = log.response_snapshot.as_mut()
+			{
+				resp.grpc_status = Some(grpc_status);
+			}
+			let proxy_timing = proxy_context(&log);
+			if let Some(resp) = log.response_snapshot.as_mut() {
+				resp.proxy = Some(proxy_timing.clone());
+			}
+			let cel_exec = log.cel.build(CelLoggingBuildInputs {
+				req: log.request_snapshot.as_deref(),
+				resp: log.response_snapshot.as_ref(),
+				llm_response: llm_response.as_ref(),
+				mcp: mcp.as_ref().filter(|m| !m.is_empty()),
+				guardrails: guardrails.as_ref(),
+				mcp_guardrails: mcp_guardrails.as_ref(),
+				end_time: &cel_end_time,
+				proxy: Some(&proxy_timing),
+				source_context: log.source_context.as_ref(),
+			});
+			if let Some(rh) = request_handle {
+				log.finish_request_handle(rh, end_time, &cel_exec);
+			}
+
+			let custom_metric_fields = CustomField::new(
+				// For metrics, keep empty values which will become 'unknown'
+				cel_exec
+					.eval_keep_empty(&cel_exec.metric_fields.add, true)
+					.into_iter()
+					.map(|(k, v)| {
+						(
+							strng::new(k),
+							v.and_then(|v| match v {
+								Value::String(s) => Some(strng::new(s)),
+								_ => None,
+							}),
+						)
+					}),
+			);
+			http_labels.custom = custom_metric_fields.clone();
+			if !is_tcp {
+				log.metrics.requests.get_or_create(&http_labels).inc();
+			}
+			if log.response_bytes > 0 {
+				log
+					.metrics
+					.response_bytes
+					.get_or_create(&http_labels)
+					.inc_by(log.response_bytes);
+			}
+			// Record HTTP request duration for all requests
+			log
+				.metrics
+				.request_duration
+				.get_or_create(&http_labels)
+				.observe(duration.as_secs_f64());
+			if let (Some(route_duration), Some(outcome)) =
+				(log.ate_router_route_duration, log.ate_router_outcome)
+			{
+				log
+					.metrics
+					.substrate_route_duration
+					.get_or_create(&SubstrateRouteLabels {
+						ate_router_outcome: outcome.into(),
+						ate_router_resume: log.ate_router_resume.unwrap_or_default().into(),
+					})
+					.observe(route_duration.as_secs_f64());
+			}
+
+			if let Some(retry_count) = log.retry_attempt {
+				log
+					.metrics
+					.retries
+					.get_or_create(&http_labels)
+					.inc_by(retry_count as u64);
+			}
+			if !is_tcp {
+				let labels = http_labels.into();
+				if let Some(duration) = log.request_processing_duration {
+					log
+						.metrics
+						.request_processing_duration
+						.get_or_create(&labels)
+						.observe(duration.as_secs_f64());
+				}
+				if let Some(duration) = log.response_processing_duration {
+					log
+						.metrics
+						.response_processing_duration
+						.get_or_create(&labels)
+						.observe(duration.as_secs_f64());
+				}
+			}
+
+			Self::add_llm_metrics(
+				&log,
+				&route_identifier,
+				duration,
+				llm_response.as_ref(),
+				&custom_metric_fields,
+			);
+			if let Some(mcp) = &mcp
+				&& mcp.method_name.is_some()
+			{
+				// Check mcp.method_name is set, so we don't count things like GET and DELETE
+				log
+					.metrics
+					.mcp_requests
+					.get_or_create(&MCPCall {
+						method: mcp.method_name.clone().map(RichStrng::from).into(),
+						resource_type: mcp.resource_type().into(),
+						server: mcp.target_name().map(RichStrng::from).into(),
+						resource: mcp.metric_resource_name().map(RichStrng::from).into(),
+
+						route: route_identifier.clone(),
+						custom: custom_metric_fields.clone(),
+					})
+					.inc();
+			}
+
+			let level = request_log_level(log.error.as_deref());
+			let level_filter = if level == "error" {
+				Level::ERROR
+			} else {
+				Level::INFO
+			};
+			let maybe_enable_log = agent_core::telemetry::enabled("request", &level_filter);
+			let otlp_log_enabled = log.otel_logger.is_some();
+			// For now we only enable this log for LLM requests to keep cost/performance appropriate.
+			let log_store_enabled = log_store::enabled()
+				&& (log.llm_request.is_some()
+					|| llm_response.is_some()
+					|| log
+						.listener_name
+						.as_ref()
+						.is_some_and(|listener| listener.listener_name.as_str() == llm::LOCAL_LISTENER_NAME)
+					|| log
+						.route_name
+						.as_ref()
+						.is_some_and(|route| route.name.as_str() == llm::LOCAL_ROUTE_NAME));
+			if !maybe_enable_log && !enable_trace && !log_store_enabled && !otlp_log_enabled {
+				return;
+			}
+
+			let dur = format!("{}ms", duration.as_millis());
+			let route_duration = log
+				.ate_router_route_duration
+				.map(|duration| duration.as_secs_f64());
+			let grpc = log.grpc_status.load();
+
+			let input_tokens = llm_response.as_ref().and_then(|l| l.input_tokens);
+			let time_to_first_token = llm_response
+				.as_ref()
+				.and_then(|l| l.time_to_first_token)
+				.and_then(|duration| duration.0.to_std().ok())
+				.map(|duration| duration.as_secs_f64());
+			let time_per_output_token = llm_response
+				.as_ref()
+				.and_then(|l| l.time_per_output_token)
+				.and_then(|duration| duration.0.to_std().ok())
+				.map(|duration| duration.as_secs_f64());
+			let cost = llm_response.as_ref().and_then(|l| l.cost.as_ref());
+			let usage_cost_total = cost.map(|b| b.total().to_string());
+			let trace_cost_fields = if enable_trace {
+				cost.map(|b| {
+					let mut fields = vec![
+						("agw.ai.usage.cost.input", b.input.to_string()),
+						("agw.ai.usage.cost.output", b.output.to_string()),
+						("agw.ai.usage.cost.cache_read", b.cache_read.to_string()),
+						("agw.ai.usage.cost.cache_write", b.cache_write.to_string()),
+						("agw.ai.usage.cost.reasoning", b.reasoning.to_string()),
+						("agw.ai.usage.cost.input_audio", b.input_audio.to_string()),
+						("agw.ai.usage.cost.output_audio", b.output_audio.to_string()),
+						("agw.ai.usage.cost.pages", b.pages.to_string()),
+						(
+							"agw.ai.usage.cost.audio_duration",
+							b.audio_duration.to_string(),
+						),
+					];
+					fields.extend(
+						[
+							("agw.ai.usage.cost.cache_write_details.1h", b.cache_write_1h),
+							(
+								"agw.ai.usage.cost.cache_write_details.12h",
+								b.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero())
+						.map(|(k, v)| (k, v.to_string())),
+					);
+					fields
+				})
+			} else {
+				None
+			};
+
+			// Falls back to the incoming trace so unsampled requests stay correlatable. There is no
+			// span id to report when nothing was recorded.
+			let trace_id = log
+				.outgoing_span
+				.as_ref()
+				.or(log.incoming_span.as_ref())
+				.map(|id| id.trace_id());
+			let span_id = log.outgoing_span.as_ref().map(|id| id.span_id());
+			let fields = cel_exec.fields;
+			let reason = log.reason.and_then(|r| match r {
+				ProxyResponseReason::Upstream => None,
+				_ => Some(r),
+			});
+			let mcp_target = mcp
+				.as_ref()
+				.and_then(|m| m.target_name())
+				.map(str::to_owned);
+			let mcp_resource_type = mcp.as_ref().and_then(|m| m.resource_type());
+			let mcp_resource_uri = mcp.as_ref().and_then(|m| {
+				if matches!(m.resource_type(), Some(MCPOperation::Resource)) {
+					m.resource_name().map(str::to_owned)
+				} else {
+					None
+				}
+			});
+			let mcp_tool_name = mcp.as_ref().and_then(|m| {
+				if matches!(m.resource_type(), Some(MCPOperation::Tool)) {
+					m.resource_name().map(str::to_owned)
+				} else {
+					None
+				}
+			});
+			let mcp_prompt_name = mcp.as_ref().and_then(|m| {
+				if matches!(m.resource_type(), Some(MCPOperation::Prompt)) {
+					m.resource_name().map(str::to_owned)
+				} else {
+					None
+				}
+			});
+
+			let guardrails_json = guardrails
+				.as_ref()
+				.map(|g| serde_json::Value::Array(g.iter().map(cel::GuardrailInfo::minimal).collect()));
+
+			let emit_ids = agent_core::telemetry::enabled("request", &Level::DEBUG);
+			let mut kv = vec![
+				(
+					"connection.id",
+					emit_ids
+						.then_some(log.connection_id)
+						.flatten()
+						.map(Into::into),
+				),
+				(
+					"request.id",
+					emit_ids.then_some(log.request_id).flatten().map(Into::into),
+				),
+				("gateway", route_identifier.gateway.as_deref().map(display)),
+				(
+					"listener",
+					route_identifier.listener.as_deref().map(display),
+				),
+				(
+					"route_rule",
+					route_identifier.route_rule.as_deref().map(display),
+				),
+				("route", route_identifier.route.as_deref().map(display)),
+				("endpoint", log.endpoint.display()),
+				("src.addr", Some(display(&log.tcp_info.peer_addr))),
+				(
+					"src.identity",
+					log
+						.tls_info
+						.as_ref()
+						.and_then(|tls| tls.src_identity.as_ref())
+						.and_then(|tls| tls.identity.as_ref())
+						.map(display),
+				),
+				("http.method", log.method.display()),
+				("http.host", log.host.display()),
+				("http.path", log.path.display()),
+				// TODO: incoming vs outgoing
+				("http.version", log.version.as_ref().map(debug)),
+				(
+					"http.status",
+					log.status.as_ref().map(|s| s.as_u16().into()),
+				),
+				("grpc.status", grpc.map(Into::into)),
+				(
+					"tls.sni",
+					if log.host.is_none() {
+						log.tls_info.as_ref().and_then(|s| s.server_name.display())
+					} else {
+						None
+					},
+				),
+				("trace.id", trace_id.display()),
+				("span.id", span_id.display()),
+				("jwt.sub", log.jwt_sub.display()),
+				("protocol", log.backend_protocol.as_ref().map(debug)),
+				("a2a.method", log.a2a_method.display()),
+				(
+					"a2a.response.outcome",
+					log.a2a_response.as_ref().map(|r| r.outcome.as_str().into()),
+				),
+				(
+					"a2a.response.error_code",
+					log
+						.a2a_response
+						.as_ref()
+						.and_then(|r| r.error_code)
+						.map(Into::into),
+				),
+				(
+					"a2a.result.kind",
+					log
+						.a2a_response
+						.as_ref()
+						.and_then(|r| r.result_kind.as_ref())
+						.map(display),
+				),
+				(
+					"a2a.task.state",
+					log
+						.a2a_response
+						.as_ref()
+						.and_then(|r| r.task_state.as_ref())
+						.map(display),
+				),
+				(
+					"a2a.context.id",
+					log
+						.a2a_response
+						.as_ref()
+						.and_then(|r| r.context_id.as_ref())
+						.map(display),
+				),
+				(
+					"mcp.method.name",
+					mcp
+						.as_ref()
+						.and_then(|m| m.method_name.as_ref())
+						.map(display),
+				),
+				("mcp.target", mcp_target.as_ref().map(display)),
+				("mcp.resource.type", mcp_resource_type.as_ref().map(display)),
+				("mcp.resource.uri", mcp_resource_uri.as_ref().map(display)),
+				("gen_ai.tool.name", mcp_tool_name.as_ref().map(display)),
+				("gen_ai.prompt.name", mcp_prompt_name.as_ref().map(display)),
+				(
+					"mcp.session.id",
+					mcp
+						.as_ref()
+						.and_then(|m| m.session_id.as_ref())
+						.map(display),
+				),
+				(
+					"mcp.error.code",
+					mcp
+						.as_ref()
+						.and_then(|m| m.error.as_ref())
+						.map(|error| error.code.into()),
+				),
+				(
+					"mcp.error.message",
+					mcp
+						.as_ref()
+						.and_then(|m| m.error.as_ref())
+						.map(|error| quoted(&error.message)),
+				),
+				(
+					"inferencepool.selected_endpoint",
+					log.inference_pool.display(),
+				),
+				(ateattr::ATE_ACTOR_NAME, log.ate_actor_name.display()),
+				(ateattr::ATE_ACTOR_UID, log.ate_actor_uid.display()),
+				(ateattr::ATE_ATESPACE, log.ate_atespace.display()),
+				(ateattr::ATE_ROUTER_RESUME, log.ate_router_resume.display()),
+				(
+					ateattr::ATE_ROUTER_ROUTE_DURATION,
+					route_duration.map(Into::into),
+				),
+				// OpenTelemetry Gen AI Semantic Conventions v1.40.0
+				(
+					"gen_ai.operation.name",
+					log
+						.llm_request
+						.as_ref()
+						.map(|r| gen_ai_operation_name(r.input_format).into()),
+				),
+				(
+					"gen_ai.provider.name",
+					log.llm_request.as_ref().map(|l| display(&l.provider)),
+				),
+				(
+					"gen_ai.request.model",
+					log.llm_request.as_ref().map(|l| display(&l.request_model)),
+				),
+				(
+					"gen_ai.response.model",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.response_model.display()),
+				),
+				(
+					"agw.ai.original_model",
+					log.original_model.as_deref().map(Into::into),
+				),
+				("gen_ai.usage.input_tokens", input_tokens.map(Into::into)),
+				(
+					"gen_ai.usage.cache_creation.input_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.cache_creation_input_tokens)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.usage.cache_read.input_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.cached_input_tokens)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.usage.output_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.output_tokens)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.reasoning_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.reasoning_tokens)
+						.map(Into::into),
+				),
+				(
+					"agw.ai.time_to_first_token",
+					time_to_first_token.map(Into::into),
+				),
+				(
+					"agw.ai.time_per_output_token",
+					time_per_output_token.map(Into::into),
+				),
+				(
+					"agw.ai.usage.cost.total",
+					usage_cost_total.as_deref().map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.output_image_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.output_image_tokens)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.input_audio_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.input_audio_tokens)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.output_audio_tokens",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.output_audio_tokens)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.audio_seconds",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.audio_seconds)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.request.temperature",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.temperature)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.embeddings.dimension.count",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.dimensions)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.request.encoding_formats",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.encoding_format.display()),
+				),
+				(
+					"gen_ai.request.top_p",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.top_p)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.request.max_tokens",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.max_tokens)
+						.map(|v| (v as i64).into()),
+				),
+				(
+					"gen_ai.request.frequency_penalty",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.frequency_penalty)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.request.presence_penalty",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.presence_penalty)
+						.map(Into::into),
+				),
+				(
+					"gen_ai.request.seed",
+					log
+						.llm_request
+						.as_ref()
+						.and_then(|l| l.params.seed)
+						.map(Into::into),
+				),
+				// Not part of official semconv
+				(
+					"agw.ai.guardrails",
+					guardrails_json.as_ref().map(json_value_to_value_bag),
+				),
+				("retry.attempt", log.retry_attempt.display()),
+				("error", log.error.quoted()),
+				("reason", reason.display()),
+				("duration", Some(dur.as_str().into())),
+			];
+
+			let mut extra_kv_capacity = trace_cost_fields.as_ref().map_or(0, |fields| fields.len());
+			if maybe_enable_log || log_store_enabled {
+				extra_kv_capacity += fields.add.len();
+			}
+			kv.reserve_exact(extra_kv_capacity);
+			let protocol_span_name = mcp
+				.as_ref()
+				.and_then(|mcp| mcp.method_name.clone())
+				.or_else(|| {
+					let request = log.request_snapshot.as_ref()?;
+					crate::http::is_grpc_content_type(&request.headers)
+						.then(|| strng::new(request.path.path().trim_start_matches('/')))
+				});
+			let use_otel_stdout = maybe_enable_log
+				&& matches!(
+					log.access_log_preset.as_ref(),
+					Some(crate::types::frontend::AccessLogPreset::Otel)
+				);
+
+			let trace_needs_otel = enable_trace
+				&& log
+					.outgoing_span
+					.as_ref()
+					.is_some_and(|span| span.is_sampled());
+
+			let needs_otel = trace_needs_otel || otlp_log_enabled || use_otel_stdout;
+			let http_semconv = (needs_otel && !is_tcp).then(|| HttpSemconvAttributes::new(&log));
+
+			let mut otel_kv = needs_otel.then(|| {
+				let mut otel_kv = kv.clone();
+
+				if let Some(http_semconv) = &http_semconv {
+					http_semconv.apply(&mut otel_kv);
+				}
+
+				otel_kv
+			});
+
+			if trace_needs_otel && let Some(t) = &log.tracer {
+				let otel_kv = otel_kv
+					.as_mut()
+					.expect("OTel attributes are built for sampled traces");
+				let base_len = otel_kv.len();
+				if let Some(trace_cost_fields) = &trace_cost_fields {
+					otel_kv.extend(
+						trace_cost_fields
+							.iter()
+							.map(|(key, value)| (*key, Some(value.as_str().into()))),
+					);
+				}
+				t.send(
+					&log,
+					&end_time,
+					&cel_exec,
+					protocol_span_name.as_deref(),
+					otel_kv.as_slice(),
+				);
+				otel_kv.truncate(base_len);
+				// Flush any buffered spans created during request processing.
+				// Does best effort, if the lock is poisoned, skip flushing.
+				if log.outgoing_span.as_ref().is_some_and(|s| s.is_sampled())
+					&& trc::should_export_span(t.filter.as_deref(), &cel_exec.executor)
+					&& let Ok(mut spans) = log.trace_spans.lock()
+				{
+					for buffered_span in spans.drain(..) {
+						t.processor.emit(buffered_span.into_span_data());
+					}
+				}
+			};
+			if let Some(otel) = &log.otel_logger
+				&& cel_exec.eval_otlp_filter()
+			{
+				let mut otlp_kv = otel_kv
+					.as_ref()
+					.expect("OTel attributes are built when OTLP logging is enabled")
+					.clone();
+				otlp_kv.reserve(cel_exec.otlp_fields.add.len());
+				for (k, v) in &mut otlp_kv {
+					if cel_exec.otlp_fields.has(k) {
+						*v = None;
+					}
+				}
+				let otlp_raws = cel_exec.eval_otlp_additions();
+				for (k, v) in &otlp_raws {
+					let eval = v.as_ref().map(json_value_to_value_bag);
+					otlp_kv.push((k, eval));
+				}
+				otel.emit(level, "request", &otlp_kv);
+			}
+
+			if maybe_enable_log || log_store_enabled {
+				let passes_log_filter = cel_exec.eval_filter();
+				if !passes_log_filter {
+					return;
+				}
+				kv.reserve(fields.add.len());
+				for (k, v) in &mut kv {
+					// Remove filtered lines, or things we are about to add
+					if fields.has(k) {
+						*v = None;
+					}
+				}
+				// To avoid lifetime issues need to store the expression before we give it to ValueBag reference.
+				// TODO: we could allow log() to take a list of borrows and then a list of OwnedValueBag
+				let raws = cel_exec.eval_additions();
+				for (k, v) in &raws {
+					// Preserve JSON numbers as numeric ValueBags so the core logger can control
+					// JSON number formatting instead of serializing serde_json::Number directly.
+					let eval = v.as_ref().map(json_value_to_value_bag);
+					kv.push((k, eval));
+				}
+
+				if maybe_enable_log {
+					if use_otel_stdout {
+						let mut stdout_kv = otel_kv
+							.as_ref()
+							.expect("OTel attributes are built for the OTel stdout preset")
+							.clone();
+
+						stdout_kv.reserve(fields.add.len());
+
+						for (k, v) in &mut stdout_kv {
+							if fields.has(k) {
+								*v = None;
+							}
+						}
+
+						for (k, v) in &raws {
+							let eval = v.as_ref().map(json_value_to_value_bag);
+							stdout_kv.push((k, eval));
+						}
+
+						agent_core::telemetry::log(level, "request", &stdout_kv);
+					} else {
+						agent_core::telemetry::log(level, "request", &kv);
+					}
+				}
+
+				if log_store_enabled {
+					let mut db_kv = kv.clone();
+					let db_raws = cel_exec.eval_database_additions();
+					let default_db_raws = [
+						(
+							Cow::Borrowed("user_agent.name"),
+							user_agent_name(log.request_snapshot.as_deref()).map(Value::String),
+						),
+						(
+							Cow::Borrowed("agw.api_key.name"),
+							api_key_name(log.request_snapshot.as_deref()).map(Value::String),
+						),
+					];
+					db_kv.reserve(db_raws.len() + default_db_raws.len());
+					for (k, v) in db_raws.iter().chain(default_db_raws.iter()) {
+						let eval = v.as_ref().map(json_value_to_value_bag);
+						db_kv.push((k, eval));
+					}
+					if let Some(cost) = cost {
+						// Default log only puts totals; we want all of them.
+						let cost_raws = [
+							("agw.ai.usage.cost.total", cost.total()),
+							("agw.ai.usage.cost.input", cost.input),
+							("agw.ai.usage.cost.output", cost.output),
+							("agw.ai.usage.cost.cacheRead", cost.cache_read),
+							("agw.ai.usage.cost.cacheWrite", cost.cache_write),
+							("agw.ai.usage.cost.reasoning", cost.reasoning),
+							("agw.ai.usage.cost.inputAudio", cost.input_audio),
+							("agw.ai.usage.cost.outputAudio", cost.output_audio),
+							("agw.ai.usage.cost.pages", cost.pages),
+							("agw.ai.usage.cost.audioDuration", cost.audio_duration),
+						];
+						let cache_write_details = [
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.1h",
+								cost.cache_write_1h,
+							),
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.12h",
+								cost.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero());
+						db_kv.reserve(cost_raws.len() + 2);
+						for (k, v) in cost_raws.into_iter().chain(cache_write_details) {
+							let eval = v.to_f64().map(ValueBag::from_f64);
+							db_kv.push((k, eval));
+						}
+					}
+					let attributes = database_attributes(&db_kv);
+					let total_tokens = llm_response.as_ref().and_then(|llm| {
+						llm
+							.total_tokens
+							.or_else(|| Some(llm.input_tokens?.saturating_add(llm.output_tokens?)))
+					});
+					let record = log_store::StoredRequestLog {
+						id: uuid::Uuid::now_v7().to_string(),
+						started_at: log.start.as_datetime().with_timezone(&chrono::Utc),
+						completed_at: end_time.as_datetime().with_timezone(&chrono::Utc),
+						duration_ms: u128_to_i64(duration.as_millis()),
+						trace_id: trace_id.map(|id| id.to_string()),
+						span_id: span_id.map(|id| id.to_string()),
+						http_status: log.status.as_ref().map(|s| i64::from(s.as_u16())),
+						error: log.error.clone(),
+						gen_ai_operation_name: log
+							.llm_request
+							.as_ref()
+							.map(|request| gen_ai_operation_name(request.input_format).to_string()),
+						gen_ai_provider_name: log
+							.llm_request
+							.as_ref()
+							.map(|request| request.provider.to_string()),
+						gen_ai_request_model: log
+							.llm_request
+							.as_ref()
+							.map(|request| request.request_model.to_string()),
+						gen_ai_response_model: llm_response
+							.as_ref()
+							.and_then(|llm| llm.response_model.as_ref().map(ToString::to_string)),
+						input_tokens: u64_to_i64(input_tokens),
+						output_tokens: u64_to_i64(llm_response.as_ref().and_then(|llm| llm.output_tokens)),
+						total_tokens: u64_to_i64(total_tokens),
+						cache_read_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cached_input_tokens),
+						),
+						cache_creation_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cache_creation_input_tokens),
+						),
+						reasoning_tokens: u64_to_i64(
+							llm_response.as_ref().and_then(|llm| llm.reasoning_tokens),
+						),
+						time_to_first_token_ms: time_to_first_token.map(|seconds| seconds * 1000.0),
+						time_per_output_token_ms: time_per_output_token.map(|seconds| seconds * 1000.0),
+						cost: cost.and_then(|cost| cost.total().to_f64()),
+						agentgateway_user: attributes.agentgateway_user,
+						agentgateway_group: attributes.agentgateway_group,
+						user_agent_name: attributes.user_agent_name,
+						has_payload: false,
+						attributes_json: attributes.json,
+						payload: None,
+					};
+					log_store::emit(log_store::PendingRequestLog {
+						record,
+						llm_mode: log.database_llm,
+						input_messages: log.input_messages.take(),
+						llm_response,
+					});
+				}
+			}
+		});
+	}
+}
+
+impl agent_http::BodyObserver for DropOnLog {
+	fn on_error(&mut self, error: &crate::http::Error) {
+		// Response headers have already been sent; retain the body failure in the log.
+		if let Some(log) = self.as_mut()
+			&& log.error.is_none()
+		{
+			log.error = Some(format!("response body failed: {error}"));
+		}
+	}
+	fn on_frame(&mut self, frame: &Frame<Bytes>) {
+		if let Some(trailer) = frame.trailers_ref()
+			&& let Some(grpc) = self.as_mut().map(|log| log.grpc_status.clone())
+		{
+			crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
+		}
+		if let Some(log) = self.as_mut()
+			&& let Some(data) = frame.data_ref()
+		{
+			log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
+		}
+	}
+}
+
+pub struct OtelAccessLogger {
+	inner: super::NonBlockingDrop<OtelAccessLoggerInner>,
+}
+
+#[derive(Debug)]
+struct OtelAccessLoggerInner {
+	provider: SdkLoggerProvider,
+	logger: opentelemetry_sdk::logs::SdkLogger,
+}
+
+impl std::fmt::Debug for OtelAccessLogger {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("OtelAccessLogger").finish()
+	}
+}
+
+fn to_any_value(v: &ValueBag) -> AnyValue {
+	if let Some(b) = v.to_str() {
+		AnyValue::String(b.to_string().into())
+	} else if let Some(b) = v.to_i64() {
+		AnyValue::Int(b)
+	} else if let Some(b) = v.to_f64() {
+		AnyValue::Double(b)
+	} else if let Some(b) = v.to_bool() {
+		AnyValue::Boolean(b)
+	} else {
+		AnyValue::String(v.to_string().into())
+	}
+}
+
+/// Policy-aware OTLP gRPC log exporter that routes via `GrpcReferenceChannel`, ensuring
+/// backend policies are looked up and applied by `PolicyClient::call_reference`.
+#[derive(Clone)]
+struct PolicyGrpcLogExporter {
+	tonic_client:
+		opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient<
+			crate::http::ext_proc::GrpcReferenceChannel,
+		>,
+	is_shutdown: Arc<bool>,
+	resource: Resource,
+	runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for PolicyGrpcLogExporter {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PolicyGrpcLogExporter").finish()
+	}
+}
+
+impl PolicyGrpcLogExporter {
+	fn new(
+		inputs: Arc<crate::ProxyInputs>,
+		target: Arc<crate::types::agent::SimpleBackendReference>,
+		policies: Vec<crate::types::agent::BackendTrafficPolicy>,
+		runtime: tokio::runtime::Handle,
+	) -> Self {
+		use crate::http::ext_proc::GrpcReferenceChannel;
+		let channel = GrpcReferenceChannel {
+			target,
+			policies: Arc::new(policies),
+			client: crate::proxy::httpproxy::PolicyClient::new(inputs),
+		};
+		let tonic_client =
+			opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient::new(
+				channel,
+			);
+		Self {
+			tonic_client,
+			is_shutdown: Arc::new(false),
+			resource: Resource::builder().build(),
+			runtime,
+		}
+	}
+}
+
+impl opentelemetry_sdk::logs::LogExporter for PolicyGrpcLogExporter {
+	fn export(
+		&self,
+		batch: opentelemetry_sdk::logs::LogBatch<'_>,
+	) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+		use opentelemetry_proto::transform::logs::tonic::group_logs_by_resource_and_scope;
+		use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+
+		let is_shutdown = self.is_shutdown.clone();
+		let mut client = self.tonic_client.clone();
+		let resource: opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema =
+			(&self.resource).into();
+		let resource_logs = group_logs_by_resource_and_scope(&batch, &resource);
+		let handle = self.runtime.clone();
+
+		async move {
+			if *is_shutdown {
+				return Err(OTelSdkError::AlreadyShutdown);
+			}
+			let req =
+				opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest { resource_logs };
+			// Drop tonic Response inside the spawned task so guard is released on the Tokio runtime, not on
+			// the BatchProcessor OS thread which has no Tokio context.
+			handle
+				.spawn(async move {
+					client
+						.export(req)
+						.await
+						.map(|_| ())
+						.map_err(|e| e.message().to_string())
+				})
+				.await
+				.map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?
+				.map_err(OTelSdkError::InternalFailure) as OTelSdkResult
+		}
+	}
+
+	fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+		Ok(())
+	}
+
+	fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+		self.resource = resource.clone();
+	}
+}
+
+fn build_resource(defaults: Option<&trc::GlobalResourceDefaults>) -> Resource {
+	let mut resource_builder = Resource::builder();
+	if let Some(d) = defaults {
+		for kv in &d.attrs {
+			resource_builder = resource_builder.with_attribute(kv.clone());
+		}
+	}
+	resource_builder = resource_builder.with_service_name(
+		defaults
+			.and_then(|d| d.service_name.clone())
+			.unwrap_or_else(|| "agentgateway".to_string()),
+	);
+	resource_builder = resource_builder.with_attribute(KeyValue::new(
+		"service.version",
+		agent_core::version::BuildInfo::new().version,
+	));
+	resource_builder.build()
+}
+
+impl OtelAccessLogger {
+	pub fn new(
+		policy_client: crate::proxy::httpproxy::PolicyClient,
+		backend_ref: crate::types::agent::SimpleBackendReference,
+		policies: Vec<crate::types::agent::BackendTrafficPolicy>,
+		protocol: crate::types::agent::TracingProtocol,
+		path: String,
+	) -> anyhow::Result<Self> {
+		let defaults = trc::global_resource_defaults();
+		let resource = build_resource(defaults);
+
+		let exporter_runtime = policy_client
+			.inputs
+			.cfg
+			.admin_runtime_handle
+			.clone()
+			.unwrap_or_else(tokio::runtime::Handle::current);
+
+		let provider = if protocol == crate::types::agent::TracingProtocol::Grpc {
+			let exporter = PolicyGrpcLogExporter::new(
+				policy_client.inputs.clone(),
+				Arc::new(backend_ref),
+				policies,
+				exporter_runtime,
+			);
+			SdkLoggerProvider::builder()
+				.with_resource(resource)
+				.with_batch_exporter(exporter)
+				.build()
+		} else {
+			let http_client = trc::PolicyOtelHttpClient {
+				policy_client,
+				backend_ref,
+				policies,
+				runtime: exporter_runtime,
+			};
+			let exporter = opentelemetry_otlp::LogExporter::builder()
+				.with_http()
+				.with_http_client(http_client)
+				.with_endpoint(path)
+				.build()?;
+			SdkLoggerProvider::builder()
+				.with_resource(resource)
+				.with_batch_exporter(exporter)
+				.build()
+		};
+
+		Ok(Self::from_provider(provider))
+	}
+
+	fn from_provider(provider: SdkLoggerProvider) -> Self {
+		let logger = provider.logger("agentgateway.access");
+		Self {
+			inner: super::NonBlockingDrop::new(OtelAccessLoggerInner { provider, logger }),
+		}
+	}
+
+	pub fn shutdown(&self) {
+		let _ = self.inner.provider.shutdown();
+	}
+
+	fn emit<'v>(&self, level: &str, _target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
+		let severity = match level {
+			"error" => Severity::Error,
+			"warn" => Severity::Warn,
+			"info" => Severity::Info,
+			"debug" => Severity::Debug,
+			"trace" => Severity::Trace,
+			_ => Severity::Info,
+		};
+		let severity_text: &'static str = match level {
+			"error" => "ERROR",
+			"warn" => "WARN",
+			"info" => "INFO",
+			"debug" => "DEBUG",
+			"trace" => "TRACE",
+			_ => "INFO",
+		};
+
+		let mut record = self.inner.logger.create_log_record();
+		record.set_severity_number(severity);
+		record.set_severity_text(severity_text);
+
+		let mut trace_id_val: Option<u128> = None;
+		let mut span_id_val: Option<u64> = None;
+
+		for &(k, ref v) in kv {
+			let Some(v) = v else { continue };
+
+			match k {
+				"trace.id" => {
+					if let Some(s) = v.to_str()
+						&& let Ok(id) = u128::from_str_radix(&s, 16)
+					{
+						trace_id_val = Some(id);
+					}
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+				"span.id" => {
+					if let Some(s) = v.to_str()
+						&& let Ok(id) = u64::from_str_radix(&s, 16)
+					{
+						span_id_val = Some(id);
+					}
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+				_ => {
+					record.add_attribute(Key::new(k.to_string()), to_any_value(v));
+				},
+			}
+		}
+
+		if let Some(tid) = trace_id_val {
+			record.set_trace_context(
+				opentelemetry::trace::TraceId::from(tid),
+				span_id_val
+					.map(opentelemetry::trace::SpanId::from)
+					.unwrap_or(opentelemetry::trace::SpanId::INVALID),
+				None,
+			);
+		}
+
+		self.inner.logger.emit(record);
+	}
+}
+
+// SpanWriter is a construct that can start otel spans
+#[derive(Debug, Default, Clone)]
+pub struct SpanWriter {
+	inner: Option<Arc<SpanWriterInner>>,
+}
+
+pub fn copy_span_writer(source: &::http::Extensions, target: &mut ::http::Extensions) {
+	if let Some(writer) = source.get::<SpanWriter>() {
+		target.insert(writer.clone());
+	}
+}
+
+impl SpanWriter {
+	pub(crate) fn is_enabled(&self) -> bool {
+		self.inner.is_some()
+	}
+
+	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
+		match &self.inner {
+			Some(i) => i.start(name),
+			None => SpanWriteOnDrop::default(),
+		}
+	}
+
+	pub fn start_outbound(&self, labels: OutboundCallLabels) -> SpanWriteOnDrop {
+		match &self.inner {
+			Some(i) => i.start_with_details(
+				labels.subtype.as_str(),
+				SpanKind::Client,
+				vec![
+					KeyValue::new("agentgateway.outbound.kind", labels.kind.as_str()),
+					KeyValue::new("agentgateway.outbound.subtype", labels.subtype.as_str()),
+				],
+			),
+			None => SpanWriteOnDrop::default(),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct SpanWriterInner {
+	parent: trc::TraceParent,
+	inner: Arc<Mutex<Vec<BufferedSpan>>>,
+}
+
+impl SpanWriterInner {
+	pub fn start(&self, name: impl Into<Cow<'static, str>>) -> SpanWriteOnDrop {
+		self.start_with_details(name, SpanKind::Server, Vec::new())
+	}
+
+	fn start_with_details(
+		&self,
+		name: impl Into<Cow<'static, str>>,
+		span_kind: SpanKind,
+		attributes: Vec<KeyValue>,
+	) -> SpanWriteOnDrop {
+		// Create a unique child span ID for this recorded span.
+		let child = self.parent.new_span();
+
+		SpanWriteOnDrop {
+			name: Some(name.into()),
+			span_kind,
+			start_time: Some(SystemTime::now()),
+			attributes,
+			status: Status::default(),
+			inner: self.inner.clone(),
+			parent: Some(self.parent.clone()),
+			span: Some(child),
+		}
+	}
+}
+
+pub struct SpanWriteOnDrop {
+	name: Option<Cow<'static, str>>,
+	span_kind: SpanKind,
+	start_time: Option<SystemTime>,
+	attributes: Vec<KeyValue>,
+	status: Status,
+	inner: Arc<Mutex<Vec<BufferedSpan>>>,
+	parent: Option<trc::TraceParent>,
+	span: Option<trc::TraceParent>,
+}
+impl Default for SpanWriteOnDrop {
+	fn default() -> Self {
+		Self {
+			name: None,
+			span_kind: SpanKind::Internal,
+			start_time: None,
+			attributes: Vec::new(),
+			status: Status::default(),
+			inner: Arc::default(),
+			parent: None,
+			span: None,
+		}
+	}
+}
+impl SpanWriteOnDrop {
+	pub fn span_writer(&self) -> SpanWriter {
+		let inner = self.span.clone().map(|parent| {
+			Arc::new(SpanWriterInner {
+				parent,
+				inner: self.inner.clone(),
+			})
+		});
+		SpanWriter { inner }
+	}
+
+	pub fn rename_span(&mut self, name: impl Into<Cow<'static, str>>) {
+		if self.parent.is_some() {
+			self.name = Some(name.into());
+		}
+	}
+
+	pub fn inject_context(&self, req: &mut Request) {
+		if let Some(span) = &self.span {
+			span.insert_header(req);
+		}
+	}
+
+	pub fn inject_headers(&self, headers: &mut ::http::HeaderMap) {
+		if let Some(span) = &self.span {
+			span.insert_headers(headers);
+		}
+	}
+
+	pub fn inject_grpc_context<T>(&self, req: &mut tonic::Request<T>) {
+		let Some(span) = &self.span else {
+			return;
+		};
+		let traceparent = format!("{span:?}");
+		if let Ok(value) = tonic::metadata::MetadataValue::try_from(traceparent.as_str()) {
+			req.metadata_mut().insert("traceparent", value);
+		}
+	}
+
+	pub fn add_attribute(&mut self, attribute: KeyValue) {
+		if self.parent.is_some() {
+			self.attributes.push(attribute);
+		}
+	}
+
+	pub fn set_error(&mut self, error_type: impl Into<String>, description: impl Into<String>) {
+		if self.parent.is_some() {
+			self
+				.attributes
+				.push(KeyValue::new("error.type", error_type.into()));
+			self.status = Status::error(description.into());
+		}
+	}
+
+	pub fn record_http_client_status(&mut self, status: http::StatusCode) {
+		self.add_attribute(KeyValue::new("http.status", i64::from(status.as_u16())));
+		if status.is_client_error() || status.is_server_error() {
+			// This is an outbound client span. A received error response is a successful
+			// transport result, but the operation represented by the span failed.
+			self.set_error(status.as_u16().to_string(), String::new());
+		}
+	}
+
+	pub fn record_grpc_result<T>(&mut self, result: &Result<tonic::Response<T>, tonic::Status>) {
+		match result {
+			Ok(_) => self.add_attribute(KeyValue::new("grpc.status", 0_i64)),
+			Err(status) => self.record_grpc_error(status),
+		}
+	}
+
+	pub fn record_grpc_status(&mut self, code: tonic::Code) {
+		self.add_attribute(KeyValue::new("grpc.status", i64::from(code as i32)));
+	}
+
+	pub fn record_grpc_error(&mut self, status: &tonic::Status) {
+		self.record_grpc_status(status.code());
+		self.set_error(format!("{:?}", status.code()), status.to_string());
+	}
+}
+impl Drop for SpanWriteOnDrop {
+	fn drop(&mut self) {
+		let (Some(name), Some(parent), Some(span)) =
+			(self.name.take(), self.parent.take(), self.span.take())
+		else {
+			return;
+		};
+		let end_time = SystemTime::now();
+
+		// Store for later flush when the request log is finalized.
+		if let Ok(mut spans) = self.inner.lock() {
+			spans.push(BufferedSpan {
+				name,
+				span_kind: self.span_kind.clone(),
+				start_time: self.start_time.unwrap_or(end_time),
+				end_time,
+				attributes: std::mem::take(&mut self.attributes),
+				status: std::mem::take(&mut self.status),
+				parent,
+				span,
+			});
+		}
+	}
+}
+
+#[derive(Debug)]
+pub struct BufferedSpan {
+	name: Cow<'static, str>,
+	span_kind: SpanKind,
+	start_time: SystemTime,
+	end_time: SystemTime,
+	attributes: Vec<KeyValue>,
+	status: Status,
+	parent: trc::TraceParent,
+	span: trc::TraceParent,
+}
+
+impl BufferedSpan {
+	fn into_span_data(self) -> opentelemetry_sdk::trace::SpanData {
+		trc::trace_span_data(
+			self.name,
+			self.span_kind,
+			&self.span,
+			Some((&self.parent, false)),
+			self.start_time,
+			self.end_time,
+			self.attributes,
+			self.status,
+		)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::future::ready;
+	use std::net::SocketAddr;
+	use std::sync::{Arc, Mutex};
+	use std::time::Instant;
+
+	use opentelemetry::InstrumentationScope;
+	use opentelemetry::trace::SpanKind;
+	use opentelemetry_sdk::error::OTelSdkResult;
+	use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+	use prometheus_client::encoding::text::encode;
+	use prometheus_client::registry::Registry;
+
+	use super::*;
+	use crate::telemetry::metrics::{
+		Metrics, OutboundCallKind, OutboundCallLabels, OutboundCallSubtype,
+	};
+	use crate::telemetry::trc;
+	use crate::transport::stream::TCPConnectionInfo;
+	use crate::types::frontend::{DatabaseLlmMode, LoggingPolicy};
+
+	#[derive(Clone, Debug, Default)]
+	struct RecordingLogExporter {
+		records: Arc<Mutex<Vec<(opentelemetry_sdk::logs::SdkLogRecord, InstrumentationScope)>>>,
+	}
+
+	impl opentelemetry_sdk::logs::LogExporter for RecordingLogExporter {
+		fn export(
+			&self,
+			batch: opentelemetry_sdk::logs::LogBatch<'_>,
+		) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+			let mut records = self.records.lock().unwrap();
+			for (record, scope) in batch.iter() {
+				records.push((record.clone(), scope.clone()));
+			}
+			ready(Ok(()))
+		}
+	}
+
+	#[test]
+	fn otlp_access_log_scope_is_logger_name_not_tracing_target() {
+		let exporter = RecordingLogExporter::default();
+		let provider = SdkLoggerProvider::builder()
+			.with_simple_exporter(exporter.clone())
+			.build();
+		let logger = OtelAccessLogger::from_provider(provider);
+
+		let kv = [("http.request.method", Some(ValueBag::from("GET")))];
+		logger.emit("info", "request", &kv);
+		logger.inner.provider.force_flush().unwrap();
+
+		let records = exporter.records.lock().unwrap();
+		assert_eq!(records.len(), 1);
+		let (record, scope) = &records[0];
+		assert_eq!(scope.name(), "agentgateway.access");
+		// opentelemetry-proto uses a record target as the wire scope name when one is set.
+		assert!(record.target().is_none());
+	}
+
+	#[derive(Clone, Debug, Default)]
+	struct RecordingSpanExporter {
+		spans: Arc<Mutex<Vec<SpanData>>>,
+	}
+
+	impl RecordingSpanExporter {
+		fn finished_spans(&self) -> Vec<SpanData> {
+			self.spans.lock().unwrap().clone()
+		}
+	}
+
+	impl SpanExporter for RecordingSpanExporter {
+		fn export(
+			&self,
+			batch: Vec<SpanData>,
+		) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+			self.spans.lock().unwrap().extend(batch);
+			ready(Ok(()))
+		}
+	}
+
+	fn test_tracer() -> (Arc<trc::Tracer>, RecordingSpanExporter) {
+		let exporter = RecordingSpanExporter::default();
+		let processor = trc::SharedSpanProcessor::new(SimpleSpanProcessor::new(exporter.clone()));
+		let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+			.with_span_processor(processor.clone())
+			.build();
+		(
+			Arc::new(trc::Tracer {
+				provider: crate::telemetry::NonBlockingDrop::new(provider),
+				processor,
+				fields: Arc::new(LoggingFields::default()),
+				filter: None,
+			}),
+			exporter,
+		)
+	}
+
+	fn test_request_log_with_registry() -> (RequestLog, Registry) {
+		let cel = CelLogging {
+			cel_context: crate::cel::ContextBuilder::new(),
+			filter: None,
+			fields: LoggingFields::default(),
+			otlp_filter: None,
+			otlp_fields: LoggingFields::default(),
+			metric_fields: MetricFields::default(),
+			database_fields: LoggingFields::default(),
+		};
+		let mut registry = Registry::default();
+		let metrics = Arc::new(Metrics::new(
+			&mut registry,
+			Default::default(),
+			Default::default(),
+		));
+		let log = RequestLog::new(
+			cel,
+			metrics,
+			ModelCatalog::empty(),
+			Timestamp::now(),
+			TCPConnectionInfo {
+				peer_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+				local_addr: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+				start: Instant::now(),
+				raw_peer_addr: None,
+			},
+		);
+		(log, registry)
+	}
+
+	fn test_request_log() -> RequestLog {
+		test_request_log_with_registry().0
+	}
+
+	fn metric_test_llm_request() -> llm::LLMRequest {
+		llm::LLMRequest {
+			input_tokens: None,
+			input_format: llm::InputFormat::Responses,
+			cache_convention: Default::default(),
+			request_model: "test-model".into(),
+			provider: "test-provider".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+		}
+	}
+
+	fn encoded_metrics(registry: &Registry) -> String {
+		let mut encoded = String::new();
+		encode(&mut encoded, registry).unwrap();
+		encoded
+	}
+
+	#[test]
+	fn substrate_route_metric_uses_resolution_outcome_not_application_status() {
+		let (mut log, registry) = test_request_log_with_registry();
+		log.status = Some(crate::http::StatusCode::NOT_FOUND);
+		log.ate_router_resume = Some(ateattr::ResumeDisposition::Triggered);
+		log.ate_router_route_duration = Some(Duration::from_millis(10));
+		log.ate_router_outcome = Some(ateattr::RouteOutcome::Ok);
+		drop(DropOnLog::from(log));
+
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, &registry).unwrap();
+		assert!(
+			encoded.contains("atenet_router_route_duration_seconds_bucket")
+				&& encoded.contains("ate_router_outcome=\"ok\"")
+				&& encoded.contains("ate_router_resume=\"triggered\""),
+			"{encoded}"
+		);
+		assert!(!encoded.contains("ate_router_outcome=\"resume_error\""));
+	}
+
+	fn sampler_request() -> crate::http::Request {
+		::http::Request::builder()
+			.method(::http::Method::GET)
+			.uri("http://example.com/trace")
+			.body(crate::http::Body::empty())
+			.unwrap()
+	}
+
+	fn sampling_expr(v: &str) -> Option<Arc<cel::Expression>> {
+		Some(Arc::new(cel::Expression::new_strict(v).unwrap()))
+	}
+
+	fn traceparent(sampled: bool) -> TraceParent {
+		let mut tp = TraceParent::new();
+		tp.flags = u8::from(sampled);
+		tp
+	}
+
+	/// The full sampling matrix. `parentNotSampled` is the only new capability: every other cell
+	/// pins pre-existing behavior. `incoming` is `None` for a request with no `traceparent`,
+	/// otherwise the parent's sampled flag.
+	#[test]
+	fn trace_sampled_matrix() {
+		// (random, client, parent_not_sampled, incoming, sampled)
+		let cases = [
+			// No incoming traceparent: `randomSampling` applies, default off.
+			(None, None, None, None, false),
+			(Some("true"), None, None, None, true),
+			(Some("false"), None, None, None, false),
+			// Incoming `-01`: `clientSampling` applies, default on.
+			(None, None, None, Some(true), true),
+			(None, Some("true"), None, Some(true), true),
+			(None, Some("false"), None, Some(true), false),
+			// Incoming `-00`: `parentNotSampled` applies, default off.
+			(None, None, None, Some(false), false),
+			(None, None, Some("false"), Some(false), false),
+			(None, None, Some("true"), Some(false), true),
+			// `clientSampling` has no say over an unsampled parent, in either direction.
+			(None, Some("true"), None, Some(false), false),
+			(None, Some("false"), Some("true"), Some(false), true),
+			(None, Some("true"), Some("false"), Some(false), false),
+			// `parentNotSampled` has no say over an already-sampled parent.
+			(None, Some("false"), Some("true"), Some(true), false),
+			// `randomSampling` has no say once a traceparent is present.
+			(Some("false"), None, None, Some(true), true),
+			(Some("true"), None, None, Some(false), false),
+		];
+
+		for (random, client, parent_not_sampled, incoming, want) in cases {
+			let sampler = TraceSampler {
+				random_sampling: random.and_then(sampling_expr),
+				client_sampling: client.and_then(sampling_expr),
+				parent_not_sampled: parent_not_sampled.and_then(sampling_expr),
+			};
+			let tp = incoming.map(traceparent);
+			let (got, reason) = sampler.trace_sampled(&sampler_request(), tp.as_ref());
+			assert_eq!(
+				got, want,
+				"random={random:?} client={client:?} parentNotSampled={parent_not_sampled:?} incoming={incoming:?} reason={reason}"
+			);
+		}
+	}
+
+	#[test]
+	fn trace_sampled_reports_unsampled_parent_reason() {
+		let req = sampler_request();
+		let unsampled = traceparent(false);
+
+		let (_, honored) = TraceSampler::default().trace_sampled(&req, Some(&unsampled));
+		assert_eq!(honored, "not sampled (unsampled parent)");
+
+		let (_, forced) = TraceSampler {
+			parent_not_sampled: sampling_expr("true"),
+			..Default::default()
+		}
+		.trace_sampled(&req, Some(&unsampled));
+		assert_eq!(forced, "sample (unsampled parent)");
+	}
+
+	fn llm_context_with_content() -> LLMContext {
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: llm::InputFormat::Responses,
+			cache_convention: Default::default(),
+			request_model: "test-model".into(),
+			provider: "test-provider".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: Some(Arc::new(vec![llm::SimpleChatCompletionMessage {
+				role: "user".into(),
+				content: "hello".into(),
+			}])),
+			provider_state: None,
+		};
+		let mut context = LLMContext::from(request);
+		context.completion = Some(vec!["world".to_string()]);
+		context
+	}
+
+	#[test]
+	fn gen_ai_request_duration_records_success_and_failure_outcomes() {
+		for (status, error, reason, expected_error_type) in [
+			(http::StatusCode::OK, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(http::StatusCode::TOO_MANY_REQUESTS, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				Some("invalid request"),
+				Some(ProxyResponseReason::InvalidRequest),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::BAD_GATEWAY,
+				Some("connection failed"),
+				Some(ProxyResponseReason::UpstreamFailure),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				Some("unclassified failure"),
+				None,
+				Some("_OTHER"),
+			),
+		] {
+			let (mut log, registry) = test_request_log_with_registry();
+			log.status = Some(status);
+			log.error = error.map(str::to_string);
+			log.reason = reason;
+			log.llm_request = Some(metric_test_llm_request());
+
+			drop(DropOnLog::from(log));
+
+			let encoded = encoded_metrics(&registry);
+			let count = encoded
+				.lines()
+				.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+				.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+			match expected_error_type {
+				Some(expected) => assert!(
+					count.contains(&format!("error_type=\"{expected}\"")),
+					"expected error.type {expected} in: {count}"
+				),
+				None => assert!(
+					!count.contains("error_type="),
+					"successful request unexpectedly has error.type: {count}"
+				),
+			}
+		}
+	}
+
+	#[test]
+	fn grpc_refusal_by_the_proxy_logs_its_grpc_status() {
+		use crate::http::jwt::TokenError;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+
+		let refusal = || {
+			Err(ProxyError::JwtAuthenticationFailure(TokenError::UnknownKeyId("rotated".into())).into())
+		};
+
+		let mut log = test_request_log();
+		let (mut response, reason) = resolve_response(refusal(), &mut log, true);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::OK);
+		assert_eq!(
+			log.grpc_status.load(),
+			Some(tonic::Code::Unauthenticated as u8)
+		);
+
+		let mut log = test_request_log();
+		log.grpc_status.store(Some(tonic::Code::Internal as u8));
+		let (mut response, reason) = resolve_response(refusal(), &mut log, false);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+		assert_eq!(log.grpc_status.load(), None);
+	}
+
+	#[test]
+	fn mcp_authorization_denial_sets_internal_error_context() {
+		use crate::mcp;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::resolve_response;
+
+		let error = ProxyError::MCP(mcp::Error::Authorization(
+			rmcp::model::RequestId::Number(7),
+			"tool".to_string(),
+			"private-item".to_string(),
+		));
+		let mut log = test_request_log();
+		let (response, reason) = resolve_response(Err(error.into()), &mut log, false);
+		let detail = "mcp: authorization denied for tool: private-item";
+		assert_eq!(reason, ProxyResponseReason::Authorization);
+		assert_eq!(log.reason, Some(ProxyResponseReason::Authorization));
+		assert_eq!(log.error.as_deref(), Some(detail));
+		let context = response
+			.extensions()
+			.get::<crate::cel::ProxyContext>()
+			.unwrap();
+		let error = context.error.as_ref().unwrap();
+		assert_eq!(error.reason, "Authorization");
+		assert_eq!(error.message, detail);
+	}
+
+	#[test]
+	fn gen_ai_duration_preserves_response_failures_and_snapshot_metadata() {
+		use crate::http::transformation_cel::TransformationMetadata;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+		use crate::proxy::{ProxyError, ProxyResponse};
+
+		for upstream_failed in [false, true] {
+			for policy in ["none", "error", "direct"] {
+				let (mut log, registry) = test_request_log_with_registry();
+				log.llm_request = Some(metric_test_llm_request());
+				log
+					.cel
+					.ctx()
+					.register_log_expression(&Expression::new_strict("proxy.error").unwrap());
+				let initial = if upstream_failed {
+					Err(ProxyError::NoHealthyEndpoints.into())
+				} else {
+					Ok(::http::Response::new(crate::http::Body::empty()))
+				};
+				let (mut response, mut reason) = resolve_response(initial, &mut log, false);
+				let original_reason = reason;
+				let metadata = TransformationMetadata(serde_json::Map::from_iter([(
+					"marker".to_string(),
+					serde_json::json!("retained"),
+				)]));
+				response.extensions_mut().insert(metadata.clone());
+				match policy {
+					"error" => {
+						(response, reason) = resolve_response(
+							Err(ProxyError::ProcessingString("policy failed".to_string()).into()),
+							&mut log,
+							false,
+						);
+						response.extensions_mut().insert(metadata.clone());
+					},
+					"direct" => {
+						let mut replacement = ::http::Response::builder()
+							.status(http::StatusCode::TOO_MANY_REQUESTS)
+							.body(crate::http::Body::empty())
+							.unwrap();
+						replacement.extensions_mut().insert(metadata.clone());
+						(response, reason) = resolve_response(
+							Err(ProxyResponse::DirectResponse(Box::new(replacement))),
+							&mut log,
+							false,
+						);
+					},
+					_ => {},
+				}
+				let expected_reason = match policy {
+					"error" => ProxyError::ProcessingString("policy failed".to_string()).as_reason(),
+					"direct" => ProxyResponseReason::DirectResponse,
+					_ => original_reason,
+				};
+				assert_eq!(reason, expected_reason);
+				let failed = upstream_failed || policy == "error";
+				assert_eq!(log.error.is_some(), failed);
+				if upstream_failed {
+					assert!(
+						log
+							.error
+							.as_ref()
+							.unwrap()
+							.contains(&ProxyError::NoHealthyEndpoints.to_string())
+					);
+				}
+				if policy == "error" {
+					assert!(log.error.as_ref().unwrap().contains("policy failed"));
+				}
+				// Resolution must leave extensions intact for the single final snapshot.
+				assert!(log.response_snapshot.is_none());
+				assert_eq!(
+					response
+						.extensions()
+						.get::<TransformationMetadata>()
+						.unwrap()
+						.0,
+					metadata.0
+				);
+				assert_eq!(
+					response
+						.extensions()
+						.get::<cel::ProxyContext>()
+						.and_then(|context| context.error.as_ref())
+						.is_some(),
+					failed
+				);
+				set_final_response_fields(&mut log, &reason, &mut response);
+				assert_eq!(log.status, Some(response.status()));
+				assert_eq!(log.reason, Some(reason));
+				let snapshot = log.response_snapshot.as_ref().unwrap();
+				assert_eq!(snapshot.metadata.as_ref().unwrap().0, metadata.0);
+				let error = snapshot
+					.proxy
+					.as_ref()
+					.and_then(|context| context.error.as_ref());
+				assert_eq!(error.is_some(), failed);
+				if let Some(error) = error {
+					assert_eq!(Some(&error.message), log.error.as_ref());
+					assert_eq!(
+						error.reason,
+						if policy == "direct" {
+							original_reason
+						} else {
+							reason
+						}
+						.to_string()
+					);
+				}
+				drop(DropOnLog::from(log));
+				let encoded = encoded_metrics(&registry);
+				let count = encoded
+					.lines()
+					.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+					.unwrap();
+				assert_eq!(count.contains("error_type=\"_OTHER\""), failed, "{count}");
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_metrics_use_the_request_operation() {
+		for (format, operation) in [
+			(InputFormat::Completions, "chat"),
+			(InputFormat::Messages, "chat"),
+			(InputFormat::Responses, "chat"),
+			(InputFormat::Gemini, "generate_content"),
+			(InputFormat::Embeddings, "embeddings"),
+			(InputFormat::Realtime, "realtime"),
+			(InputFormat::Rerank, "rerank"),
+			(InputFormat::Decisions, "decisions"),
+			(InputFormat::CountTokens, "count_tokens"),
+			(InputFormat::GeminiCountTokens, "count_tokens"),
+			(InputFormat::Detect(None), "unknown"),
+			(InputFormat::Detect(Some(DetectedOperation::Chat)), "chat"),
+		] {
+			for streaming in [false, true] {
+				for has_response in [false, true] {
+					let (mut log, registry) = test_request_log_with_registry();
+					let mut request = metric_test_llm_request();
+					request.input_format = format;
+					request.streaming = streaming;
+					log.llm_request = Some(request.clone());
+					if has_response {
+						log.llm_response.store(Some(llm::LLMInfo::new(
+							request,
+							llm::LLMResponse {
+								input_tokens: Some(10),
+								..Default::default()
+							},
+						)));
+						log.status = Some(http::StatusCode::OK);
+					} else {
+						log.error = Some("connection failed".to_string());
+					}
+					drop(DropOnLog::from(log));
+					let encoded = encoded_metrics(&registry);
+					let counts: Vec<_> = encoded
+						.lines()
+						.filter(|line| {
+							line.starts_with("gen_ai_server_request_duration_count")
+								|| line.starts_with("gen_ai_client_token_usage_count")
+						})
+						.collect();
+					assert_eq!(counts.len(), if has_response { 2 } else { 1 });
+					for count in counts {
+						assert!(
+							count.contains(&format!("gen_ai_operation_name=\"{operation}\"")),
+							"{count}"
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_request_duration_requires_a_recognized_llm_operation() {
+		let (mut log, registry) = test_request_log_with_registry();
+		log.status = Some(http::StatusCode::BAD_GATEWAY);
+		log.error = Some("connection failed".to_string());
+		log.reason = Some(ProxyResponseReason::UpstreamFailure);
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		assert!(
+			!encoded
+				.lines()
+				.any(|line| line.starts_with("gen_ai_server_request_duration_count")),
+			"non-GenAI request emitted a GenAI duration observation:\n{encoded}"
+		);
+	}
+
+	#[test]
+	fn gen_ai_error_type_is_specific_to_request_duration() {
+		let (mut log, registry) = test_request_log_with_registry();
+		let request = metric_test_llm_request();
+		let response = llm::LLMResponse {
+			input_tokens: Some(10),
+			output_tokens: Some(5),
+			..Default::default()
+		};
+		log.status = Some(http::StatusCode::INTERNAL_SERVER_ERROR);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		let duration_count = encoded
+			.lines()
+			.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+			.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+		assert!(duration_count.contains("error_type=\"_OTHER\""));
+		for token_line in encoded
+			.lines()
+			.filter(|line| line.starts_with("gen_ai_client_token_usage"))
+		{
+			assert!(
+				!token_line.contains("error_type="),
+				"token metric unexpectedly has error.type: {token_line}"
+			);
+		}
+	}
+
+	#[test]
+	fn database_llm_omitted_preserves_legacy_payload_without_capture_requirements() {
+		let policy: LoggingPolicy = serde_json::from_value(serde_json::json!({
+			"database": {}
+		}))
+		.unwrap();
+		let mut log = test_request_log();
+
+		crate::proxy::httpproxy::apply_logging_policy_to_log(&mut log, &policy);
+
+		assert_eq!(log.database_llm, None);
+		assert!(!log.cel.cel_context.needs_llm_prompt());
+		assert!(!log.cel.cel_context.needs_llm_completion());
+		assert!(database_llm_payload(None, None, Some(&llm_context_with_content())).is_some());
+	}
+
+	#[test]
+	fn database_llm_full_enables_capture_requirements() {
+		let policy: LoggingPolicy = serde_json::from_value(serde_json::json!({
+			"database": {"llm": "full"}
+		}))
+		.unwrap();
+		let mut log = test_request_log();
+
+		crate::proxy::httpproxy::apply_logging_policy_to_log(&mut log, &policy);
+
+		assert_eq!(log.database_llm, Some(DatabaseLlmMode::Full));
+		assert!(!log.cel.cel_context.needs_llm_prompt());
+		assert!(log.cel.cel_context.needs_llm_completion());
+		assert!(log.cel.cel_context.needs_llm_tool_calls());
+	}
+
+	#[test]
+	fn database_llm_metadata_does_not_persist_captured_content() {
+		let context = llm_context_with_content();
+		assert!(database_llm_payload(Some(DatabaseLlmMode::Metadata), None, Some(&context)).is_none());
+	}
+
+	#[test]
+	fn database_add_can_capture_content_without_enabling_payload_storage() {
+		let policy: LoggingPolicy = serde_json::from_value(serde_json::json!({
+			"database": {
+				"llm": "metadata",
+				"add": {"my.prompt": "llm.prompt"}
+			}
+		}))
+		.unwrap();
+		let mut log = test_request_log();
+		let database = policy.database.as_ref().unwrap();
+		for expression in database.add.values_unordered() {
+			log
+				.cel
+				.cel_context
+				.register_log_expression(expression.as_ref());
+		}
+
+		crate::proxy::httpproxy::apply_logging_policy_to_log(&mut log, &policy);
+
+		assert!(log.cel.cel_context.needs_llm_prompt());
+		assert!(!log.cel.cel_context.needs_llm_completion());
+		assert!(log.cel.database_fields.add.contains_key("my.prompt"));
+		assert!(
+			database_llm_payload(
+				Some(DatabaseLlmMode::Metadata),
+				None,
+				Some(&llm_context_with_content())
+			)
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn database_llm_full_persists_content_in_payload_only() {
+		let mut context = llm_context_with_content();
+		context.completion = Some(vec![String::new()]);
+		context.tool_calls = Some(vec![agent_llm::types::ToolCall {
+			id: "call-1".into(),
+			name: "lookup".into(),
+			arguments: serde_json::json!({"query": "weather"}),
+		}]);
+		let messages = vec![agent_llm::types::NormalizedMessage {
+			role: "user".into(),
+			parts: vec![agent_llm::types::NormalizedMessagePart::text(
+				"hello".into(),
+			)],
+		}];
+		let payload =
+			database_llm_payload(Some(DatabaseLlmMode::Full), Some(&messages), Some(&context)).unwrap();
+		assert_eq!(
+			payload.request_prompt_json,
+			Some(serde_json::json!([{
+				"role": "user",
+				"parts": [{"type": "text", "text": "hello"}]
+			}]))
+		);
+		assert_eq!(
+			payload.response_completion_json,
+			Some(serde_json::json!([{
+				"role": "assistant",
+				"parts": [
+					{
+						"type": "toolCall",
+						"id": "call-1",
+						"name": "lookup",
+						"arguments": {"query": "weather"}
+					}
+				]
+			}]))
+		);
+	}
+
+	#[test]
+	fn default_health_treats_server_grpc_status_as_unhealthy() {
+		let mut log = test_request_log();
+		log.status = Some(http::StatusCode::OK);
+		log.grpc_status.store(Some(13));
+		assert!(DropOnLog::default_unhealthy(&log));
+
+		log.grpc_status.store(Some(3));
+		assert!(!DropOnLog::default_unhealthy(&log));
+
+		log.grpc_status.store(Some(0));
+		assert!(!DropOnLog::default_unhealthy(&log));
+	}
+
+	#[test]
+	fn span_writer_flushes_recorded_spans_as_children_of_request_span() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.tracer = Some(tracer.clone());
+
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		request.outgoing_span = Some(outgoing.clone());
+
+		{
+			let _span = request.span_writer().start("buffered child span");
+		}
+
+		drop(DropOnLog::from(request));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		assert_eq!(spans.len(), 2);
+
+		let child = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "buffered child span")
+			.expect("buffered span should be exported");
+		assert_eq!(child.span_kind, SpanKind::Server);
+		assert_eq!(child.parent_span_id, outgoing.span_id.into());
+		assert_eq!(child.span_context.trace_id(), outgoing.trace_id.into());
+		assert!(!child.parent_span_is_remote);
+	}
+
+	#[test]
+	fn span_writer_records_outbound_client_span_and_propagates_it() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.tracer = Some(tracer.clone());
+
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		request.outgoing_span = Some(outgoing.clone());
+
+		let mut outbound_request = ::http::Request::new(crate::http::Body::empty());
+		{
+			let mut span = request.span_writer().start_outbound(OutboundCallLabels {
+				kind: OutboundCallKind::Policy,
+				subtype: OutboundCallSubtype::ExtAuthz,
+			});
+			span.inject_context(&mut outbound_request);
+			span.set_error(
+				ProxyResponseReason::ExtAuth.to_string(),
+				"authorization denied",
+			);
+		}
+		let propagated = trc::TraceParent::from_request(&outbound_request).unwrap();
+
+		drop(DropOnLog::from(request));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let child = spans
+			.iter()
+			.find(|span| span.name.as_ref() == OutboundCallSubtype::ExtAuthz.as_str())
+			.expect("outbound span should be exported");
+		assert_eq!(child.span_kind, SpanKind::Client);
+		assert_eq!(child.parent_span_id, outgoing.span_id.into());
+		assert_eq!(child.span_context.trace_id(), outgoing.trace_id.into());
+		assert_eq!(child.span_context.span_id(), propagated.span_id.into());
+		assert!(child.attributes.contains(&KeyValue::new(
+			"agentgateway.outbound.kind",
+			OutboundCallKind::Policy.as_str(),
+		)));
+		assert!(child.attributes.contains(&KeyValue::new(
+			"agentgateway.outbound.subtype",
+			OutboundCallSubtype::ExtAuthz.as_str(),
+		)));
+		assert!(child.attributes.contains(&KeyValue::new(
+			"error.type",
+			ProxyResponseReason::ExtAuth.to_string(),
+		)));
+		assert_eq!(child.status, Status::error("authorization denied"));
+	}
+
+	#[test]
+	fn outbound_client_span_classifies_http_response_status() {
+		let (tracer, _exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.tracer = Some(tracer);
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		request.outgoing_span = Some(outgoing);
+
+		for (status, expected) in [
+			(http::StatusCode::OK, Status::default()),
+			(http::StatusCode::FOUND, Status::default()),
+			(http::StatusCode::TOO_MANY_REQUESTS, Status::error("")),
+			(http::StatusCode::INTERNAL_SERVER_ERROR, Status::error("")),
+		] {
+			let mut span = request.span_writer().start_outbound(OutboundCallLabels {
+				kind: OutboundCallKind::Primary,
+				subtype: OutboundCallSubtype::Llm,
+			});
+			span.record_http_client_status(status);
+
+			assert_eq!(span.status, expected, "status {status}");
+			assert!(
+				span
+					.attributes
+					.contains(&KeyValue::new("http.status", i64::from(status.as_u16()),))
+			);
+			let error_type = span
+				.attributes
+				.iter()
+				.find(|attribute| attribute.key.as_str() == "error.type");
+			if status.is_client_error() || status.is_server_error() {
+				assert_eq!(
+					error_type.map(|attribute| attribute.value.as_str().into_owned()),
+					Some(status.as_u16().to_string()),
+				);
+			} else {
+				assert!(error_type.is_none());
+			}
+		}
+	}
+
+	#[test]
+	fn span_writer_noops_for_unsampled_outgoing_span() {
+		let (tracer, exporter) = test_tracer();
+		let mut request = test_request_log();
+		request.tracer = Some(tracer.clone());
+
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 0;
+		request.outgoing_span = Some(outgoing);
+
+		{
+			let mut span = request.span_writer().start("buffered child span");
+			span.rename_span("renamed child span");
+		}
+
+		drop(DropOnLog::from(request));
+		let _ = tracer.provider.force_flush();
+
+		assert!(exporter.finished_spans().is_empty());
+	}
+
+	#[test]
+	fn llm_span_uses_cache_inclusive_input_tokens() {
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: strng::literal!("claude"),
+			provider: strng::literal!("anthropic"),
+			streaming: false,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+		let response = llm::LLMResponse {
+			input_tokens: Some(50),
+			cached_input_tokens: Some(40),
+			cache_creation_input_tokens: Some(10),
+			input_audio_tokens: Some(3),
+			output_tokens: Some(20),
+			output_audio_tokens: Some(4),
+			reasoning_tokens: Some(5),
+			total_tokens: Some(70),
+			..Default::default()
+		};
+
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		assert_eq!(
+			value("gen_ai.usage.input_tokens"),
+			Some(&opentelemetry::Value::I64(100))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_read.input_tokens"),
+			Some(&opentelemetry::Value::I64(40))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(10))
+		);
+		assert_eq!(
+			value("gen_ai.usage.reasoning_tokens"),
+			Some(&opentelemetry::Value::I64(5))
+		);
+		assert_eq!(
+			value("gen_ai.usage.input_audio_tokens"),
+			Some(&opentelemetry::Value::I64(3))
+		);
+		assert_eq!(
+			value("gen_ai.usage.output_audio_tokens"),
+			Some(&opentelemetry::Value::I64(4))
+		);
+	}
+
+	#[tokio::test]
+	async fn llm_cost_breakdown_span_attributes() {
+		let catalog_file = tempfile::NamedTempFile::new().unwrap();
+		fs_err::write(
+			catalog_file.path(),
+			r#"{"providers":{"openai":{"models":{"my-model":{"rates":{"input":"1","output":"2","perPage":"0.005"}}}}}}"#,
+		)
+		.unwrap();
+		let catalog = ModelCatalog::new(vec![crate::ModelCatalogSource::File {
+			file: catalog_file.path().to_path_buf(),
+		}])
+		.await
+		.unwrap();
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Completions,
+			cache_convention: llm::CacheTokenConvention::InputIncludesCache,
+			request_model: strng::literal!("my-model"),
+			provider: strng::literal!("openai"),
+			streaming: false,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+		let response = llm::LLMResponse {
+			input_tokens: Some(1_000_000),
+			output_tokens: Some(0),
+			pages: Some(4),
+			..Default::default()
+		};
+		for _ in 0..20 {
+			let projection = catalog.project(&llm::LLMInfo::new(request.clone(), response.clone()));
+			if projection.cost.is_some() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.model_catalog = catalog;
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let has = |key: &str| span.attributes.iter().any(|attr| attr.key.as_str() == key);
+		for expected in [
+			"agw.ai.usage.cost.total", // lossless decimal total (also on the structured log)
+			"agw.ai.usage.cost.input", // a span-only exact breakdown component
+		] {
+			assert!(has(expected), "expected {expected} span attribute");
+		}
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| attr.value.to_string())
+		};
+		// 1M input tokens at $1/1M plus 4 pages at $0.005/page: the page line is priced per page.
+		assert_eq!(value("agw.ai.usage.cost.pages").as_deref(), Some("0.020"));
+		assert_eq!(value("agw.ai.usage.cost.total").as_deref(), Some("1.020"));
+		assert!(
+			span
+				.attributes
+				.iter()
+				.all(|attr| attr.key.as_str() != "gen_ai.usage.cost"),
+			"cost must not be emitted under the GenAI semantic convention namespace"
+		);
+		assert!(
+			span
+				.attributes
+				.iter()
+				.all(|attr| attr.key.as_str() != "agw.usage.cost"),
+			"cost should use the AGW AI usage namespace"
+		);
+	}
+
+	#[test]
+	fn original_model_span_attribute() {
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(metric_test_llm_request());
+		log.original_model = Some("smart-model".to_string());
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| attr.value.to_string())
+		};
+		assert_eq!(value("gen_ai.request.model").as_deref(), Some("test-model"));
+		assert_eq!(
+			value("agw.ai.original_model").as_deref(),
+			Some("smart-model")
+		);
+	}
+
+	#[test]
+	fn a2a_response_span_attributes() {
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.backend_protocol = Some(cel::BackendProtocol::a2a);
+		log.a2a_method = Some(strng::literal!("tasks/send"));
+		log.a2a_response = Some(a2a::ResponseInfo {
+			outcome: a2a::ResponseOutcome::Error,
+			error_code: Some(-32602),
+			result_kind: Some(strng::literal!("task")),
+			task_state: Some(strng::literal!("failed")),
+			context_id: Some(strng::literal!("ctx-123")),
+		});
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let has = |key: &str| span.attributes.iter().any(|attr| attr.key.as_str() == key);
+		for expected in [
+			"a2a.response.outcome",
+			"a2a.response.error_code",
+			"a2a.result.kind",
+			"a2a.task.state",
+			"a2a.context.id",
+		] {
+			assert!(has(expected), "expected {expected} span attribute");
+		}
+	}
+}

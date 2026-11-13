@@ -1,0 +1,26 @@
+package proxy
+
+import (
+	"github.com/spf13/cobra"
+
+	"github.com/agentgateway/agentgateway/controller/pkg/cli/flag"
+	"github.com/agentgateway/agentgateway/controller/pkg/cli/proxy/config"
+	"github.com/agentgateway/agentgateway/controller/pkg/cli/proxy/log"
+	"github.com/agentgateway/agentgateway/controller/pkg/cli/proxy/profile"
+	"github.com/agentgateway/agentgateway/controller/pkg/cli/proxy/trace"
+)
+
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "proxy",
+		Short: "Inspect and manage the agentgateway proxy",
+		Long:  "Inspect and manage the agentgateway proxy admin API.",
+	}
+
+	cmd.AddCommand(flag.BuildCobra(config.Command))
+	cmd.AddCommand(flag.BuildCobra(profile.Command))
+	cmd.AddCommand(flag.BuildCobra(trace.Command))
+	cmd.AddCommand(log.Command())
+
+	return cmd
+}

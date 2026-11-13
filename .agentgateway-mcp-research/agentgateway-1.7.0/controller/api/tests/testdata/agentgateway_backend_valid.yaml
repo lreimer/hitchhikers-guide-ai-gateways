@@ -1,0 +1,333 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-default
+spec:
+  ai:
+    provider:
+      copilot: {}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-model
+spec:
+  ai:
+    provider:
+      copilot:
+        model: gpt-test
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: copilot-group
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: default
+        copilot: {}
+      - name: override
+        copilot:
+          model: gpt-test
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: ai-simple
+spec:
+  ai:
+    provider:
+      openai: {}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: ai-full
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: openai-gpt4
+        openai: {}
+        policies:
+          authorization:
+            policy:
+              matchExpressions:
+              - 'request.headers["x-tenant"] == "acme"'
+          ai:
+            modelAliases:
+              fast: gpt-5-nano
+              slow: gpt-4o
+            overrides:
+            - field: model
+              value: gpt-4
+            defaults:
+              - field: logit_bias
+                value: {"50256": -100}
+            prompt:
+              prepend:
+                - content: "be nice"
+                  role: system
+              append:
+                - content: "hello!"
+                  role: user
+            promptCaching:
+              cacheMessages: true
+              cacheSystem: true
+              minTokens: 1024
+            promptGuard:
+              request:
+              - regex:
+                  builtins:
+                  - CreditCard
+                  matches:
+                  - 'bad.*'
+                response:
+                  message: "regex rejected"
+              - openAIModeration:
+                  policies:
+                    tls:
+                      insecureSkipVerify: All
+              - webhook:
+                  backendRef:
+                    name: hello
+                    kind: AgentgatewayBackend
+                    group: agentgateway.dev
+                  failureMode: FailOpen
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-full
+spec:
+  policies:
+    mcp:
+      authorization:
+        action: Deny
+        policy:
+          matchExpressions:
+            - 'mcp.tool.name == "hello"'
+      authentication:
+        issuer: https://issuer.example.com/
+        jwks:
+          backendRef:
+            name: jwks
+            port: 443
+          jwksPath: /.well-known/jwks.json
+  mcp:
+    prefixMode: Never
+    targets:
+    - name: everything
+      static:
+        host: example.com
+        port: 443
+        policies:
+          tls: {}
+    - name: k8s
+      selector:
+        namespaces:
+          matchLabels:
+            kubernetes.io/metadata.name: mcp-servers
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: static-full
+spec:
+  policies:
+    http:
+      version: HTTP2
+    authorization:
+      policy:
+        matchExpressions:
+        - 'request.headers["x-tenant"] == "acme"'
+  static:
+    host: example.com
+    port: 443
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: ai-providers
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: openai
+        openai:
+          model: gpt-4
+      - name: vertex
+        vertexai:
+          projectId: "123"
+          region: global
+      - name: azure
+        azureopenai:
+          endpoint: test
+      - name: anthropic
+        anthropic:
+          model: claude
+      - name: gemini
+        gemini:
+          model: xx
+      - name: local
+        openai:
+          model: ollama
+        host: localhost
+        port: 8443
+        path: /custom
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-require
+spec:
+  mcp:
+    targets:
+    - name: everything
+      static:
+        host: example.com
+        port: 443
+  policies:
+    mcp:
+      authorization:
+        action: Require
+        policy:
+          matchExpressions:
+          - 'mcp.tool.name == "hello"'
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-backend-ref
+spec:
+  mcp:
+    targets:
+    - name: local-svc
+      static:
+        backendRef:
+          name: mcp-service
+        port: 8080
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: custom-provider-service-backendref
+spec:
+  ai:
+    provider:
+      custom:
+        backendRef:
+          name: llm-service
+          port: 8080
+        formats:
+        - type: Completions
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: custom-provider-inferencepool-backendref
+spec:
+  ai:
+    provider:
+      custom:
+        backendRef:
+          group: inference.networking.k8s.io
+          kind: InferencePool
+          name: llama-pool
+        formats:
+        - type: Completions
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: custom-provider-direct-host-port
+spec:
+  ai:
+    provider:
+      custom:
+        model: llama3
+        formats:
+        - type: Messages
+          path: /api/chat
+      host: llm.example.com
+      port: 443
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-backend-runtimepreferred-guardrail
+spec:
+  ai:
+    provider:
+      bedrock:
+        endpointPreference: RuntimePreferred
+        guardrail:
+          identifier: test-guardrail
+          version: "1"
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-backend-mantlepreferred
+spec:
+  ai:
+    provider:
+      bedrock:
+        endpointPreference: MantlePreferred
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-backend-mantleonly
+spec:
+  ai:
+    provider:
+      bedrock:
+        endpointPreference: MantleOnly
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-group-runtimeonly-guardrail
+spec:
+  ai:
+    groups:
+    - providers:
+      - name: bedrock
+        bedrock:
+          endpointPreference: RuntimeOnly
+          guardrail:
+            identifier: test-guardrail
+            version: "1"
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-single-selector-target-condition
+spec:
+  mcp:
+    targets:
+    - name: internal
+      selector:
+        services:
+          matchLabels:
+            app: mcp
+      condition: 'jwt.sub == "admin"'
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-multi-static-target-condition
+spec:
+  mcp:
+    targets:
+    - name: admin
+      static:
+        host: admin.example.com
+        port: 80
+      condition: 'jwt.sub == "admin"'
+    - name: public
+      static:
+        host: public.example.com
+        port: 80

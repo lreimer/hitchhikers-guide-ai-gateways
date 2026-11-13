@@ -1,0 +1,691 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
+use azure_identity::UserAssignedId;
+use secrecy::{ExposeSecret, SecretString};
+use tracing::trace;
+
+use super::BackendAuthError;
+use crate::serdes::schema;
+use crate::util::ErrorContext;
+use crate::{apply, client, ser_redact};
+
+// The Rust sdk for Azure is the only one that requires users to manually specify their auth method
+// for all non-developer use-cases. Therefore, we have to carry these different options in our API....
+// More context here: https://github.com/Azure/azure-sdk-for-rust/issues/2283
+#[apply(schema!)]
+pub enum AzureAuthCredentialSource {
+	ClientSecret {
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		tenant_id: String,
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		client_id: String,
+		#[serde(serialize_with = "ser_redact")]
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		client_secret: SecretString,
+	},
+	#[serde(rename_all = "camelCase")]
+	ManagedIdentity {
+		user_assigned_identity: Option<AzureUserAssignedIdentity>,
+	},
+	WorkloadIdentity {},
+}
+
+#[apply(schema!)]
+pub enum AzureUserAssignedIdentity {
+	ClientId(String),
+	ObjectId(String),
+	ResourceId(String),
+}
+
+/// Per-instance credential cache for [`AzureAuth`].
+///
+/// Each [`AzureAuth`] value owns its own cache so that different backends
+/// (e.g. two `ExplicitConfig` entries with different client secrets) get
+/// independent credentials instead of sharing a single global cache.
+/// Clones share the same underlying `Arc`, so the credential is built at
+/// most once per config instance.
+#[derive(Default, Clone)]
+pub struct AzureCredentialCache(
+	Arc<tokio::sync::OnceCell<Arc<dyn azure_core::credentials::TokenCredential>>>,
+);
+
+impl std::fmt::Debug for AzureCredentialCache {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("AzureCredentialCache")
+	}
+}
+
+#[apply(schema!)]
+pub struct AzureAuth {
+	#[serde(flatten)]
+	pub kind: AzureAuthKind,
+	/// Scopes requested for the Azure access token. When unset, the scope is
+	/// inferred from the backend hostname.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub scopes: Vec<String>,
+}
+
+#[apply(schema!)]
+pub enum AzureAuthKind {
+	/// Use explicit Azure credentials
+	#[serde(rename_all = "camelCase")]
+	ExplicitConfig {
+		#[serde(flatten)]
+		credential_source: AzureAuthCredentialSource,
+		/// Cached credential, populated on first use.
+		#[serde(skip)]
+		#[cfg_attr(feature = "schema", schemars(skip))]
+		cached_cred: AzureCredentialCache,
+	},
+	/// Use implicit Azure auth. Note that this is for developer use-cases only!
+	DeveloperImplicit {
+		/// Cached credential, populated on first use.
+		#[serde(skip)]
+		#[cfg_attr(feature = "schema", schemars(skip))]
+		cached_cred: AzureCredentialCache,
+	},
+	/// Automatically detect authentication method based on environment.
+	/// Uses Workload Identity on K8s, Managed Identity on Azure VMs, or Developer Tools locally.
+	Implicit {
+		/// Cached credential, populated on first use.
+		#[serde(skip)]
+		#[cfg_attr(feature = "schema", schemars(skip))]
+		cached_cred: AzureCredentialCache,
+	},
+}
+
+impl Default for AzureAuth {
+	fn default() -> Self {
+		Self {
+			kind: AzureAuthKind::Implicit {
+				cached_cred: Default::default(),
+			},
+			scopes: Vec::new(),
+		}
+	}
+}
+
+const SCOPES: &[&str] = &["https://cognitiveservices.azure.com/.default"];
+const FOUNDRY_SCOPES: &[&str] = &["https://ai.azure.com/.default"];
+
+fn scopes_for_target<'a>(
+	auth: &'a AzureAuth,
+	target: &crate::types::agent::Target,
+) -> Vec<&'a str> {
+	if !auth.scopes.is_empty() {
+		return auth.scopes.iter().map(String::as_str).collect();
+	}
+	if matches!(target, crate::types::agent::Target::Hostname(h, _) if h.ends_with(".services.ai.azure.com"))
+	{
+		FOUNDRY_SCOPES.to_vec()
+	} else {
+		SCOPES.to_vec()
+	}
+}
+
+/// A credential chain that mirrors the Azure Go SDK's DefaultAzureCredential.
+///
+/// DefaultAzureCredential is an opinionated, preconfigured chain of credentials
+/// designed to support many environments along with the most common authentication
+/// flows and developer tools.
+///
+/// The chain tries each credential in order, stopping when one provides a token:
+///
+/// 1. **EnvironmentCredential** - Reads `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+///    `AZURE_CLIENT_SECRET` to authenticate as a service principal. Most often used
+///    in server environments but can also be used locally.
+/// 2. **WorkloadIdentityCredential** - If deployed to a Kubernetes host with Workload
+///    Identity enabled (detected via `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_TENANT_ID`,
+///    `AZURE_CLIENT_ID`), authenticates using the federated token.
+/// 3. **ManagedIdentityCredential** - If deployed to an Azure host with Managed Identity
+///    enabled (App Service, Azure VMs via IMDS, etc.), authenticates using that identity.
+///    Supports user-assigned identity via `AZURE_CLIENT_ID`.
+/// 4. **DeveloperToolsCredential** - Falls back to developer tools: Azure CLI
+///    (`az login`) and Azure Developer CLI (`azd auth login`).
+///
+/// Once a credential successfully provides a token, it is cached and used for all
+/// subsequent token requests.
+///
+/// Reference: <https://learn.microsoft.com/azure/developer/go/azure-sdk-authentication>
+struct DefaultAzureCredential {
+	sources: Vec<(&'static str, Arc<dyn TokenCredential>)>,
+	/// Errors from credentials that failed to *construct*
+	construction_errors: Vec<String>,
+	/// Index of the source that first provided a token.
+	/// `usize::MAX` indicates no source has provided a token yet.
+	cached_source_index: AtomicUsize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct AzureCredentialChainError {
+	provider_failure: bool,
+	message: String,
+}
+
+impl std::fmt::Debug for DefaultAzureCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("DefaultAzureCredential")
+	}
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for DefaultAzureCredential {
+	async fn get_token(
+		&self,
+		scopes: &[&str],
+		options: Option<TokenRequestOptions<'_>>,
+	) -> azure_core::Result<AccessToken> {
+		// If a credential has previously succeeded, use it directly.
+		let cached_index = self.cached_source_index.load(Ordering::Relaxed);
+		if cached_index != usize::MAX
+			&& let Some((name, source)) = self.sources.get(cached_index)
+		{
+			trace!("DefaultAzureCredential: using cached credential: {name}");
+			return source.get_token(scopes, options).await;
+		}
+		// Try each credential in order, caching the first one that succeeds.
+		let mut errors = Vec::new();
+		for (index, (name, source)) in self.sources.iter().enumerate() {
+			match source.get_token(scopes, options.clone()).await {
+				Ok(token) => {
+					trace!("DefaultAzureCredential: authenticated with {name}");
+					self.cached_source_index.store(index, Ordering::Relaxed);
+					return Ok(token);
+				},
+				Err(error) => {
+					trace!("DefaultAzureCredential: {name} failed: {error}");
+					errors.push(error);
+				},
+			}
+		}
+
+		let provider_failure = errors.iter().any(is_azure_credential_provider_error);
+		let mut message = format!(
+			"DefaultAzureCredential: all credentials failed:\n{}",
+			format_credential_errors(&errors)
+		);
+		if !self.construction_errors.is_empty() {
+			message.push_str(&format!(
+				"\nCredentials excluded because they could not be constructed:\n{}",
+				self.construction_errors.join("\n")
+			));
+		}
+		Err(azure_core::Error::new(
+			azure_core::error::ErrorKind::Credential,
+			AzureCredentialChainError {
+				provider_failure,
+				message,
+			},
+		))
+	}
+}
+
+fn is_azure_credential_provider_error(error: &azure_core::Error) -> bool {
+	let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+	while let Some(error) = current {
+		if let Some(chain_error) = error.downcast_ref::<AzureCredentialChainError>() {
+			return chain_error.provider_failure;
+		}
+		if let Some(azure_error) = error.downcast_ref::<azure_core::Error>() {
+			match azure_error.kind() {
+				azure_core::error::ErrorKind::HttpResponse { status, .. } => {
+					return status.is_server_error()
+						|| matches!(
+							*status,
+							azure_core::http::StatusCode::RequestTimeout
+								| azure_core::http::StatusCode::TooManyRequests
+						);
+				},
+				azure_core::error::ErrorKind::Connection | azure_core::error::ErrorKind::DataConversion => {
+					return true;
+				},
+				_ => {},
+			}
+		}
+		current = error.source();
+	}
+	false
+}
+
+fn classify_azure_token_error(error: azure_core::Error) -> BackendAuthError {
+	if is_azure_credential_provider_error(&error) {
+		BackendAuthError::credential_provider(error)
+	} else {
+		BackendAuthError::local(error)
+	}
+}
+
+fn azure_bearer_header(token: &str) -> Result<http::HeaderValue, BackendAuthError> {
+	let mut header = http::HeaderValue::from_str(&format!("Bearer {token}"))
+		.map_err(BackendAuthError::credential_provider)?;
+	header.set_sensitive(true);
+	Ok(header)
+}
+
+fn format_credential_errors(errors: &[azure_core::Error]) -> String {
+	use std::error::Error;
+	errors
+		.iter()
+		.map(|e| {
+			let mut current: Option<&dyn Error> = Some(e);
+			let mut stack = vec![];
+			while let Some(err) = current.take() {
+				stack.push(err.to_string());
+				current = err.source();
+			}
+			stack.join(" - ")
+		})
+		.collect::<Vec<String>>()
+		.join("\n")
+}
+
+/// The IMDS endpoint used by ManagedIdentityCredential when no other
+/// managed-identity source is detected via environment variables.
+const IMDS_ADDR: &str = "169.254.169.254:80";
+
+/// Quick TCP probe timeout. If we can't connect to IMDS within this
+/// duration, skip ManagedIdentityCredential to avoid the SDK's long
+/// retry loop (~99 s with 5 retries + exponential backoff).
+const IMDS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Returns true if IMDS appears reachable (TCP connect within timeout).
+async fn imds_is_reachable() -> bool {
+	tokio::time::timeout(
+		IMDS_PROBE_TIMEOUT,
+		tokio::net::TcpStream::connect(IMDS_ADDR),
+	)
+	.await
+	.map(|r| r.is_ok())
+	.unwrap_or(false)
+}
+
+/// Returns true when a managed-identity env-var source is configured
+/// (App Service, Service Fabric, Cloud Shell, Arc). In those cases we
+/// skip the IMDS probe because the SDK will use the env-var endpoint
+/// instead.
+fn has_managed_identity_env_vars() -> bool {
+	std::env::var_os("IDENTITY_ENDPOINT").is_some() || std::env::var_os("MSI_ENDPOINT").is_some()
+}
+
+async fn build_credential(
+	client: &client::Client,
+	auth: &AzureAuth,
+) -> anyhow::Result<Arc<dyn TokenCredential>> {
+	let client_options = azure_core::http::ClientOptions {
+		transport: Some(azure_core::http::Transport::new(Arc::new(client.clone()))),
+		..Default::default()
+	};
+	match &auth.kind {
+		AzureAuthKind::ExplicitConfig {
+			credential_source, ..
+		} => match credential_source {
+			AzureAuthCredentialSource::ClientSecret {
+				tenant_id,
+				client_id,
+				client_secret,
+			} => Ok(azure_identity::ClientSecretCredential::new(
+				tenant_id,
+				client_id.to_string(),
+				azure_core::credentials::Secret::new(client_secret.expose_secret().to_string()),
+				Some(azure_identity::ClientSecretCredentialOptions { client_options }),
+			)?),
+			AzureAuthCredentialSource::ManagedIdentity {
+				user_assigned_identity,
+			} => {
+				// Always construct ManagedIdentityCredentialOptions so that the
+				// custom reqwest-backed transport is injected regardless of whether
+				// a user-assigned identity is specified.
+				//
+				// Before this fix, .map() short-circuited to None for system-assigned
+				// identity (managedIdentity: {}), causing ManagedIdentityCredential::new(None)
+				// to fall back to NoopClient which panics on every IMDS request.
+				// See: https://github.com/agentgateway/agentgateway/issues/900
+				let options = azure_identity::ManagedIdentityCredentialOptions {
+					user_assigned_id: user_assigned_identity.as_ref().map(|uami| match uami {
+						AzureUserAssignedIdentity::ClientId(cid) => UserAssignedId::ClientId(cid.to_string()),
+						AzureUserAssignedIdentity::ObjectId(oid) => UserAssignedId::ObjectId(oid.to_string()),
+						AzureUserAssignedIdentity::ResourceId(rid) => {
+							UserAssignedId::ResourceId(rid.to_string())
+						},
+					}),
+					client_options,
+				};
+				Ok(azure_identity::ManagedIdentityCredential::new(Some(
+					options,
+				))?)
+			},
+			AzureAuthCredentialSource::WorkloadIdentity {} => {
+				Ok(azure_identity::WorkloadIdentityCredential::new(Some(
+					azure_identity::WorkloadIdentityCredentialOptions {
+						credential_options: azure_identity::ClientAssertionCredentialOptions { client_options },
+						..Default::default()
+					},
+				))?)
+			},
+		},
+		AzureAuthKind::DeveloperImplicit { .. } => {
+			Ok(azure_identity::DeveloperToolsCredential::new(None)?)
+		},
+		AzureAuthKind::Implicit { .. } => {
+			// Build a DefaultAzureCredential chain following the Azure Go SDK pattern.
+			// Each credential is tried in order; the first to succeed is cached and
+			// used for all subsequent requests.
+			//
+			// Order:
+			// 1. EnvironmentCredential (service principal via env vars)
+			// 2. WorkloadIdentityCredential (Kubernetes workload identity)
+			// 3. ManagedIdentityCredential (Azure VMs, App Service, etc.)
+			// 4. DeveloperToolsCredential (Azure CLI, Azure Developer CLI)
+			let mut sources: Vec<(&'static str, Arc<dyn TokenCredential>)> = Vec::new();
+			let mut errors: Vec<String> = Vec::new();
+
+			// 1. EnvironmentCredential — authenticate as a service principal.
+			// Checks AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET.
+			// This mirrors the Go SDK's EnvironmentCredential which also supports
+			// certificate and username/password flows, but client secret is the
+			// most common server-side pattern.
+			if let (Ok(tenant_id), Ok(client_id), Ok(client_secret)) = (
+				std::env::var("AZURE_TENANT_ID"),
+				std::env::var("AZURE_CLIENT_ID"),
+				std::env::var("AZURE_CLIENT_SECRET"),
+			) {
+				match azure_identity::ClientSecretCredential::new(
+					&tenant_id,
+					client_id,
+					azure_core::credentials::Secret::new(client_secret),
+					Some(azure_identity::ClientSecretCredentialOptions {
+						client_options: client_options.clone(),
+					}),
+				) {
+					Ok(cred) => {
+						trace!("DefaultAzureCredential: added EnvironmentCredential to chain");
+						sources.push(("EnvironmentCredential", cred));
+					},
+					Err(e) => {
+						trace!("DefaultAzureCredential: EnvironmentCredential construction failed: {e}");
+						errors.push(format!("EnvironmentCredential: {e}"));
+					},
+				}
+			}
+
+			// 2. WorkloadIdentityCredential — Kubernetes workload identity.
+			// The constructor reads AZURE_FEDERATED_TOKEN_FILE, AZURE_TENANT_ID,
+			// and AZURE_CLIENT_ID internally and returns an error if they're not set.
+			match azure_identity::WorkloadIdentityCredential::new(Some(
+				azure_identity::WorkloadIdentityCredentialOptions {
+					credential_options: azure_identity::ClientAssertionCredentialOptions {
+						client_options: client_options.clone(),
+					},
+					..Default::default()
+				},
+			)) {
+				Ok(cred) => {
+					trace!("DefaultAzureCredential: added WorkloadIdentityCredential to chain");
+					sources.push(("WorkloadIdentityCredential", cred));
+				},
+				Err(e) => {
+					trace!("DefaultAzureCredential: WorkloadIdentityCredential not available: {e}");
+					errors.push(format!("WorkloadIdentityCredential: {e}"));
+				},
+			}
+
+			// 3. ManagedIdentityCredential — Azure VMs, App Service, etc.
+			// The constructor detects the managed identity source from env vars
+			// (IDENTITY_ENDPOINT, MSI_ENDPOINT, etc.) and defaults to IMDS.
+			// Supports user-assigned identity via AZURE_CLIENT_ID.
+			//
+			// When no env-var source is detected, the SDK falls back to IMDS at
+			// 169.254.169.254. If we're not on an Azure VM, the SDK's internal
+			// retry policy will hammer the unreachable endpoint for ~99 s before
+			// giving up. To avoid this, we do a quick 1 s TCP probe first.
+			{
+				let should_try_mi = if has_managed_identity_env_vars() {
+					// A known endpoint is set (App Service, Service Fabric, etc.).
+					// Skip the IMDS probe — the SDK will use the env-var endpoint.
+					trace!("DefaultAzureCredential: managed-identity env vars detected, skipping IMDS probe");
+					true
+				} else {
+					let reachable = imds_is_reachable().await;
+					if reachable {
+						trace!("DefaultAzureCredential: IMDS is reachable");
+					} else {
+						trace!(
+							"DefaultAzureCredential: IMDS not reachable within {IMDS_PROBE_TIMEOUT:?}, skipping ManagedIdentityCredential"
+						);
+					}
+					reachable
+				};
+
+				if should_try_mi {
+					let mi_options = azure_identity::ManagedIdentityCredentialOptions {
+						user_assigned_id: std::env::var("AZURE_CLIENT_ID")
+							.ok()
+							.map(UserAssignedId::ClientId),
+						client_options: client_options.clone(),
+					};
+					match azure_identity::ManagedIdentityCredential::new(Some(mi_options)) {
+						Ok(cred) => {
+							trace!("DefaultAzureCredential: added ManagedIdentityCredential to chain");
+							sources.push(("ManagedIdentityCredential", cred));
+						},
+						Err(e) => {
+							trace!("DefaultAzureCredential: ManagedIdentityCredential not available: {e}");
+							errors.push(format!("ManagedIdentityCredential: {e}"));
+						},
+					}
+				} else {
+					errors
+						.push("ManagedIdentityCredential: IMDS not reachable (probe timed out)".to_string());
+				}
+			}
+
+			// 4. DeveloperToolsCredential — Azure CLI and Azure Developer CLI.
+			// This is the fallback for local development. The credential runs
+			// `az account get-access-token` or `azd auth token` under the hood.
+			match azure_identity::DeveloperToolsCredential::new(None) {
+				Ok(cred) => {
+					trace!("DefaultAzureCredential: added DeveloperToolsCredential to chain");
+					sources.push(("DeveloperToolsCredential", cred));
+				},
+				Err(e) => {
+					trace!("DefaultAzureCredential: DeveloperToolsCredential construction failed: {e}");
+					errors.push(format!("DeveloperToolsCredential: {e}"));
+				},
+			}
+
+			if sources.is_empty() {
+				anyhow::bail!(
+					"DefaultAzureCredential: no credentials could be constructed. Errors:\n{}",
+					errors.join("\n")
+				);
+			}
+
+			if !errors.is_empty() {
+				trace!(
+					"DefaultAzureCredential: some credentials could not be constructed:\n{}",
+					errors.join("\n")
+				);
+			}
+
+			Ok(Arc::new(DefaultAzureCredential {
+				sources,
+				construction_errors: errors,
+				cached_source_index: AtomicUsize::new(usize::MAX),
+			}))
+		},
+	}
+}
+pub(super) async fn get_token(
+	client: &client::Client,
+	auth: &AzureAuth,
+	target: &crate::types::agent::Target,
+) -> Result<http::HeaderValue, BackendAuthError> {
+	let cache = match &auth.kind {
+		AzureAuthKind::Implicit { cached_cred, .. } => &cached_cred.0,
+		AzureAuthKind::DeveloperImplicit { cached_cred, .. } => &cached_cred.0,
+		AzureAuthKind::ExplicitConfig { cached_cred, .. } => &cached_cred.0,
+	};
+	let cred = cache
+		.get_or_try_init(|| build_credential(client, auth))
+		.await
+		.map_err(BackendAuthError::local)?
+		.clone();
+	let scopes = scopes_for_target(auth, target);
+	let token = tokio::time::timeout(super::CLOUD_AUTH_TIMEOUT, cred.get_token(&scopes, None))
+		.await
+		.ctx("Azure token fetch timed out after 5s")
+		.map_err(BackendAuthError::credential_provider)?
+		.map_err(classify_azure_token_error)?;
+	let hv = azure_bearer_header(token.token.secret())?;
+	trace!("attached Azure token (scope: {})", scopes[0]);
+	Ok(hv)
+}
+
+#[cfg(test)]
+mod tests {
+	use azure_core::error::ErrorKind;
+	use azure_core::http::StatusCode;
+
+	use super::*;
+
+	#[test]
+	fn classifies_azure_token_errors() {
+		let http_error = |status| {
+			azure_core::Error::with_message(
+				ErrorKind::HttpResponse {
+					status,
+					error_code: None,
+					raw_response: None,
+				},
+				"test error",
+			)
+		};
+		let cases = [
+			(
+				azure_core::Error::with_message(ErrorKind::Credential, "test error"),
+				false,
+			),
+			(http_error(StatusCode::BadRequest), false),
+			(http_error(StatusCode::Unauthorized), false),
+			(http_error(StatusCode::RequestTimeout), true),
+			(http_error(StatusCode::TooManyRequests), true),
+			(http_error(StatusCode::InternalServerError), true),
+			(
+				azure_core::Error::with_message(ErrorKind::Connection, "test error"),
+				true,
+			),
+			(
+				azure_core::Error::with_message(ErrorKind::DataConversion, "test error"),
+				true,
+			),
+			(
+				azure_core::Error::new(
+					ErrorKind::Credential,
+					AzureCredentialChainError {
+						provider_failure: true,
+						message: "test error".to_string(),
+					},
+				),
+				true,
+			),
+		];
+
+		for (error, expect_provider) in cases {
+			let classified = classify_azure_token_error(error);
+			assert_eq!(
+				matches!(classified, BackendAuthError::CredentialProvider(_)),
+				expect_provider
+			);
+		}
+	}
+
+	#[test]
+	fn classifies_malformed_azure_token_as_provider_failure() {
+		assert!(matches!(
+			azure_bearer_header("invalid\ntoken"),
+			Err(BackendAuthError::CredentialProvider(_))
+		));
+	}
+
+	#[test]
+	fn configured_scopes_are_siblings_of_the_auth_kind() {
+		let auth = serde_json::from_str::<AzureAuth>(
+			r#"{
+				"explicitConfig":{"managedIdentity":{}},
+				"scopes":["https://graph.microsoft.com/.default"]
+			}"#,
+		)
+		.expect("Azure auth with configured scopes should parse");
+
+		assert!(matches!(&auth.kind, AzureAuthKind::ExplicitConfig { .. }));
+		assert_eq!(auth.scopes, ["https://graph.microsoft.com/.default"]);
+		assert_eq!(
+			serde_json::to_value(auth).expect("Azure auth with configured scopes should serialize"),
+			serde_json::json!({
+				"explicitConfig": {"managedIdentity": {"userAssignedIdentity": null}},
+				"scopes": ["https://graph.microsoft.com/.default"]
+			})
+		);
+	}
+
+	#[test]
+	fn legacy_auth_shape_round_trips_without_scopes() {
+		let auth = serde_json::from_value::<AzureAuth>(serde_json::json!({"implicit": {}}))
+			.expect("legacy Azure auth should parse");
+
+		assert_eq!(
+			serde_json::to_value(auth).expect("legacy Azure auth should serialize"),
+			serde_json::json!({"implicit": {}})
+		);
+	}
+
+	#[test]
+	fn scopes_default_from_target_and_allow_an_explicit_override() {
+		let mut auth = AzureAuth::default();
+
+		assert_eq!(
+			scopes_for_target(&auth, &("example.openai.azure.com", 443).into()),
+			SCOPES
+		);
+		assert_eq!(
+			scopes_for_target(&auth, &("example.services.ai.azure.com", 443).into()),
+			FOUNDRY_SCOPES
+		);
+
+		auth.scopes = vec!["https://graph.microsoft.com/.default".to_string()];
+		assert_eq!(
+			scopes_for_target(&auth, &("example.services.ai.azure.com", 443).into()),
+			["https://graph.microsoft.com/.default"]
+		);
+	}
+
+	#[test]
+	fn existing_user_assigned_managed_identity_parses() {
+		serde_json::from_str::<AzureAuthCredentialSource>(
+			r#"{"managedIdentity":{"userAssignedIdentity":{"clientId":"cid"}}}"#,
+		)
+		.expect("the existing managed identity shape must remain supported");
+	}
+
+	#[tokio::test]
+	async fn empty_managed_identity_builds_sdk_credential() {
+		let credential_source =
+			serde_json::from_str(r#"{"managedIdentity":{}}"#).expect("managed identity should parse");
+		let auth = AzureAuth {
+			kind: AzureAuthKind::ExplicitConfig {
+				credential_source,
+				cached_cred: Default::default(),
+			},
+			scopes: Vec::new(),
+		};
+		let config = crate::config::parse_config("{}".to_string(), None).expect("config");
+		let client = crate::client::Client::new(&config.dns, None, Default::default(), None);
+
+		build_credential(&client, &auth)
+			.await
+			.expect("system-assigned managed identity should build");
+	}
+}

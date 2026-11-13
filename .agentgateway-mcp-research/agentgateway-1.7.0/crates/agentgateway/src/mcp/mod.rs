@@ -1,0 +1,941 @@
+mod apps;
+pub(crate) mod auth;
+pub(crate) mod dns_rebinding;
+pub(crate) mod guardrails;
+mod handler;
+mod mergestream;
+mod rbac;
+mod router;
+mod session;
+mod sse;
+mod streamablehttp;
+mod subscriptions;
+mod upstream;
+
+use std::borrow::Cow;
+use std::fmt::{Display, Write};
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_core::strng::Strng;
+use axum_core::BoxError;
+use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
+pub use rbac::{McpAuthorization, McpAuthorizationSet, ResourceId, ResourceType};
+use rmcp::model::{
+	CallToolRequestMethod, CallToolResult, CancelTaskMethod, CompleteRequestMethod, ConstString,
+	ContentBlock, DiscoverRequestMethod, ErrorCode, ErrorData, GetPromptRequestMethod, GetTaskMethod,
+	InitializeResultMethod, JsonRpcError, ListPromptsRequestMethod,
+	ListResourceTemplatesRequestMethod, ListResourcesRequestMethod, ListToolsRequestMethod,
+	PingRequestMethod, ProtocolVersion, ReadResourceRequestMethod, RequestId, SetLevelRequestMethod,
+	SubscribeRequestMethod, SubscriptionsListenRequestMethod, UnsubscribeRequestMethod,
+	UpdateTaskMethod,
+};
+pub use router::App;
+use thiserror::Error;
+pub(crate) use upstream::openapi_server_prefix;
+
+use crate::http::SendDirectResponse;
+use crate::proxy::ProxyError;
+use crate::{apply, schema};
+
+#[apply(schema!)]
+#[derive(Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema", schemars(rename = "McpBackendFailureMode"))]
+pub enum FailureMode {
+	/// Fail the entire session if any target fails to initialize or any
+	/// upstream fails during a fanout. This is the default and matches
+	/// current behavior.
+	#[default]
+	FailClosed,
+	/// Skip failed targets/upstreams and continue serving from healthy ones.
+	/// If ALL targets fail, still return an error.
+	FailOpen,
+}
+
+pub(crate) const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_mins(30);
+
+#[derive(Clone)]
+pub(crate) struct CachedRequest(pub rmcp::model::ClientJsonRpcMessage);
+
+impl agent_http::BodyExtension for CachedRequest {}
+
+/// Application-defined "over quota" code (MCP defines none); shared with the guardrail mapping.
+pub(crate) const RESOURCE_EXHAUSTED: ErrorCode = ErrorCode(-32003);
+
+/// Method names of rmcp's typed `ClientRequest` variants. Keep this list in sync with rmcp rev
+/// bumps; only `CustomRequest` and failed typed parses consult it, so drift cannot 404 typed
+/// requests.
+pub(crate) fn is_known_client_request_method(method: &str) -> bool {
+	matches!(
+		method,
+		DiscoverRequestMethod::VALUE
+			| PingRequestMethod::VALUE
+			| InitializeResultMethod::VALUE
+			| CompleteRequestMethod::VALUE
+			| SetLevelRequestMethod::VALUE
+			| GetPromptRequestMethod::VALUE
+			| ListPromptsRequestMethod::VALUE
+			| ListResourcesRequestMethod::VALUE
+			| ListResourceTemplatesRequestMethod::VALUE
+			| ReadResourceRequestMethod::VALUE
+			| SubscriptionsListenRequestMethod::VALUE
+			| SubscribeRequestMethod::VALUE
+			| UnsubscribeRequestMethod::VALUE
+			| CallToolRequestMethod::VALUE
+			| ListToolsRequestMethod::VALUE
+			| GetTaskMethod::VALUE
+			| UpdateTaskMethod::VALUE
+			| CancelTaskMethod::VALUE
+	)
+}
+
+/// JSON-RPC classifies any message without a usable id as a notification, so a `tools/call` sent
+/// without an id (or with an unrepresentable one) would be forwarded with no request authorization.
+/// Only accept notifications in the MCP `notifications/` namespace.
+pub(crate) fn validate_client_message(
+	message: &rmcp::model::ClientJsonRpcMessage,
+) -> Result<(), Error> {
+	if matches!(message, rmcp::model::ClientJsonRpcMessage::Notification(_)) {
+		let method = streamablehttp::message_method(message).unwrap_or("unknown");
+		if !method.starts_with("notifications/") {
+			return Err(Error::InvalidParams(
+				None,
+				format!("{method} is not a notification"),
+			));
+		}
+	}
+	Ok(())
+}
+
+/// True for protocol versions in the modern (2026-07-28+) era, which negotiate via
+/// `server/discover` plus per-request `_meta` rather than a session-establishing `initialize`.
+pub(crate) fn is_modern_version(version: &ProtocolVersion) -> bool {
+	version.as_str() >= ProtocolVersion::STANDARD_HEADERS.as_str()
+}
+
+/// Methods removed for the modern (2026-07-28+) protocol by SEP-2575/SEP-2567:
+/// modern clients use `server/discover` plus per-request `_meta` instead of a
+/// session-establishing `initialize`, and have no session to subscribe/set-level on.
+/// Keep consistent with [`is_known_client_request_method`].
+pub(crate) const REMOVED_METHODS_2026_07_28: &[&str] = &[
+	InitializeResultMethod::VALUE,
+	PingRequestMethod::VALUE,
+	SetLevelRequestMethod::VALUE,
+	SubscribeRequestMethod::VALUE,
+	UnsubscribeRequestMethod::VALUE,
+];
+
+#[cfg(test)]
+#[path = "mcp_tests.rs"]
+mod tests;
+
+#[derive(Error, Debug)]
+pub enum Error {
+	#[error("method not allowed; must be GET, POST, or DELETE")]
+	MethodNotAllowed,
+	#[error("GET event stream is not supported by any upstream")]
+	GetStreamNotSupported,
+	#[error("client must accept both application/json and text/event-stream")]
+	InvalidAccept,
+	#[error("client must accept text/event-stream")]
+	InvalidAcceptGet,
+	#[error("client must send application/json")]
+	InvalidContentType,
+	#[error("fail to deserialize request body: {0}")]
+	Deserialize(crate::http::Error),
+	#[error("request body exceeds the maximum buffer size of {0} bytes")]
+	PayloadTooLarge(usize),
+	#[error("fail to create session: {0}")]
+	StartSession(crate::http::Error),
+	#[error("session not found")]
+	UnknownSession,
+	#[error("session header is required for non-initialize requests")]
+	MissingSessionHeader,
+	#[error("session ID is required")]
+	SessionIdRequired,
+	#[error("invalid session ID header")]
+	InvalidSessionIdHeader,
+	#[error("invalid MCP protocol version header")]
+	InvalidProtocolVersion,
+	#[error("unsupported MCP protocol version: {version}")]
+	UnsupportedVersion {
+		request_id: Option<RequestId>,
+		version: String,
+		include_supported_versions: bool,
+	},
+	#[error("MCP protocol version header/body mismatch")]
+	VersionMismatch(Option<RequestId>),
+	#[error("{1} header/body mismatch")]
+	HeaderBodyMismatch(Option<RequestId>, &'static str),
+	#[error("invalid MCP routing header: {1}")]
+	InvalidRoutingHeader(Option<RequestId>, &'static str),
+	#[error("method not found: {1}")]
+	MethodNotFound(Option<RequestId>, String),
+	#[error("invalid request parameters: {1}")]
+	InvalidParams(Option<RequestId>, String),
+	#[error("failed to start stdio server: {0}")]
+	Stdio(io::Error),
+	#[error("upstream error: {}", .0.status())]
+	UpstreamError(Box<SendDirectResponse>),
+	#[error("failed to send message: {1}")]
+	SendError(Option<RequestId>, String),
+	/// Server-side availability/capability condition (no upstreams reachable, method unsupported by
+	/// the selected transport). Maps to a JSON-RPC internal error, not invalid-params: the client's
+	/// request was well-formed.
+	#[error("{1}")]
+	Unavailable(Option<RequestId>, String),
+	#[error("authorization denied for {1}: {2}")]
+	Authorization(RequestId, String, String),
+	#[error("mcpGuardrails rejected: {}", .rej.message)]
+	McpGuardrails {
+		request_id: RequestId,
+		rej: rmcp::ErrorData,
+		was_tool_call: bool,
+		downstream_modern: bool,
+	},
+	#[error("{}", .message.as_deref().unwrap_or("rate limit exceeded"))]
+	RateLimited {
+		request_id: RequestId,
+		status: Option<crate::http::localratelimit::RateLimitStatus>,
+		message: Option<String>,
+		headers: Box<crate::http::HeaderMap>,
+		was_tool_call: bool,
+		downstream_modern: bool,
+	},
+	#[error("failed to process session_id query parameter")]
+	InvalidSessionIdQuery,
+	#[error("failed to establish get stream: {0}")]
+	EstablishGetStream(String),
+	#[error("failed to forward message to legacy SSE: {0}")]
+	ForwardLegacySse(String),
+	#[error("failed to create SSE url: {0}")]
+	CreateSseUrl(String),
+	#[error("failed to parse openapi: {0}")]
+	OpenAPI(upstream::OpenAPIParseError),
+	#[error("no backends configured")]
+	NoBackends,
+}
+
+fn tool_error_body(
+	request_id: &RequestId,
+	text: String,
+	downstream_modern: bool,
+) -> Option<String> {
+	let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
+	if !downstream_modern {
+		result.result_type = None;
+	}
+	serde_json::to_string(&serde_json::json!({
+		"jsonrpc": "2.0",
+		"id": request_id,
+		"result": result,
+	}))
+	.ok()
+}
+
+impl Error {
+	/// A client-safe message; Display retains the internal diagnostic details.
+	pub fn external_message(&self) -> Cow<'static, str> {
+		let msg = match self {
+			// A denial is deliberately reported as "unknown resource", indistinguishable from a
+			// nonexistent one, so clients cannot probe which tools/prompts/resources exist. Display
+			// says "authorization denied" for logs, so this must stay ahead of EXPOSE_ERROR_DETAILS.
+			Error::Authorization(_, _, _) => "unknown resource",
+			_ if *crate::proxy::EXPOSE_ERROR_DETAILS => return self.to_string().into(),
+			// Client request errors only describe the client's own request, so keep their detail.
+			Error::MethodNotAllowed
+			| Error::GetStreamNotSupported
+			| Error::InvalidAccept
+			| Error::InvalidAcceptGet
+			| Error::InvalidContentType
+			| Error::Deserialize(_)
+			| Error::UnknownSession
+			| Error::MissingSessionHeader
+			| Error::SessionIdRequired
+			| Error::InvalidSessionIdHeader
+			| Error::InvalidSessionIdQuery
+			| Error::InvalidProtocolVersion
+			| Error::UnsupportedVersion { .. }
+			| Error::VersionMismatch(_)
+			| Error::HeaderBodyMismatch(_, _)
+			| Error::InvalidRoutingHeader(_, _)
+			| Error::MethodNotFound(_, _)
+			| Error::InvalidParams(_, _) => return self.to_string().into(),
+			Error::PayloadTooLarge(_) => "request body too large",
+			Error::Unavailable(_, _) => "service unavailable",
+			Error::McpGuardrails { .. } => "request rejected by guardrail",
+			Error::RateLimited { .. } => "rate limit exceeded",
+			Error::StartSession(_) => "failed to create session",
+			Error::Stdio(_) => "failed to start stdio server",
+			Error::SendError(_, _) => "failed to send message",
+			Error::EstablishGetStream(_) => "failed to establish stream",
+			Error::ForwardLegacySse(_) => "failed to forward message",
+			Error::CreateSseUrl(_) => "failed to create sse url",
+			Error::OpenAPI(_) => "failed to parse openapi",
+			Error::UpstreamError(_) => "upstream error",
+			Error::NoBackends => "no backends available",
+		};
+		msg.into()
+	}
+
+	pub fn jsonrpc_error_body(&self) -> Option<String> {
+		match self {
+			Error::RateLimited {
+				request_id,
+				status,
+				was_tool_call: true,
+				downstream_modern,
+				..
+			} => {
+				let mut text = self.to_string();
+				if let Some(status) = status {
+					let _ = write!(
+						text,
+						" (retry after {}s; limit {}, remaining {})",
+						status.reset_seconds, status.limit, status.remaining
+					);
+				}
+				return tool_error_body(request_id, text, *downstream_modern);
+			},
+			// internal error sure looks like a protocol error so making the decision to bubble it back up
+			Error::McpGuardrails {
+				request_id,
+				rej,
+				was_tool_call: true,
+				downstream_modern,
+			} if rej.code != ErrorCode::INTERNAL_ERROR => {
+				return tool_error_body(request_id, rej.message.to_string(), *downstream_modern);
+			},
+			_ => {},
+		}
+		let (id, error) = match self {
+			// Policy rejections are explicit client responses; retain their message and data.
+			Error::McpGuardrails {
+				request_id, rej, ..
+			} => (request_id.clone(), rej.clone()),
+			Error::RateLimited {
+				request_id: id,
+				status,
+				message,
+				..
+			} => (
+				id.clone(),
+				ErrorData {
+					code: RESOURCE_EXHAUSTED,
+					message: message
+						.clone()
+						.unwrap_or_else(|| self.external_message().into_owned())
+						.into(),
+					data: status.map(|s| {
+						serde_json::json!({
+							"limit": s.limit,
+							"remaining": s.remaining,
+							"retryAfterSeconds": s.reset_seconds,
+						})
+					}),
+				},
+			),
+			Error::UnsupportedVersion {
+				request_id: Some(id),
+				version,
+				include_supported_versions,
+			} => (
+				id.clone(),
+				ErrorData {
+					code: ErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
+					message: self.external_message(),
+					// This gate runs before backend selection, so it reports the gateway set.
+					// With single-server discover passthrough, SEP-2575's supported/discover
+					// correlation holds only when the upstream advertises a superset of this list.
+					data: include_supported_versions.then(|| {
+						serde_json::json!({
+							"supported": ProtocolVersion::KNOWN_VERSIONS,
+							"requested": version,
+						})
+					}),
+				},
+			),
+			_ => {
+				let (id, code) = match self {
+					Error::SendError(Some(id), _) | Error::Unavailable(Some(id), _) => {
+						(id.clone(), ErrorCode::INTERNAL_ERROR)
+					},
+					Error::Authorization(id, _, _) => (id.clone(), ErrorCode::INVALID_PARAMS),
+					Error::VersionMismatch(Some(id))
+					| Error::HeaderBodyMismatch(Some(id), _)
+					| Error::InvalidRoutingHeader(Some(id), _) => (id.clone(), ErrorCode::HEADER_MISMATCH),
+					Error::MethodNotFound(Some(id), _) => (id.clone(), ErrorCode::METHOD_NOT_FOUND),
+					Error::InvalidParams(Some(id), _) => (id.clone(), ErrorCode::INVALID_PARAMS),
+					_ => return None,
+				};
+				(
+					id,
+					ErrorData {
+						code,
+						message: self.external_message(),
+						data: None,
+					},
+				)
+			},
+		};
+
+		serde_json::to_string(&JsonRpcError {
+			jsonrpc: Default::default(),
+			id: Some(id),
+			error,
+		})
+		.ok()
+	}
+}
+
+// a rate-limited MCP toolcall becomes an isError result others just have the top level json RPC error
+pub(crate) async fn maybe_convert_mcp_error<T>(
+	res: Result<T, crate::proxy::ProxyResponse>,
+	request_protocol: crate::proxy::httpproxy::RequestProtocol,
+	req: &mut crate::http::Request,
+) -> Result<T, crate::proxy::ProxyResponse> {
+	use crate::proxy::ProxyResponse;
+	let err = match res {
+		Err(ProxyResponse::Error(err)) => err,
+		other => return other,
+	};
+	if !matches!(
+		err,
+		ProxyError::RateLimitExceeded { .. } | ProxyError::RemoteRateLimitExceeded { .. }
+	) {
+		return Err(ProxyResponse::Error(err));
+	}
+	if request_protocol != crate::proxy::httpproxy::RequestProtocol::Mcp {
+		return Err(ProxyResponse::Error(err));
+	}
+	let limit = crate::http::buffer_limit(req);
+	let parsed = match req.body_mut().inspect(limit).await {
+		Ok(crate::http::BodyInspection::Complete(bytes)) => {
+			serde_json::from_slice::<rmcp::model::ClientJsonRpcMessage>(&bytes).ok()
+		},
+		Ok(crate::http::BodyInspection::Partial(_)) | Err(_) => None,
+	};
+	let Some(request_id) = parsed.as_ref().and_then(streamablehttp::request_id) else {
+		return Err(ProxyResponse::Error(err));
+	};
+	let was_tool_call =
+		parsed.as_ref().and_then(streamablehttp::message_method) == Some(CallToolRequestMethod::VALUE);
+	// runs earlier than the ctx stuff so tried to rederive is modern here. Perhaps there is a better place to centralize this call though.
+	let downstream_modern = streamablehttp::protocol_version_header(req.headers(), None, false)
+		.ok()
+		.flatten()
+		.as_ref()
+		.is_some_and(is_modern_version);
+	let converted = match err {
+		ProxyError::RateLimitExceeded {
+			limit,
+			remaining,
+			reset_seconds,
+		} => {
+			let status = crate::http::localratelimit::RateLimitStatus {
+				limit,
+				remaining,
+				reset_seconds,
+			};
+			Error::RateLimited {
+				request_id,
+				status: Some(status),
+				message: None,
+				headers: Box::new(status.to_headers()),
+				was_tool_call,
+				downstream_modern,
+			}
+			.into()
+		},
+		ProxyError::RemoteRateLimitExceeded {
+			status,
+			raw_body,
+			response_headers,
+		} => Error::RateLimited {
+			request_id,
+			status,
+			message: (!raw_body.is_empty()).then(|| String::from_utf8_lossy(&raw_body).into_owned()),
+			headers: response_headers,
+			was_tool_call,
+			downstream_modern,
+		}
+		.into(),
+		e => e,
+	};
+	Err(ProxyResponse::Error(converted))
+}
+
+impl From<Error> for ProxyError {
+	fn from(value: Error) -> Self {
+		ProxyError::MCP(value)
+	}
+}
+impl<T> From<Error> for Result<T, ProxyError> {
+	fn from(val: Error) -> Self {
+		Err(ProxyError::MCP(val))
+	}
+}
+
+#[derive(Error, Debug)]
+pub enum ClientError {
+	#[error("http request failed with code: {}", .0.status())]
+	Status(Box<crate::http::Response>),
+	#[error("http request failed: {0}")]
+	General(Arc<crate::http::Error>),
+	#[error("http request failed: {0}")]
+	Proxy(#[from] ProxyError),
+}
+
+impl ClientError {
+	pub fn new(error: impl Into<BoxError>) -> Self {
+		Self::General(Arc::new(crate::http::Error::new(error.into())))
+	}
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MCPOperation {
+	Tool,
+	Prompt,
+	Resource,
+	ResourceTemplates,
+	Task,
+}
+
+impl EncodeLabelValue for MCPOperation {
+	fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+		encoder.write_str(&self.to_string())
+	}
+}
+
+impl Display for MCPOperation {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			MCPOperation::Tool => write!(f, "tool"),
+			MCPOperation::Prompt => write!(f, "prompt"),
+			MCPOperation::Resource => write!(f, "resource"),
+			MCPOperation::ResourceTemplates => write!(f, "templates"),
+			MCPOperation::Task => write!(f, "task"),
+		}
+	}
+}
+
+#[apply(schema!)]
+#[derive(Default, PartialEq, ::cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct MCPTool {
+	/// The target handling the tool call after multiplexing resolution.
+	pub target: String,
+	/// The resolved tool name sent to the upstream target.
+	pub name: String,
+	/// The JSON arguments passed to the tool call.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+	/// The terminal tool result payload, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result: Option<serde_json::Value>,
+	/// The terminal JSON-RPC error payload, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<serde_json::Value>,
+}
+
+#[apply(schema!)]
+#[derive(Default, PartialEq)]
+pub struct MCPError {
+	pub code: i32,
+	pub message: String,
+}
+
+#[apply(schema!)]
+#[derive(Default, PartialEq, ::cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct MCPTask {
+	/// The target handling the task.
+	pub target: String,
+	/// The task ID.
+	pub name: String,
+}
+
+#[apply(schema!)]
+#[derive(Default, PartialEq, ::cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct MCPTarget {
+	/// The MCP target for the current target-scoped operation.
+	pub name: String,
+}
+
+impl MCPTask {
+	pub fn new(target: String, name: String) -> Self {
+		Self { target, name }
+	}
+
+	pub fn target(&self) -> &str {
+		&self.target
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+}
+
+#[apply(schema!)]
+#[derive(Default, PartialEq, ::cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct MCPInfo {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub method_name: Option<Strng>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub target: Option<MCPTarget>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tool: Option<MCPTool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt: Option<ResourceId>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resource: Option<ResourceId>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub task: Option<MCPTask>,
+	/// The terminal tools/list result returned to the client, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tools_list: Option<serde_json::Value>,
+	/// The terminal prompts/list result returned to the client, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompts_list: Option<serde_json::Value>,
+	/// The terminal resources/list result returned to the client, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resources_list: Option<serde_json::Value>,
+	/// The terminal resources/templates/list result returned to the client, if available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resource_templates_list: Option<serde_json::Value>,
+	// Terminal errors arrive while the response body is drained. Keep them out of CEL so policy
+	// evaluation cannot depend on asynchronous stream timing; they are emitted as access-log fields.
+	#[dynamic(skip)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<MCPError>,
+}
+
+/// `mcp` in CEL; params and result are borrowed while guardrails evaluate.
+#[derive(Debug, Clone, Copy, ::cel::DynamicType)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+pub struct MCPView<'a> {
+	#[dynamic(flatten)]
+	#[cfg_attr(feature = "schema", schemars(flatten))]
+	pub info: &'a MCPInfo,
+	// TODO: Expose the selected targets as a list of MCPTarget in mcp.targets for CEL guardrails.
+	/// Current request parameters, with the same structure as the `params` object in an MCP request.
+	/// Available only during request-phase CEL guardrails.
+	#[dynamic(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub params: Option<&'a dyn ::cel::types::dynamic::DynamicType>,
+	/// Current response result, with the same structure as the `result` object in an MCP response.
+	/// Available only during response-phase CEL guardrails.
+	#[dynamic(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub result: Option<&'a dyn ::cel::types::dynamic::DynamicType>,
+}
+
+impl<'a> MCPView<'a> {
+	pub fn new(info: &'a MCPInfo) -> Self {
+		Self {
+			info,
+			params: None,
+			result: None,
+		}
+	}
+}
+
+impl MCPInfo {
+	/// Builds the MCP information available to HTTP request policies. Response-derived
+	/// fields are populated later by MCP processing.
+	pub(crate) fn from_request(
+		headers: &crate::http::HeaderMap,
+		message: &rmcp::model::ClientJsonRpcMessage,
+		backend: &crate::types::agent::McpBackend,
+	) -> Self {
+		use rmcp::model::{ClientJsonRpcMessage, ClientRequest};
+		use rmcp::transport::common::http_header::HEADER_SESSION_ID;
+
+		let mut info = Self {
+			method_name: streamablehttp::message_method(message).map(Into::into),
+			session_id: headers
+				.get(HEADER_SESSION_ID)
+				.and_then(|value| value.to_str().ok())
+				.map(str::to_owned),
+			..Default::default()
+		};
+		let ClientJsonRpcMessage::Request(request) = message else {
+			return info;
+		};
+
+		match &request.request {
+			ClientRequest::CallToolRequest(request) => {
+				if let Some((target, name)) = mcp_request_name(backend, &request.params.name) {
+					info.set_tool(target, name);
+					info.capture_call_arguments(request.params.arguments.clone());
+				}
+			},
+			ClientRequest::GetPromptRequest(request) => {
+				if let Some((target, name)) = mcp_request_name(backend, &request.params.name) {
+					info.set_prompt(target, name);
+				}
+			},
+			ClientRequest::ReadResourceRequest(request) => {
+				if let Some((target, uri)) = mcp_request_uri(backend, &request.params.uri) {
+					info.set_resource(target, uri);
+				}
+			},
+			ClientRequest::SubscribeRequest(request) => {
+				if let Some((target, uri)) = mcp_request_uri(backend, &request.params.uri) {
+					info.set_resource(target, uri);
+				}
+			},
+			ClientRequest::UnsubscribeRequest(request) => {
+				if let Some((target, uri)) = mcp_request_uri(backend, &request.params.uri) {
+					info.set_resource(target, uri);
+				}
+			},
+			ClientRequest::GetTaskRequest(request) => {
+				if let Some((target, id)) = mcp_request_task(backend, &request.params.task_id) {
+					info.set_task(target, id);
+				}
+			},
+			ClientRequest::UpdateTaskRequest(request) => {
+				if let Some((target, id)) = mcp_request_task(backend, &request.params.task_id) {
+					info.set_task(target, id);
+				}
+			},
+			ClientRequest::CancelTaskRequest(request) => {
+				if let Some((target, id)) = mcp_request_task(backend, &request.params.task_id) {
+					info.set_task(target, id);
+				}
+			},
+			_ => {},
+		}
+		info
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.method_name.is_none()
+			&& self.session_id.is_none()
+			&& self.tool.is_none()
+			&& self.prompt.is_none()
+			&& self.resource.is_none()
+			&& self.task.is_none()
+			&& self.tools_list.is_none()
+			&& self.prompts_list.is_none()
+			&& self.resources_list.is_none()
+			&& self.resource_templates_list.is_none()
+			&& self.error.is_none()
+	}
+
+	pub fn resource_type(&self) -> Option<MCPOperation> {
+		if self.tool.is_some() {
+			Some(MCPOperation::Tool)
+		} else if self.prompt.is_some() {
+			Some(MCPOperation::Prompt)
+		} else if self.resource.is_some() {
+			Some(MCPOperation::Resource)
+		} else if self.task.is_some() {
+			Some(MCPOperation::Task)
+		} else {
+			None
+		}
+	}
+
+	pub fn target_name(&self) -> Option<&str> {
+		self
+			.tool
+			.as_ref()
+			.map(|tool| tool.target.as_str())
+			.or_else(|| self.prompt.as_ref().map(ResourceId::target))
+			.or_else(|| self.resource.as_ref().map(ResourceId::target))
+			.or_else(|| self.task.as_ref().map(MCPTask::target))
+	}
+
+	pub fn resource_name(&self) -> Option<&str> {
+		self
+			.tool
+			.as_ref()
+			.map(|tool| tool.name.as_str())
+			.or_else(|| self.prompt.as_ref().map(ResourceId::name))
+			.or_else(|| self.resource.as_ref().map(ResourceId::name))
+			.or_else(|| self.task.as_ref().map(MCPTask::name))
+	}
+
+	/// Like [`Self::resource_name`], but omits task IDs, which are unique per request and would
+	/// grow the metric label set without bound.
+	pub fn metric_resource_name(&self) -> Option<&str> {
+		self
+			.tool
+			.as_ref()
+			.map(|tool| tool.name.as_str())
+			.or_else(|| self.prompt.as_ref().map(ResourceId::name))
+			.or_else(|| self.resource.as_ref().map(ResourceId::name))
+	}
+
+	pub fn set_tool(&mut self, target: String, name: String) {
+		self.prompt = None;
+		self.resource = None;
+		self.task = None;
+		match self.tool.as_mut() {
+			Some(tool) => {
+				tool.target = target;
+				tool.name = name;
+			},
+			None => {
+				self.tool = Some(MCPTool {
+					target,
+					name,
+					..Default::default()
+				});
+			},
+		}
+	}
+
+	pub fn set_prompt(&mut self, target: String, name: String) {
+		self.tool = None;
+		self.resource = None;
+		self.task = None;
+		self.prompt = Some(ResourceId::new(target, name));
+	}
+
+	pub fn set_resource(&mut self, target: String, name: String) {
+		self.tool = None;
+		self.prompt = None;
+		self.task = None;
+		self.resource = Some(ResourceId::new(target, name));
+	}
+
+	pub fn set_task(&mut self, target: String, task_id: String) {
+		self.tool = None;
+		self.prompt = None;
+		self.resource = None;
+		self.task = Some(MCPTask::new(target, task_id));
+	}
+
+	pub fn capture_call_arguments(
+		&mut self,
+		arguments: Option<serde_json::Map<String, serde_json::Value>>,
+	) {
+		let Some(tool) = self.tool.as_mut() else {
+			return;
+		};
+
+		tool.arguments = arguments;
+	}
+
+	pub fn capture_call_result<T: serde::Serialize>(&mut self, result: &T) {
+		if let Some(tool) = self.tool.as_mut() {
+			tool.result = serde_json::to_value(result).ok();
+		}
+	}
+
+	pub fn capture_error(&mut self, error: &rmcp::ErrorData) {
+		self.error = Some(MCPError {
+			code: error.code.0,
+			message: error.message.to_string(),
+		});
+		if let Some(tool) = self.tool.as_mut() {
+			tool.error = serde_json::to_value(error).ok();
+		}
+	}
+}
+
+fn mcp_request_name(
+	backend: &crate::types::agent::McpBackend,
+	name: &str,
+) -> Option<(String, String)> {
+	use crate::types::agent::McpPrefixMode;
+
+	if backend.targets.len() == 1 && !matches!(backend.prefix_mode, McpPrefixMode::Always) {
+		return Some((backend.targets[0].name.to_string(), name.to_owned()));
+	}
+	// With prefixMode=never and multiple targets, the owner is discovered by querying
+	// the upstreams later in MCP processing. Preserve the name for request policies,
+	// but leave the target empty until that resolution happens.
+	if matches!(backend.prefix_mode, McpPrefixMode::Never) {
+		return Some((String::new(), name.to_owned()));
+	}
+	let (target, name) = name.split_once('_')?;
+	backend
+		.targets
+		.iter()
+		.any(|candidate| candidate.name.as_str() == target)
+		.then(|| (target.to_owned(), name.to_owned()))
+}
+
+fn mcp_request_uri(
+	backend: &crate::types::agent::McpBackend,
+	uri: &str,
+) -> Option<(String, String)> {
+	if backend.targets.len() == 1
+		&& !matches!(
+			backend.prefix_mode,
+			crate::types::agent::McpPrefixMode::Always
+		) {
+		return Some((backend.targets[0].name.to_string(), uri.to_owned()));
+	}
+	let (target, uri) = if apps::is_ui_uri(uri) {
+		apps::decode_ui_uri(uri)?
+	} else {
+		let (target, uri) = uri.split_once('+')?;
+		(target, uri.to_owned())
+	};
+	backend
+		.targets
+		.iter()
+		.any(|candidate| candidate.name.as_str() == target)
+		.then(|| (target.to_owned(), uri))
+}
+
+fn mcp_request_task(
+	backend: &crate::types::agent::McpBackend,
+	id: &str,
+) -> Option<(String, String)> {
+	if backend.targets.len() == 1
+		&& !matches!(
+			backend.prefix_mode,
+			crate::types::agent::McpPrefixMode::Always
+		) {
+		return Some((backend.targets[0].name.to_string(), id.to_owned()));
+	}
+	let (target, id) = id.split_once('+')?;
+	backend
+		.targets
+		.iter()
+		.any(|candidate| candidate.name.as_str() == target)
+		.then(|| (target.to_owned(), id.to_owned()))
+}
+
+impl From<&ResourceType> for MCPInfo {
+	fn from(value: &ResourceType) -> Self {
+		match value {
+			ResourceType::Tool(tool) => Self {
+				tool: Some(MCPTool {
+					target: tool.target().to_string(),
+					name: tool.name().to_string(),
+					..Default::default()
+				}),
+				..Default::default()
+			},
+			ResourceType::Prompt(prompt) => Self {
+				prompt: Some(prompt.clone()),
+				..Default::default()
+			},
+			ResourceType::Resource(resource) => Self {
+				resource: Some(resource.clone()),
+				..Default::default()
+			},
+			ResourceType::Task(task) => Self {
+				task: Some(MCPTask::new(
+					task.target().to_string(),
+					task.name().to_string(),
+				)),
+				..Default::default()
+			},
+		}
+	}
+}

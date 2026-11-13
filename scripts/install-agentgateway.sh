@@ -6,7 +6,7 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 # shellcheck source=scripts/agentgateway-common.sh
 source "$script_dir/agentgateway-common.sh"
 
-namespace="${AGENTGATEWAY_NAMESPACE:-agentgateway-demo}"
+namespace="${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}"
 mode="${AGENTGATEWAY_MODE:-mock}"
 model="${AGENTGATEWAY_MODEL:-gpt-4o-mini}"
 gateway_api_version="1.6.3"

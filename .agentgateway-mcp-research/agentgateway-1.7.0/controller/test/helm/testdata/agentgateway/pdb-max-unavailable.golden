@@ -1,0 +1,22 @@
+---
+# Source: agentgateway/templates/poddisruptionbudget.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: test-release-agentgateway
+  namespace: default
+  labels:
+    helm.sh/chart: agentgateway-0.0.2
+    agentgateway: agentgateway
+    app.kubernetes.io/name: agentgateway
+    app.kubernetes.io/instance: test-release
+    app.kubernetes.io/version: "0.0.0-dev"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    matchLabels:
+      agentgateway: agentgateway
+      app.kubernetes.io/name: agentgateway
+      app.kubernetes.io/instance: test-release
+  maxUnavailable: 25%
+

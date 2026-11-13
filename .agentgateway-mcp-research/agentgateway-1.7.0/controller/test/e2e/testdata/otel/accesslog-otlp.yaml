@@ -1,0 +1,22 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: agw-accesslog
+  namespace: agentgateway-base
+spec:
+  targetRefs:
+    - kind: Gateway
+      name: gateway
+      group: gateway.networking.k8s.io
+  frontend:
+    accessLog:
+      attributes:
+        add:
+          - name: test.request.id
+            expression: 'request.headers["x-otel-test-id"]'
+      otlp:
+        backendRef:
+          name: opentelemetry-collector
+          namespace: agentgateway-base
+          port: 4317
+        protocol: GRPC

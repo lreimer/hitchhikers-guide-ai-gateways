@@ -1,0 +1,164 @@
+use std::fmt;
+use std::time::Duration;
+
+use ::http::{Method, StatusCode, header};
+use anyhow::Context;
+use secrecy::{ExposeSecret, SecretString};
+
+use super::{Error, Provider, TokenEndpointAuth};
+use crate::http::Body;
+use crate::http::filters::BackendRequestTimeout;
+use crate::http::oauth::{encode_client_secret_basic, format_token_endpoint_error_body};
+use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TokenResponse {
+	#[serde(default)]
+	pub id_token: Option<String>,
+	#[serde(default)]
+	pub refresh_token: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("TokenResponse")
+			.field("id_token", &self.id_token.as_ref().map(|_| "[redacted]"))
+			.field(
+				"refresh_token",
+				&self.refresh_token.as_ref().map(|_| "[redacted]"),
+			)
+			.finish()
+	}
+}
+
+const DEFAULT_TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const TOKEN_RESPONSE_BODY_LIMIT: usize = 64 * 1024;
+
+pub(crate) async fn exchange_code(
+	client: PolicyClient,
+	provider: &Provider,
+	client_config: &super::ClientConfig,
+	redirect_uri: &str,
+	code: &str,
+	pkce_verifier: &SecretString,
+) -> Result<TokenResponse, Error> {
+	exchange_code_with_timeout(
+		client,
+		provider,
+		client_config,
+		redirect_uri,
+		code,
+		pkce_verifier,
+		DEFAULT_TOKEN_EXCHANGE_TIMEOUT,
+	)
+	.await
+}
+
+pub(crate) async fn exchange_code_with_timeout(
+	client: PolicyClient,
+	provider: &Provider,
+	client_config: &super::ClientConfig,
+	redirect_uri: &str,
+	code: &str,
+	pkce_verifier: &SecretString,
+	timeout: Duration,
+) -> Result<TokenResponse, Error> {
+	let form = vec![
+		("grant_type", "authorization_code".to_string()),
+		("code", code.to_string()),
+		("redirect_uri", redirect_uri.to_string()),
+		("code_verifier", pkce_verifier.expose_secret().to_string()),
+	];
+	exchange_token_with_timeout(client, provider, client_config, form, timeout).await
+}
+
+pub(crate) async fn refresh_token(
+	client: PolicyClient,
+	provider: &Provider,
+	client_config: &super::ClientConfig,
+	refresh_token: &SecretString,
+) -> Result<TokenResponse, Error> {
+	let form = vec![
+		("grant_type", "refresh_token".to_string()),
+		("refresh_token", refresh_token.expose_secret().to_string()),
+	];
+	exchange_token_with_timeout(
+		client,
+		provider,
+		client_config,
+		form,
+		DEFAULT_TOKEN_EXCHANGE_TIMEOUT,
+	)
+	.await
+}
+
+async fn exchange_token_with_timeout(
+	client: PolicyClient,
+	provider: &Provider,
+	client_config: &super::ClientConfig,
+	mut form: Vec<(&'static str, String)>,
+	timeout: Duration,
+) -> Result<TokenResponse, Error> {
+	let mut req = ::http::Request::builder()
+		.method(Method::POST)
+		.uri(provider.token_endpoint.as_str())
+		.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+		.header(header::ACCEPT, "application/json");
+	match client_config.token_endpoint_auth {
+		TokenEndpointAuth::ClientSecretBasic => {
+			let auth = format!(
+				"Basic {}",
+				encode_client_secret_basic(&client_config.client_id, &client_config.client_secret)
+			);
+			req = req.header(header::AUTHORIZATION, auth);
+		},
+		TokenEndpointAuth::ClientSecretPost => {
+			form.push(("client_id", client_config.client_id.clone()));
+			form.push((
+				"client_secret",
+				client_config.client_secret.expose_secret().to_string(),
+			));
+		},
+	}
+	let body = serde_urlencoded::to_string(form).map_err(anyhow::Error::from)?;
+	let mut req = req
+		.body(Body::from(body))
+		.map_err(|e| Error::Config(format!("failed to build token exchange request: {e}")))?;
+	req.extensions_mut().insert(BackendRequestTimeout(timeout));
+	let resp = client
+		.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Oidc)
+		.simple_call(req)
+		.await
+		.map_err(anyhow::Error::from)
+		.map_err(Error::TokenExchangeFailed)?;
+	let status = resp.status();
+	let (_, body) = {
+		let (parts, body) = resp.into_parts();
+		let body = crate::http::read_body_with_limit(body, TOKEN_RESPONSE_BODY_LIMIT)
+			.await
+			.map_err(anyhow::Error::from)
+			.map_err(Error::TokenExchangeFailed)?;
+		(parts, body)
+	};
+	if status != StatusCode::OK {
+		let error = anyhow::anyhow!(
+			"token endpoint returned {status}: {}",
+			format_token_endpoint_error_body(&body, 1024)
+		);
+		return Err(
+			if status.is_client_error()
+				&& !matches!(
+					status,
+					StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+				) {
+				Error::TokenEndpointRejected(error)
+			} else {
+				Error::TokenExchangeFailed(error)
+			},
+		);
+	}
+	serde_json::from_slice::<TokenResponse>(&body)
+		.context("failed to decode token response")
+		.map_err(Error::TokenExchangeFailed)
+}

@@ -1,0 +1,647 @@
+use std::fmt::Display;
+use std::time::Instant;
+
+use anyhow::Context;
+use serde_json::Value;
+use sqlx::types::Json;
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Row};
+use tracing::{error, info, warn};
+
+use super::{
+	ANALYTICS_TOTALS_SELECT, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
+	AnalyticsTotals, GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry,
+	LogFilters, MIGRATIONS_TABLE, OUTPUT_TOKENS_PER_SECOND_BOUNDS, PayloadEntry, SearchRequest,
+	SearchResponse, StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest,
+	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
+	decode_cursor, encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
+	promoted_attribute_column, prompt_preview, turn_kind,
+};
+
+pub struct PostgresLogStore {
+	pool: PgPool,
+}
+
+const ANALYTICS_FILTER_OPTION_LIMIT: i64 = 500;
+const SCHEMA_LOCK_TIMEOUT: &str = "10s";
+
+impl PostgresLogStore {
+	pub async fn from_pool(pool: PgPool) -> anyhow::Result<Self> {
+		migrate(&pool).await?;
+		Ok(Self { pool })
+	}
+
+	pub async fn insert_batch(&self, records: &[StoredRequestLog]) -> anyhow::Result<()> {
+		if records.is_empty() {
+			return Ok(());
+		}
+		let mut tx = self.pool.begin().await?;
+		let mut logs = String::new();
+		for record in records {
+			push_request_log_copy_row(&mut logs, record)?;
+		}
+		let mut copy = tx.copy_in_raw(COPY_REQUEST_LOGS).await?;
+		copy.send(logs.as_bytes()).await?;
+		copy.finish().await?;
+
+		if records.iter().any(|record| record.payload.is_some()) {
+			let mut payloads = String::new();
+			for record in records {
+				if let Some(payload) = &record.payload {
+					push_request_log_payload_copy_row(&mut payloads, &record.id, payload)?;
+				}
+			}
+			let mut copy = tx.copy_in_raw(COPY_REQUEST_LOG_PAYLOADS).await?;
+			copy.send(payloads.as_bytes()).await?;
+			copy.finish().await?;
+		}
+		tx.commit().await?;
+		Ok(())
+	}
+
+	pub async fn search(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
+		let limit = limit(request.limit);
+		let mut qb = QueryBuilder::<Postgres>::new(format!("{SELECT_LOGS} WHERE 1=1"));
+		push_filters(&mut qb, request.time_range.as_ref(), &request.filters);
+		if let Some(cursor) = request.cursor.as_deref() {
+			let (completed_at, id) = decode_cursor(cursor)?;
+			qb.push(" AND (completed_at, id) < (")
+				.push_bind(completed_at)
+				.push(", ")
+				.push_bind(id)
+				.push(")");
+		}
+		qb.push(" ORDER BY completed_at DESC, id DESC LIMIT ");
+		qb.push_bind(limit + 1);
+		let rows = qb.build().fetch_all(&self.pool).await?;
+		let mut logs = rows
+			.into_iter()
+			.map(|row| row_to_log(row, request.include_attributes, false))
+			.collect::<Result<Vec<_>, _>>()?;
+		let next_cursor = if logs.len() > limit as usize {
+			let _ = logs.pop();
+			logs
+				.last()
+				.map(|log| encode_cursor(log.completed_at, &log.id))
+		} else {
+			None
+		};
+		Ok(SearchResponse { logs, next_cursor })
+	}
+
+	pub async fn get(&self, request: GetRequest) -> anyhow::Result<GetResponse> {
+		let row = sqlx::query(SELECT_LOG_BY_ID)
+			.bind(request.id)
+			.fetch_optional(&self.pool)
+			.await?;
+		let log = row
+			.map(|row| row_to_log(row, true, request.include_payload))
+			.transpose()?;
+		Ok(GetResponse { log })
+	}
+
+	pub async fn analytics_summary(
+		&self,
+		request: AnalyticsSummaryRequest,
+	) -> anyhow::Result<AnalyticsSummaryResponse> {
+		let (time_range, from, _to, bucket_seconds) = analytics_window(
+			request.time_range,
+			request.bucket_count,
+			request.bucket_seconds,
+		);
+		let mut qb =
+			QueryBuilder::<Postgres>::new("SELECT CAST(FLOOR((EXTRACT(EPOCH FROM completed_at) - ");
+		qb.push_bind(from.timestamp() as f64);
+		qb.push(") / ");
+		qb.push_bind(bucket_seconds as f64);
+		qb.push(") AS BIGINT) AS bucket_index");
+		if !request.group_by.is_empty() {
+			qb.push(", ");
+			push_group_select(&mut qb, &request.group_by);
+		}
+		qb.push(", ");
+		qb.push(ANALYTICS_TOTALS_SELECT);
+		qb.push(" FROM request_logs WHERE 1=1");
+		push_filters(&mut qb, Some(&time_range), &request.filters);
+		qb.push(" GROUP BY bucket_index");
+		if !request.group_by.is_empty() {
+			for idx in 0..request.group_by.len() {
+				qb.push(format!(", g{idx}"));
+			}
+		}
+		qb.push(" ORDER BY bucket_index ASC");
+		let rows = qb.build().fetch_all(&self.pool).await?;
+		let buckets = rows
+			.into_iter()
+			.map(|row| row_to_analytics_bucket(row, from, bucket_seconds, &request.group_by))
+			.collect::<Result<Vec<_>, _>>()?;
+		let groups = groups_from_buckets(&buckets);
+		let filter_options = self.analytics_filter_options(&time_range).await?;
+		Ok(AnalyticsSummaryResponse {
+			time_range,
+			bucket_seconds,
+			buckets,
+			groups,
+			filter_options,
+		})
+	}
+
+	async fn analytics_filter_options(
+		&self,
+		time_range: &TimeRange,
+	) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+		let mut options = analytics_filter_option_map();
+		self
+			.push_distinct_column_options(
+				&mut options,
+				"requestModel",
+				"gen_ai_request_model",
+				time_range,
+			)
+			.await?;
+		self
+			.push_distinct_column_options(&mut options, "provider", "gen_ai_provider_name", time_range)
+			.await?;
+		self
+			.push_distinct_attribute_options(&mut options, "agentgateway.user", time_range)
+			.await?;
+		self
+			.push_distinct_attribute_options(&mut options, "agentgateway.group", time_range)
+			.await?;
+		self
+			.push_distinct_attribute_options(&mut options, "user_agent.name", time_range)
+			.await?;
+		for values in options.values_mut() {
+			values.sort();
+		}
+		Ok(options)
+	}
+
+	async fn push_distinct_column_options(
+		&self,
+		options: &mut std::collections::BTreeMap<String, Vec<String>>,
+		key: &str,
+		column: &'static str,
+		time_range: &TimeRange,
+	) -> anyhow::Result<()> {
+		let mut qb = QueryBuilder::<Postgres>::new("SELECT DISTINCT ");
+		qb.push(column);
+		qb.push(" AS value FROM request_logs WHERE ");
+		qb.push(column);
+		qb.push(" IS NOT NULL AND ");
+		qb.push(column);
+		qb.push(" != ''");
+		push_filters(&mut qb, Some(time_range), &LogFilters::default());
+		qb.push(" ORDER BY value LIMIT ");
+		qb.push_bind(ANALYTICS_FILTER_OPTION_LIMIT);
+		for row in qb.build().fetch_all(&self.pool).await? {
+			push_filter_option(options, key, row.try_get::<Option<String>, _>("value")?);
+		}
+		Ok(())
+	}
+
+	async fn push_distinct_attribute_options(
+		&self,
+		options: &mut std::collections::BTreeMap<String, Vec<String>>,
+		key: &str,
+		time_range: &TimeRange,
+	) -> anyhow::Result<()> {
+		if let Some(column) = promoted_attribute_column(key) {
+			return self
+				.push_distinct_column_options(options, key, column, time_range)
+				.await;
+		}
+		let mut qb = QueryBuilder::<Postgres>::new("SELECT DISTINCT attributes_json ->> ");
+		qb.push_bind(key);
+		qb.push(" AS value FROM request_logs WHERE 1=1");
+		push_filters(&mut qb, Some(time_range), &LogFilters::default());
+		qb.push(" ORDER BY value LIMIT ");
+		qb.push_bind(ANALYTICS_FILTER_OPTION_LIMIT);
+		for row in qb.build().fetch_all(&self.pool).await? {
+			push_filter_option(options, key, row.try_get::<Option<String>, _>("value")?);
+		}
+		Ok(())
+	}
+
+	pub async fn tail(&self, request: TailRequest) -> anyhow::Result<TailResponse> {
+		let limit = limit(request.limit);
+		let mut qb = QueryBuilder::<Postgres>::new(format!("{SELECT_LOGS} WHERE 1=1"));
+		push_filters(&mut qb, None, &request.filters);
+		if let Some(cursor) = request.cursor.as_deref() {
+			let (completed_at, id) = decode_cursor(cursor)?;
+			qb.push(" AND (completed_at > ");
+			qb.push_bind(completed_at);
+			qb.push(" OR (completed_at = ");
+			qb.push_bind(completed_at);
+			qb.push(" AND id > ");
+			qb.push_bind(id);
+			qb.push("))");
+		}
+		qb.push(" ORDER BY completed_at ASC, id ASC LIMIT ");
+		qb.push_bind(limit);
+		let rows = qb.build().fetch_all(&self.pool).await?;
+		let logs = rows
+			.into_iter()
+			.map(|row| row_to_log(row, request.include_attributes, false))
+			.collect::<Result<Vec<_>, _>>()?;
+		let next_cursor = logs
+			.last()
+			.map(|log| encode_cursor(log.completed_at, &log.id));
+		Ok(TailResponse { logs, next_cursor })
+	}
+}
+
+async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+	let started = Instant::now();
+	info!(
+		lock_timeout = SCHEMA_LOCK_TIMEOUT,
+		"initializing request log database schema"
+	);
+
+	// Use one connection for all migration work, then close it so the session-scoped
+	// lock_timeout and any advisory lock left behind after an error cannot leak into the pool.
+	let mut connection = pool
+		.acquire()
+		.await
+		.context("failed to acquire connection for request log database migration")?;
+	connection.close_on_drop();
+	sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+		.bind(SCHEMA_LOCK_TIMEOUT)
+		.execute(&mut *connection)
+		.await
+		.context("failed to configure request log database migration lock timeout")?;
+
+	let mut migrator = sqlx::migrate!("./src/telemetry/log_store/postgres_migrations");
+	// Keep request-log migrations independent from any other SQLx-managed schema that
+	// may share this database.
+	migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+	let result = migrator.run(&mut *connection).await;
+	if let Err(err) = connection.close().await {
+		warn!(
+			?err,
+			"failed to close request log database migration connection"
+		);
+	}
+
+	match result {
+		Ok(()) => {
+			info!(elapsed = ?started.elapsed(), "request log database schema is ready");
+			Ok(())
+		},
+		Err(err) => {
+			error!(?err, elapsed = ?started.elapsed(), "failed to migrate request log database schema");
+			Err(err).context("failed to migrate request log database schema")
+		},
+	}
+}
+
+fn push_request_log_copy_row(buf: &mut String, record: &StoredRequestLog) -> anyhow::Result<()> {
+	let mut first = true;
+	push_copy_text_column(buf, &mut first, Some(&record.id));
+	push_copy_text_column(buf, &mut first, Some(&record.started_at.to_rfc3339()));
+	push_copy_text_column(buf, &mut first, Some(&record.completed_at.to_rfc3339()));
+	push_copy_display_column(buf, &mut first, Some(record.duration_ms));
+	push_copy_text_column(buf, &mut first, record.trace_id.as_deref());
+	push_copy_text_column(buf, &mut first, record.span_id.as_deref());
+	push_copy_display_column(buf, &mut first, record.http_status);
+	push_copy_text_column(buf, &mut first, record.error.as_deref());
+	push_copy_text_column(buf, &mut first, record.gen_ai_operation_name.as_deref());
+	push_copy_text_column(buf, &mut first, record.gen_ai_provider_name.as_deref());
+	push_copy_text_column(buf, &mut first, record.gen_ai_request_model.as_deref());
+	push_copy_text_column(buf, &mut first, record.gen_ai_response_model.as_deref());
+	push_copy_display_column(buf, &mut first, record.input_tokens);
+	push_copy_display_column(buf, &mut first, record.output_tokens);
+	push_copy_display_column(buf, &mut first, record.total_tokens);
+	push_copy_display_column(buf, &mut first, record.cache_read_input_tokens);
+	push_copy_display_column(buf, &mut first, record.cache_creation_input_tokens);
+	push_copy_display_column(buf, &mut first, record.reasoning_tokens);
+	push_copy_display_column(buf, &mut first, record.time_to_first_token_ms);
+	push_copy_display_column(buf, &mut first, record.time_per_output_token_ms);
+	push_copy_display_column(buf, &mut first, record.cost);
+	push_copy_text_column(buf, &mut first, record.agentgateway_user.as_deref());
+	push_copy_text_column(buf, &mut first, record.agentgateway_group.as_deref());
+	push_copy_text_column(buf, &mut first, record.user_agent_name.as_deref());
+	push_copy_display_column(buf, &mut first, Some(record.has_payload));
+	push_copy_text_column(buf, &mut first, Some(record.attributes_json.as_ref()));
+	buf.push('\n');
+	Ok(())
+}
+
+fn push_request_log_payload_copy_row(
+	buf: &mut String,
+	log_id: &str,
+	payload: &StoredRequestLogPayload,
+) -> anyhow::Result<()> {
+	let mut first = true;
+	push_copy_text_column(buf, &mut first, Some(log_id));
+	push_copy_json_column(buf, &mut first, payload.request_prompt_json.as_ref())?;
+	push_copy_json_column(buf, &mut first, payload.response_completion_json.as_ref())?;
+	buf.push('\n');
+	Ok(())
+}
+
+fn push_copy_text_column(buf: &mut String, first: &mut bool, value: Option<&str>) {
+	push_copy_column_separator(buf, first);
+	let Some(value) = value else {
+		buf.push_str(r"\N");
+		return;
+	};
+	push_copy_escaped(buf, value);
+}
+
+fn push_copy_display_column<T: Display>(buf: &mut String, first: &mut bool, value: Option<T>) {
+	push_copy_column_separator(buf, first);
+	match value {
+		Some(value) => buf.push_str(&value.to_string()),
+		None => buf.push_str(r"\N"),
+	}
+}
+
+fn push_copy_json_column(
+	buf: &mut String,
+	first: &mut bool,
+	value: Option<&Value>,
+) -> anyhow::Result<()> {
+	push_copy_column_separator(buf, first);
+	let Some(value) = value else {
+		buf.push_str(r"\N");
+		return Ok(());
+	};
+	push_copy_escaped(buf, &serde_json::to_string(value)?);
+	Ok(())
+}
+
+fn push_copy_column_separator(buf: &mut String, first: &mut bool) {
+	if *first {
+		*first = false;
+	} else {
+		buf.push('\t');
+	}
+}
+
+fn push_copy_escaped(buf: &mut String, value: &str) {
+	for ch in value.chars() {
+		match ch {
+			'\\' => buf.push_str(r"\\"),
+			'\n' => buf.push_str(r"\n"),
+			'\r' => buf.push_str(r"\r"),
+			'\t' => buf.push_str(r"\t"),
+			_ => buf.push(ch),
+		}
+	}
+}
+
+fn analytics_filter_option_map() -> std::collections::BTreeMap<String, Vec<String>> {
+	[
+		("requestModel".to_string(), Vec::new()),
+		("provider".to_string(), Vec::new()),
+		("agentgateway.user".to_string(), Vec::new()),
+		("agentgateway.group".to_string(), Vec::new()),
+		("user_agent.name".to_string(), Vec::new()),
+	]
+	.into()
+}
+
+fn push_filter_option(
+	options: &mut std::collections::BTreeMap<String, Vec<String>>,
+	key: &str,
+	value: Option<String>,
+) {
+	let Some(value) = value
+		.map(|value| value.trim().to_string())
+		.filter(|value| !value.is_empty())
+	else {
+		return;
+	};
+	let values = options.entry(key.to_string()).or_default();
+	if !values.contains(&value) {
+		values.push(value);
+	}
+}
+
+fn push_filters(
+	qb: &mut QueryBuilder<Postgres>,
+	time_range: Option<&TimeRange>,
+	filters: &LogFilters,
+) {
+	if let Some(from) = time_range.and_then(|r| r.from) {
+		qb.push(" AND completed_at >= ");
+		qb.push_bind(from);
+	}
+	if let Some(to) = time_range.and_then(|r| r.to) {
+		qb.push(" AND completed_at < ");
+		qb.push_bind(to);
+	}
+	push_in(qb, "http_status", &filters.http_status);
+	push_in(qb, "gen_ai_provider_name", &filters.provider);
+	push_in(qb, "gen_ai_request_model", &filters.request_model);
+	push_in(qb, "gen_ai_response_model", &filters.response_model);
+	if let Some(trace_id) = &filters.trace_id {
+		qb.push(" AND trace_id = ");
+		qb.push_bind(trace_id);
+	}
+	if let Some(has_payload) = filters.has_payload {
+		qb.push(" AND has_payload = ");
+		qb.push_bind(has_payload);
+	}
+	for (key, value) in &filters.attributes {
+		let Some(values) = attr_filter_values(value) else {
+			qb.push(" AND 1=0");
+			continue;
+		};
+		if values.is_empty() {
+			qb.push(" AND 1=0");
+			continue;
+		}
+		if let Some(column) = promoted_attribute_column(key) {
+			push_in(qb, column, &values);
+			continue;
+		}
+		qb.push(" AND attributes_json ->> ");
+		qb.push_bind(key);
+		qb.push(" IN (");
+		let mut separated = qb.separated(", ");
+		for value in values {
+			separated.push_bind(value);
+		}
+		separated.push_unseparated(")");
+	}
+}
+
+fn push_in<T>(qb: &mut QueryBuilder<Postgres>, column: &str, values: &[T])
+where
+	T: for<'q> sqlx::Encode<'q, Postgres> + sqlx::Type<Postgres> + Send + Sync,
+{
+	if values.is_empty() {
+		return;
+	}
+	qb.push(" AND ");
+	qb.push(column);
+	qb.push(" IN (");
+	let mut separated = qb.separated(", ");
+	for value in values {
+		separated.push_bind(value);
+	}
+	separated.push_unseparated(")");
+}
+
+fn push_group_select(qb: &mut QueryBuilder<Postgres>, group_by: &[GroupBy]) {
+	for (idx, group) in group_by.iter().enumerate() {
+		if idx > 0 {
+			qb.push(", ");
+		}
+		match group.field {
+			GroupByField::Provider => {
+				qb.push(format!("gen_ai_provider_name AS g{idx}"));
+			},
+			GroupByField::RequestModel => {
+				qb.push(format!("gen_ai_request_model AS g{idx}"));
+			},
+			GroupByField::ResponseModel => {
+				qb.push(format!("gen_ai_response_model AS g{idx}"));
+			},
+			GroupByField::HttpStatus => {
+				qb.push(format!("http_status::TEXT AS g{idx}"));
+			},
+			GroupByField::Ttft => {
+				let bucket = histogram_bucket_sql("time_to_first_token_ms", TTFT_BOUNDS_MS);
+				qb.push(format!("{bucket} AS g{idx}"));
+			},
+			GroupByField::OutputTokensPerSecond => {
+				let bucket = histogram_bucket_sql(
+					"1000.0 / NULLIF(time_per_output_token_ms, 0)",
+					OUTPUT_TOKENS_PER_SECOND_BOUNDS,
+				);
+				qb.push(format!("{bucket} AS g{idx}"));
+			},
+			GroupByField::Attributes => {
+				if let Some(column) = group.key.as_deref().and_then(promoted_attribute_column) {
+					qb.push(format!("{column} AS g{idx}"));
+				} else {
+					qb.push("attributes_json ->> ");
+					qb.push_bind(group.key.as_deref().unwrap_or_default());
+					qb.push(format!(" AS g{idx}"));
+				}
+			},
+		};
+	}
+}
+
+fn row_to_analytics_bucket(
+	row: sqlx::postgres::PgRow,
+	from: chrono::DateTime<chrono::Utc>,
+	bucket_seconds: i64,
+	group_by: &[GroupBy],
+) -> anyhow::Result<AnalyticsTimeBucket> {
+	let bucket_index: i64 = row.try_get("bucket_index")?;
+	let mut group = std::collections::BTreeMap::new();
+	for (idx, spec) in group_by.iter().enumerate() {
+		let value: Option<String> = row.try_get(format!("g{idx}").as_str())?;
+		group.insert(
+			group_key(spec),
+			value.map(Value::String).unwrap_or(Value::Null),
+		);
+	}
+	Ok(AnalyticsTimeBucket {
+		start: from + chrono::Duration::seconds(bucket_index * bucket_seconds),
+		group,
+		totals: AnalyticsTotals::from_row(&row)?,
+	})
+}
+
+fn row_to_log(
+	row: sqlx::postgres::PgRow,
+	include_attributes: bool,
+	include_payload: bool,
+) -> anyhow::Result<LogEntry> {
+	let attributes: Json<Value> = row.try_get("attributes_json")?;
+	let request_prompt: Option<Json<Value>> = row.try_get("request_prompt_json")?;
+	let response_completion: Option<Json<Value>> = row.try_get("response_completion_json")?;
+	let prompt_preview = prompt_preview(request_prompt.as_ref().map(|value| &value.0));
+	let turn = TurnEntry {
+		input: turn_kind(request_prompt.as_ref().map(|value| &value.0)),
+		output: turn_kind(response_completion.as_ref().map(|value| &value.0)),
+	};
+	let payload = if include_payload {
+		Some(PayloadEntry {
+			request_prompt: request_prompt.map(|v| v.0),
+			response_completion: response_completion.map(|v| v.0),
+		})
+	} else {
+		None
+	};
+	Ok(LogEntry {
+		id: row.try_get("id")?,
+		started_at: row.try_get("started_at")?,
+		completed_at: row.try_get("completed_at")?,
+		duration_ms: row.try_get("duration_ms")?,
+		trace_id: row.try_get("trace_id")?,
+		span_id: row.try_get("span_id")?,
+		http_status: row.try_get("http_status")?,
+		error: row.try_get("error")?,
+		prompt_preview,
+		turn,
+		gen_ai: GenAiEntry {
+			operation_name: row.try_get("gen_ai_operation_name")?,
+			provider_name: row.try_get("gen_ai_provider_name")?,
+			request_model: row.try_get("gen_ai_request_model")?,
+			response_model: row.try_get("gen_ai_response_model")?,
+		},
+		usage: UsageEntry {
+			input_tokens: row.try_get("input_tokens")?,
+			output_tokens: row.try_get("output_tokens")?,
+			total_tokens: row.try_get("total_tokens")?,
+		},
+		cost: row.try_get("cost")?,
+		has_payload: row.try_get("has_payload")?,
+		attributes: include_attributes.then_some(attributes.0),
+		payload,
+	})
+}
+
+fn group_key(group: &GroupBy) -> String {
+	match group.field {
+		GroupByField::Provider => "provider".to_string(),
+		GroupByField::RequestModel => "requestModel".to_string(),
+		GroupByField::ResponseModel => "responseModel".to_string(),
+		GroupByField::HttpStatus => "httpStatus".to_string(),
+		GroupByField::Attributes => group
+			.key
+			.clone()
+			.unwrap_or_else(|| "attributes".to_string()),
+		GroupByField::Ttft => "ttft".to_string(),
+		GroupByField::OutputTokensPerSecond => "outputTokensPerSecond".to_string(),
+	}
+}
+
+const COPY_REQUEST_LOGS: &str = r#"
+COPY request_logs (
+	id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
+	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
+	input_tokens, output_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+	reasoning_tokens, time_to_first_token_ms, time_per_output_token_ms, cost, agentgateway_user,
+	agentgateway_group, user_agent_name, has_payload, attributes_json
+) FROM STDIN
+"#;
+
+const COPY_REQUEST_LOG_PAYLOADS: &str = r#"
+COPY request_log_payloads (log_id, request_prompt_json, response_completion_json) FROM STDIN
+"#;
+
+const SELECT_LOGS: &str = r#"
+SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
+	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
+	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
+	request_prompt_json, response_completion_json
+FROM request_logs
+LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
+"#;
+
+const SELECT_LOG_BY_ID: &str = r#"
+SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
+	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
+	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
+	request_prompt_json, response_completion_json
+FROM request_logs
+LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
+WHERE request_logs.id = $1
+"#;

@@ -1,0 +1,1069 @@
+package translator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/netip"
+	"net/url"
+	"slices"
+	"strings"
+
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/util/sets"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/agentgateway/agentgateway/api"
+	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
+	agwir "github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
+	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
+	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
+	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
+	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
+)
+
+func AgwModelCollection(
+	queue *status.StatusCollections,
+	models krt.Collection[*agentgateway.AgentgatewayModel],
+	inputs RouteContextInputs,
+	krtopts krtutil.KrtOptions,
+) (krt.Collection[agwir.AgwResource], krt.Collection[*plugins.RouteAttachment], krt.Collection[*utils.AncestorBackend]) {
+	modelStatus, modelResources := krt.NewStatusManyCollection(models, func(krtctx krt.HandlerContext, obj *agentgateway.AgentgatewayModel) (*agentgateway.AgentgatewayModelStatus, []agwir.AgwResource) {
+		ctx := inputs.WithCtx(krtctx)
+		rm := reports.NewReportMap()
+		rep := reports.NewReporter(&rm)
+		routeReporter := rep.Route(obj)
+
+		parentRefs := extractModelParentReferenceInfo(ctx, obj)
+		resources := translateModelForParents(ctx, obj, parentRefs, routeReporter)
+
+		status := rm.BuildRouteStatusWithParentRefDefaulting(context.Background(), obj, inputs.ControllerName, true)
+		if status == nil {
+			return &agentgateway.AgentgatewayModelStatus{}, resources
+		}
+		return &agentgateway.AgentgatewayModelStatus{Parents: status.Parents}, resources
+	}, krtopts.ToOptions("translator/AgentgatewayModels")...)
+	status.RegisterStatus(queue, modelStatus, GetStatus)
+
+	attachments := gatewayRouteAttachmentCollection(inputs, models, wellknown.AgentgatewayModelGVK, krtopts)
+	ancestors := krt.NewManyCollection(models, func(krtctx krt.HandlerContext, obj *agentgateway.AgentgatewayModel) []*utils.AncestorBackend {
+		return extractModelAncestorBackends(inputs.WithCtx(krtctx), obj)
+	}, krtopts.ToOptions("translator/ModelAncestorBackends")...)
+	return modelResources, attachments, ancestors
+}
+
+// extractModelAncestorBackends mirrors extractAncestorBackends for AgentgatewayModels.
+// It includes provider and inline-policy backends from the model, its concrete
+// failover targets, and its callout backend.
+func extractModelAncestorBackends(ctx RouteContext, model *agentgateway.AgentgatewayModel) []*utils.AncestorBackend {
+	source := utils.TypedNamespacedName{
+		Namespace: model.Namespace,
+		Name:      model.Name,
+		Kind:      wellknown.AgentgatewayModelGVK.Kind,
+	}
+
+	// Collect the model's parent gateways (shared by both direct and indirect cases).
+	gateways := sets.Set[types.NamespacedName]{}
+	for _, parent := range FilteredReferences(extractModelParentReferenceInfo(ctx, model)) {
+		gateways.Insert(parent.ParentGateway)
+	}
+	if len(gateways) == 0 {
+		return nil
+	}
+
+	// Collect all reachable backends (deduplicated).
+	backends := sets.Set[utils.TypedNamespacedName]{}
+	collectBackendRef := func(namespace string, ref gwv1.BackendObjectReference) {
+		groupKind := NormalizeReference(ref.Group, ref.Kind, wellknown.ServiceGVK.GroupKind())
+		if !ancestorBackendAllowed(ctx, wellknown.AgentgatewayModelGVK, namespace, groupKind, ref.Namespace, ref.Name) {
+			return
+		}
+		backends.Insert(utils.TypedNamespacedName{
+			Namespace: defaultString(ref.Namespace, namespace),
+			Name:      string(ref.Name),
+			Kind:      groupKind.Kind,
+		})
+	}
+	collectConcreteModelBackends := func(concrete *agentgateway.AgentgatewayModel) {
+		if custom := concrete.Spec.Custom; custom != nil && custom.BackendRef != nil {
+			backends.Insert(backendRefToTypedNamespacedName(concrete.Namespace, custom.BackendRef))
+		}
+		if policies := modelBackendPolicy(concrete.Spec.Policies); policies != nil {
+			plugins.BackendReferencesFromBackendPolicy(policies, func(ref gwv1.BackendObjectReference) {
+				collectBackendRef(concrete.Namespace, ref)
+			})
+		}
+	}
+	collectConcreteModelBackends(model)
+
+	if vm := model.Spec.VirtualModel; vm != nil && vm.Callout != nil && vm.Callout.BackendRef != nil {
+		collectBackendRef(model.Namespace, *vm.Callout.BackendRef)
+	}
+
+	// Virtual model failover → concrete model → backendRefs.
+	// Failover targets must be concrete models (enforced by modelFailoverBackend runtime check).
+	if vm := model.Spec.VirtualModel; vm != nil && vm.Failover != nil {
+		for _, target := range vm.Failover.Targets {
+			refModel, _, err := translateFailoverTarget(ctx, model.Namespace, target)
+			if err != nil {
+				continue // Invalid targets are omitted from both ancestry and the generated failover backend.
+			}
+			collectConcreteModelBackends(refModel)
+		}
+	}
+
+	if len(backends) == 0 {
+		return nil
+	}
+
+	// Generate sorted cartesian product of gateways × backends.
+	gtw := gateways.UnsortedList()
+	slices.SortFunc(gtw, func(a, b types.NamespacedName) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	bes := backends.UnsortedList()
+	slices.SortFunc(bes, func(a, b utils.TypedNamespacedName) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	res := make([]*utils.AncestorBackend, 0, len(gtw)*len(bes))
+	for _, gw := range gtw {
+		for _, be := range bes {
+			res = append(res, &utils.AncestorBackend{
+				Gateway: gw,
+				Backend: be,
+				Source:  source,
+			})
+		}
+	}
+	return res
+}
+
+// backendRefToTypedNamespacedName converts a LocalBackendObjectReference to a TypedNamespacedName.
+// backendRef can only target Service or InferencePool (CEL constraint); Kind defaults to Service.
+func backendRefToTypedNamespacedName(namespace string, ref *agentgateway.LocalBackendObjectReference) utils.TypedNamespacedName {
+	kind := wellknown.ServiceKind
+	if ref.Kind != nil {
+		kind = *ref.Kind
+	}
+	return utils.TypedNamespacedName{
+		Namespace: namespace,
+		Name:      ref.Name,
+		Kind:      kind,
+	}
+}
+
+// extractModelParentReferenceInfo resolves an HTTPRoute parent to that route's
+// Gateway listeners. The referenced HTTPRoute rule supplies normal routing and
+// policy behavior; models populate its generated LLM router backend.
+func extractModelParentReferenceInfo(ctx RouteContext, model *agentgateway.AgentgatewayModel) []RouteParentReference {
+	parents := extractParentReferenceInfo(ctx, model)
+	cloned := false
+	for _, ref := range model.Spec.ParentRefs {
+		if NormalizeReference(ref.Group, ref.Kind, wellknown.GatewayGVK.GroupKind()) != wellknown.HTTPRouteGVK.GroupKind() {
+			continue
+		}
+		if !cloned {
+			parents = slices.Clone(parents)
+			cloned = true
+		}
+		namespace := defaultString(ref.Namespace, model.Namespace)
+		rejected := func(message string) RouteParentReference {
+			return RouteParentReference{
+				OriginalReference: ref,
+				ParentKey: utils.TypedNamespacedName{
+					NamespacedName: types.NamespacedName{Namespace: namespace, Name: string(ref.Name)},
+					Kind:           wellknown.HTTPRouteKind,
+				},
+				ParentSection: ptr.OrEmpty(ref.SectionName),
+				DeniedReason:  &ParentError{Reason: ParentErrorNotAccepted, Message: message},
+			}
+		}
+		if namespace != model.Namespace {
+			parents = append(parents, rejected("model HTTPRoute parentRef must use the model namespace"))
+			continue
+		}
+		route := ptr.Flatten(krt.FetchOne(ctx.Krt, ctx.Collections.HTTPRoutes, krt.FilterObjectName(types.NamespacedName{Namespace: namespace, Name: string(ref.Name)})))
+		if route == nil {
+			parents = append(parents, rejected("model parent HTTPRoute not found"))
+			continue
+		}
+		ruleIndex, err := modelParentRuleIndex(route.Spec.Rules, ref.SectionName)
+		if err != nil {
+			parents = append(parents, rejected(err.Error()))
+			continue
+		}
+		rule := route.Spec.Rules[ruleIndex]
+		routerKey, optedIn, err := modelServingRuleRouterKey(namespace, route.Name, ruleIndex, rule)
+		if err != nil {
+			parents = append(parents, rejected(err.Error()))
+			continue
+		}
+		if !optedIn {
+			parents = append(parents, rejected("HTTPRoute rule does not select AgentgatewayModel backends"))
+			continue
+		}
+		if modelServingRuleMatchesRoot(rule) {
+			if conflicts := rootModelRouteDirectListenerConflicts(ctx, route); len(conflicts) > 0 {
+				parents = append(parents, rejected(rootModelRouteConflictMessage(conflicts)))
+				continue
+			}
+		}
+		for _, gatewayParent := range FilteredReferences(extractParentReferenceInfo(ctx, route)) {
+			gatewayParent.OriginalReference = ref
+			gatewayParent.ParentKey = utils.TypedNamespacedName{Namespace: namespace, Name: route.Name, Kind: wellknown.HTTPRouteKind}
+			gatewayParent.ParentSection = ptr.OrEmpty(ref.SectionName)
+			gatewayParent.ModelRouterKey = routerKey
+			parents = append(parents, gatewayParent)
+		}
+	}
+	return parents
+}
+
+func modelParentRuleIndex(rules []gwv1.HTTPRouteRule, sectionName *gwv1.SectionName) (int, error) {
+	if sectionName == nil {
+		if len(rules) != 1 {
+			return -1, fmt.Errorf("model HTTPRoute parentRef without sectionName requires exactly one rule")
+		}
+		return 0, nil
+	}
+	for i, rule := range rules {
+		if rule.Name != nil && *rule.Name == *sectionName {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("HTTPRoute rule %q not found", *sectionName)
+}
+
+func modelServingRuleMatchesRoot(rule gwv1.HTTPRouteRule) bool {
+	if len(rule.Matches) == 0 {
+		return true
+	}
+	for _, match := range rule.Matches {
+		if match.Path == nil {
+			return true
+		}
+		if ptr.OrDefault(match.Path.Type, gwv1.PathMatchPathPrefix) == gwv1.PathMatchPathPrefix &&
+			ptr.OrDefault(match.Path.Value, "/") == "/" {
+			return true
+		}
+	}
+	return false
+}
+
+func rootModelRouteDirectListenerConflicts(ctx RouteContext, route *gwv1.HTTPRoute) []string {
+	routeListeners := make(map[string]struct{})
+	for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, route)) {
+		routeListeners[parent.ListenerKey] = struct{}{}
+	}
+	if len(routeListeners) == 0 {
+		return nil
+	}
+
+	conflicts := make(map[string]struct{})
+	for _, model := range krt.Fetch(ctx.Krt, ctx.Models) {
+		for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, model)) {
+			if _, found := routeListeners[parent.ListenerKey]; found {
+				conflicts[parent.ListenerKey] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(conflicts))
+	for listener := range conflicts {
+		result = append(result, listener)
+	}
+	slices.Sort(result)
+	return result
+}
+
+func rootModelRouteConflictMessage(listeners []string) string {
+	return fmt.Sprintf("root model-serving HTTPRoute conflicts with directly attached models on listeners: %s", strings.Join(listeners, ", "))
+}
+
+func modelServingRuleRouterKey(namespace, route string, ruleIndex int, rule gwv1.HTTPRouteRule) (string, bool, error) {
+	modelBackendRefs := make([]gwv1.HTTPBackendRef, 0, 1)
+	for _, backend := range rule.BackendRefs {
+		if NormalizeReference(backend.Group, backend.Kind, wellknown.ServiceGVK.GroupKind()) == wellknown.AgentgatewayModelGVK.GroupKind() {
+			modelBackendRefs = append(modelBackendRefs, backend)
+		}
+	}
+	if len(modelBackendRefs) == 0 {
+		return "", false, nil
+	}
+	if len(rule.BackendRefs) != 1 || len(modelBackendRefs) != 1 {
+		return "", true, fmt.Errorf("model-serving HTTPRoute rule must have exactly one AgentgatewayModel backendRef and no other backends")
+	}
+	for _, match := range rule.Matches {
+		if match.Path != nil && ptr.OrDefault(match.Path.Type, gwv1.PathMatchPathPrefix) != gwv1.PathMatchPathPrefix {
+			return "", true, fmt.Errorf("model-serving HTTPRoute rule path matches must use PathPrefix")
+		}
+	}
+	for _, filter := range rule.Filters {
+		if filter.Type == gwv1.HTTPRouteFilterURLRewrite || filter.Type == gwv1.HTTPRouteFilterRequestRedirect {
+			return "", true, fmt.Errorf("model-serving HTTPRoute rule does not support URLRewrite or RequestRedirect filters")
+		}
+	}
+	backend := modelBackendRefs[0]
+	if backend.Name != "*" {
+		return "", true, fmt.Errorf("model-serving HTTPRoute backendRef name must be \"*\"")
+	}
+	if backend.Namespace != nil && string(*backend.Namespace) != namespace {
+		return "", true, fmt.Errorf("model-serving HTTPRoute backendRef must use the route namespace")
+	}
+	if backend.Port != nil {
+		return "", true, fmt.Errorf("model-serving HTTPRoute backendRef must not specify port")
+	}
+	if backend.Weight != nil && *backend.Weight != 1 {
+		return "", true, fmt.Errorf("model-serving HTTPRoute backendRef weight must be 1")
+	}
+	if len(backend.Filters) > 0 {
+		return "", true, fmt.Errorf("model-serving HTTPRoute backendRef must not have filters")
+	}
+	ruleKey := fmt.Sprintf("index:%d", ruleIndex)
+	if rule.Name != nil {
+		ruleKey = string(*rule.Name)
+	}
+	return modelRouterBackendKey(namespace, route, ruleKey), true, nil
+}
+
+func modelRouterBackendKey(namespace, route, rule string) string {
+	return fmt.Sprintf("/llm:router:httproute:%s:%s:%s", namespace, route, rule)
+}
+
+func translateModelForParents(
+	ctx RouteContext,
+	model *agentgateway.AgentgatewayModel,
+	parentRefs []RouteParentReference,
+	routeReporter reporter.RouteReporter,
+) []agwir.AgwResource {
+	type parentAgg struct {
+		anyAllowed bool
+		parentRefs []RouteParentReference
+	}
+	agg := map[string]*parentAgg{}
+	denied := map[string]*ParentError{}
+	for _, parent := range parentRefs {
+		statusKey := parentStatusKey(parent)
+		if agg[statusKey] == nil {
+			agg[statusKey] = &parentAgg{}
+		}
+		agg[statusKey].parentRefs = append(agg[statusKey].parentRefs, parent)
+		if parent.DeniedReason != nil {
+			denied[statusKey] = parent.DeniedReason
+		}
+	}
+
+	var resources []agwir.AgwResource
+	var conversionErr *reporter.RouteCondition
+	for _, parent := range parentRefs {
+		if parent.DeniedReason != nil {
+			continue
+		}
+		if a := agg[parentStatusKey(parent)]; a != nil {
+			a.anyAllowed = true
+		}
+		parentResources, err := convertAgentgatewayModel(ctx, model, parent)
+		// Keep safe partial virtual-model output while still reporting target errors through
+		// the model's status.
+		for _, resource := range parentResources {
+			resources = append(resources, ToResourceForGateway(parent.ParentGateway, resource))
+		}
+		if err != nil {
+			conversionErr = &reporter.RouteCondition{
+				Type:    gwv1.RouteConditionResolvedRefs,
+				Status:  "False",
+				Reason:  "Invalid",
+				Message: err.Error(),
+			}
+			continue
+		}
+	}
+
+	resolvedOK := conversionErr == nil
+	for statusKey, a := range agg {
+		for _, parent := range a.parentRefs {
+			prStatusRef := parent.OriginalReference
+			prStatusRef.Kind = new(gwv1.Kind(parent.ParentKey.Kind))
+			prStatusRef.Namespace = new(gwv1.Namespace(parent.ParentKey.Namespace))
+			prStatusRef.Name = gwv1.ObjectName(parent.ParentKey.Name)
+
+			pr := routeReporter.ParentRef(&prStatusRef)
+			if a.anyAllowed {
+				pr.SetCondition(reporter.RouteCondition{
+					Type:    gwv1.RouteConditionAccepted,
+					Status:  "True",
+					Reason:  gwv1.RouteReasonAccepted,
+					Message: reports.AgentgatewayModelAcceptedMessage,
+				})
+			} else {
+				reason := gwv1.RouteReasonNoMatchingParent
+				msg := "No listener matched the parent reference"
+				if dr := denied[statusKey]; dr != nil {
+					reason = gwv1.RouteConditionReason(dr.Reason)
+					msg = dr.Message
+				}
+				pr.SetCondition(reporter.RouteCondition{
+					Type:    gwv1.RouteConditionAccepted,
+					Status:  "False",
+					Reason:  reason,
+					Message: msg,
+				})
+			}
+			pr.SetCondition(reporter.RouteCondition{
+				Type: gwv1.RouteConditionResolvedRefs,
+				Status: func() metav1.ConditionStatus {
+					if resolvedOK {
+						return metav1.ConditionTrue
+					}
+					return metav1.ConditionFalse
+				}(),
+				Reason:  reasonResolvedRefs(conversionErr, resolvedOK),
+				Message: routeConditionMessage(conversionErr),
+			})
+		}
+	}
+	return resources
+}
+
+func parentStatusKey(parent RouteParentReference) string {
+	return fmt.Sprintf("%s/%s/%s/%s/%d", parent.ParentKey.Namespace, parent.ParentKey.Name, parent.ParentKey.Kind,
+		ptr.OrEmpty(parent.OriginalReference.SectionName), ptr.OrEmpty(parent.OriginalReference.Port))
+}
+
+func convertAgentgatewayModel(ctx RouteContext, model *agentgateway.AgentgatewayModel, parent RouteParentReference) ([]*api.Resource, error) {
+	key := modelRouteKey(model, parent)
+	created := max(model.CreationTimestamp.Unix(), 0)
+	route := &api.ModelRoute{
+		Key:         key,
+		ListenerKey: parent.ListenerKey,
+		Match:       &api.ModelRoute_Match{Model: effectiveModelName(model)},
+		Created:     uint64(created),
+		RouterKey:   parent.ModelRouterKey,
+	}
+	var resources []*api.Resource
+	var conversionErr error
+	aiPolicy, err := translateModelRouteAIPolicy(ctx, model.Namespace, model.Spec.Policies)
+	if err != nil {
+		return nil, err
+	}
+	route.AiPolicy = aiPolicy
+	if model.Spec.Policies != nil && model.Spec.Policies.Authorization != nil {
+		authorization, err := plugins.TranslateAuthorization(model.Spec.Policies.Authorization)
+		if err != nil {
+			return nil, err
+		}
+		route.Authorization = authorization
+	}
+
+	if model.Spec.Provider != nil {
+		backend, err := modelConcreteBackend(ctx, model, parent, nil)
+		if err != nil {
+			return nil, err
+		}
+		route.Kind = &api.ModelRoute_ConcreteModel_{
+			ConcreteModel: &api.ModelRoute_ConcreteModel{
+				ModelVisibility: translateModelVisibility(model.Spec.Visibility),
+				Backend:         backendRef(backend.Key),
+			},
+		}
+		provider := strings.ToLower(string(*model.Spec.Provider))
+		switch *model.Spec.Provider {
+		case agentgateway.ModelProviderGemini:
+			provider = "gcp.gemini"
+		case agentgateway.ModelProviderVertexAI:
+			provider = "gcp.vertex_ai"
+		case agentgateway.ModelProviderBedrock:
+			provider = "aws.bedrock"
+		case agentgateway.ModelProviderCustom:
+			if model.Spec.Custom.ProviderOverride != nil {
+				provider = *model.Spec.Custom.ProviderOverride
+			}
+		}
+		route.GetConcreteModel().DiscoveryProvider = &provider
+		resources = append(resources, backendResource(backend))
+	} else if model.Spec.VirtualModel != nil {
+		virtual, generated, err := translateVirtualModel(ctx, model, parent)
+		if virtual == nil {
+			return nil, err
+		}
+		route.Kind = &api.ModelRoute_VirtualModel_{VirtualModel: virtual}
+		resources = append(resources, generated...)
+		conversionErr = err
+	} else {
+		return nil, fmt.Errorf("model must define provider or virtualModel")
+	}
+
+	resources = append(resources, &api.Resource{Kind: &api.Resource_ModelRoute{ModelRoute: route}})
+	return resources, conversionErr
+}
+
+func translateVirtualModel(ctx RouteContext, model *agentgateway.AgentgatewayModel, parent RouteParentReference) (*api.ModelRoute_VirtualModel, []*api.Resource, error) {
+	vm := model.Spec.VirtualModel
+	switch {
+	case vm.Weighted != nil:
+		targets := make([]*api.ModelRoute_VirtualModel_Weighted_Target, 0, len(vm.Weighted.Targets))
+		var errs []error
+		for _, target := range vm.Weighted.Targets {
+			modelName, err := resolveModelTargetName(ctx, model.Namespace, target.ModelTargetReference)
+			if err != nil {
+				errs = append(errs, err)
+				modelName = unresolvedModelTargetName(target.ModelTargetReference)
+			}
+			targets = append(targets, &api.ModelRoute_VirtualModel_Weighted_Target{
+				Model:   modelName,
+				Weight:  uint32(ptr.NonEmptyOrDefault(target.Weight, 1)), //nolint:gosec // CEL constrains this to positive int32.
+				Invalid: err != nil,
+			})
+		}
+		return &api.ModelRoute_VirtualModel{
+			Routing: &api.ModelRoute_VirtualModel_Weighted_{
+				Weighted: &api.ModelRoute_VirtualModel_Weighted{Targets: targets},
+			},
+		}, nil, errors.Join(errs...)
+	case vm.Conditional != nil:
+		targets := make([]*api.ModelRoute_VirtualModel_Conditional_Target, 0, len(vm.Conditional.Targets))
+		var errs []error
+		for _, target := range vm.Conditional.Targets {
+			modelName, err := resolveModelTargetName(ctx, model.Namespace, target.ModelTargetReference)
+			if err != nil {
+				errs = append(errs, err)
+				modelName = unresolvedModelTargetName(target.ModelTargetReference)
+			}
+			var when *string
+			if target.When != nil {
+				when = new(string(*target.When))
+			}
+			targets = append(targets, &api.ModelRoute_VirtualModel_Conditional_Target{
+				Model:   modelName,
+				When:    when,
+				Invalid: err != nil,
+			})
+		}
+		return &api.ModelRoute_VirtualModel{
+			Routing: &api.ModelRoute_VirtualModel_Conditional_{
+				Conditional: &api.ModelRoute_VirtualModel_Conditional{Targets: targets},
+			},
+		}, nil, errors.Join(errs...)
+	case vm.Callout != nil:
+		callout, err := plugins.TranslateModelCallout(modelPolicyCtx(ctx), model.Namespace, vm.Callout)
+		if fallback := vm.Callout.Fallback; fallback != nil {
+			modelName, ferr := resolveModelTargetName(ctx, model.Namespace, *fallback)
+			if ferr != nil {
+				err = errors.Join(err, ferr)
+			} else {
+				callout.FallbackModel = &modelName
+			}
+		}
+		return &api.ModelRoute_VirtualModel{
+			Routing: &api.ModelRoute_VirtualModel_Callout_{Callout: callout},
+		}, nil, err
+	case vm.Failover != nil:
+		backend, err := modelFailoverBackend(ctx, model, parent)
+		if backend == nil {
+			return nil, nil, err
+		}
+		return &api.ModelRoute_VirtualModel{
+			Routing: &api.ModelRoute_VirtualModel_Failover_{
+				Failover: &api.ModelRoute_VirtualModel_Failover{Backend: backendRef(backend.Key)},
+			},
+		}, []*api.Resource{backendResource(backend)}, err
+	default:
+		return nil, nil, fmt.Errorf("virtualModel must define weighted, conditional, failover, or callout")
+	}
+}
+
+func modelConcreteBackend(ctx RouteContext, model *agentgateway.AgentgatewayModel, parent RouteParentReference, selectedModel *string) (*api.Backend, error) {
+	provider, err := translateModelLLMProvider(ctx, model.Namespace, &model.Spec, utils.SingularLLMProviderSubBackendName, selectedModel)
+	if err != nil {
+		return nil, err
+	}
+	return &api.Backend{
+		Key:  modelBackendKey(model, parent, "backend"),
+		Name: plugins.ResourceName(model),
+		Kind: &api.Backend_Ai{
+			Ai: &api.AIBackend{
+				ProviderGroups: []*api.AIBackend_ProviderGroup{{Providers: []*api.AIBackend_Provider{provider}}},
+			},
+		},
+	}, nil
+}
+
+func modelFailoverBackend(ctx RouteContext, model *agentgateway.AgentgatewayModel, parent RouteParentReference) (*api.Backend, error) {
+	groups := map[int32][]*api.AIBackend_Provider{}
+	var errs []error
+	for _, target := range model.Spec.VirtualModel.Failover.Targets {
+		_, provider, err := translateFailoverTarget(ctx, model.Namespace, target)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		groups[target.Priority] = append(groups[target.Priority], provider)
+	}
+	if len(groups) == 0 {
+		err := errors.Join(errs...)
+		if err == nil {
+			err = fmt.Errorf("failover requires at least one valid target")
+		}
+		return nil, err
+	}
+
+	priorities := make([]int32, 0, len(groups))
+	for p := range groups {
+		priorities = append(priorities, p)
+	}
+	slices.Sort(priorities)
+
+	backend := &api.AIBackend{}
+	for _, priority := range priorities {
+		providers := groups[priority]
+		slices.SortFunc(providers, func(a, b *api.AIBackend_Provider) int {
+			return strings.Compare(a.GetName(), b.GetName())
+		})
+		backend.ProviderGroups = append(backend.ProviderGroups, &api.AIBackend_ProviderGroup{Providers: providers})
+	}
+
+	return &api.Backend{
+		Key:  modelBackendKey(model, parent, "failover"),
+		Name: plugins.ResourceName(model),
+		Kind: &api.Backend_Ai{Ai: backend},
+	}, errors.Join(errs...)
+}
+
+// translateFailoverTarget resolves and translates one failover target. Callers omit targets
+// that return an error so the ancestry index and generated failover backend stay consistent.
+func translateFailoverTarget(
+	ctx RouteContext,
+	namespace string,
+	target agentgateway.FailoverModelTarget,
+) (*agentgateway.AgentgatewayModel, *api.AIBackend_Provider, error) {
+	refModel, modelName, err := resolveModelTarget(ctx, namespace, target.ModelTargetReference)
+	if err != nil {
+		return nil, nil, err
+	}
+	if refModel.Spec.Provider == nil {
+		return nil, nil, fmt.Errorf("failover target %s/%s is not a concrete provider model", namespace, target.ModelRef.Name)
+	}
+	provider, err := translateModelLLMProvider(ctx, refModel.Namespace, &refModel.Spec, target.ModelRef.Name, new(modelName))
+	if err != nil {
+		return nil, nil, err
+	}
+	if refModel.Spec.Policies != nil && refModel.Spec.Policies.Authorization != nil {
+		authorization, err := plugins.TranslateAuthorization(refModel.Spec.Policies.Authorization)
+		if err != nil {
+			return nil, nil, err
+		}
+		provider.InlinePolicies = append(provider.InlinePolicies, &api.BackendPolicySpec{
+			Kind: &api.BackendPolicySpec_Authorization{Authorization: authorization},
+		})
+	}
+	transformations, err := translateModelRouteAIPolicy(ctx, refModel.Namespace, refModel.Spec.Policies)
+	if err != nil {
+		return nil, nil, err
+	}
+	if transformations != nil {
+		provider.InlinePolicies = append(provider.InlinePolicies, &api.BackendPolicySpec{
+			Kind: &api.BackendPolicySpec_Ai_{Ai: transformations},
+		})
+	}
+	return refModel, provider, nil
+}
+
+func translateModelLLMProvider(ctx RouteContext, namespace string, model *agentgateway.AgentgatewayModelSpec, providerName string, selectedModel *string) (*api.AIBackend_Provider, error) {
+	if err := validateModelBaseURL(model); err != nil {
+		return nil, err
+	}
+	inlinePolicies, err := translateModelPolicies(ctx, namespace, model)
+	if err != nil {
+		return nil, err
+	}
+	provider := &api.AIBackend_Provider{Name: providerName, InlinePolicies: inlinePolicies}
+	if model.BaseURL != nil {
+		provider.BaseUrl = new(*model.BaseURL)
+	}
+	if model.Provider != nil {
+		if preset, ok := modelProviderPreset(*model.Provider); ok {
+			provider.ModelOverride = selectedModel
+			provider.Provider = &api.AIBackend_Provider_ProviderPreset{ProviderPreset: preset}
+			return provider, nil
+		}
+	}
+
+	llm, err := modelLLMProvider(model)
+	if err != nil {
+		return nil, err
+	}
+	if llm == nil {
+		return nil, fmt.Errorf("no LLM provider configured")
+	}
+	if provider.HostOverride == nil && llm.Host != "" {
+		provider.HostOverride = &api.AIBackend_HostOverride{
+			Host: llm.Host,
+			Port: ptr.NonEmptyOrDefault(llm.Port, 443),
+		}
+	}
+	if provider.PathOverride == nil && llm.Path != "" {
+		provider.PathOverride = new(llm.Path)
+	}
+	if provider.PathPrefix == nil && llm.PathPrefix != "" {
+		provider.PathPrefix = new(llm.PathPrefix)
+	}
+
+	switch {
+	case llm.OpenAI != nil:
+		provider.Provider = &api.AIBackend_Provider_Openai{Openai: &api.AIBackend_OpenAI{Model: providerModel(selectedModel, llm.OpenAI.Model)}}
+	case llm.Copilot != nil:
+		provider.Provider = &api.AIBackend_Provider_Copilot{Copilot: &api.AIBackend_Copilot{Model: providerModel(selectedModel, llm.Copilot.Model)}}
+	case llm.Azure != nil:
+		resourceType := api.AIBackend_OPEN_AI
+		if llm.Azure.ResourceType == agentgateway.AzureResourceTypeFoundry {
+			resourceType = api.AIBackend_FOUNDRY
+		}
+		provider.Provider = &api.AIBackend_Provider_Azure{Azure: &api.AIBackend_Azure{
+			ResourceName: llm.Azure.ResourceName,
+			ResourceType: resourceType,
+			Model:        providerModel(selectedModel, llm.Azure.Model),
+			ApiVersion:   stringPtr(llm.Azure.ApiVersion),
+			ProjectName:  stringPtr(llm.Azure.ProjectName),
+		}}
+	case llm.Anthropic != nil:
+		provider.Provider = &api.AIBackend_Provider_Anthropic{Anthropic: &api.AIBackend_Anthropic{Model: providerModel(selectedModel, llm.Anthropic.Model)}}
+	case llm.Gemini != nil:
+		provider.Provider = &api.AIBackend_Provider_Gemini{Gemini: &api.AIBackend_Gemini{Model: providerModel(selectedModel, llm.Gemini.Model)}}
+	case llm.VertexAI != nil:
+		provider.Provider = &api.AIBackend_Provider_Vertex{Vertex: &api.AIBackend_Vertex{
+			Region:    ptr.NonEmptyOrDefault(llm.VertexAI.Region, "global"),
+			Model:     providerModel(selectedModel, llm.VertexAI.Model),
+			ProjectId: llm.VertexAI.ProjectId,
+		}}
+	case llm.Bedrock != nil:
+		var guardrailIdentifier, guardrailVersion *string
+		if llm.Bedrock.Guardrail != nil {
+			guardrailIdentifier = new(llm.Bedrock.Guardrail.GuardrailIdentifier)
+			guardrailVersion = new(llm.Bedrock.Guardrail.GuardrailVersion)
+		}
+		provider.Provider = &api.AIBackend_Provider_Bedrock{Bedrock: &api.AIBackend_Bedrock{
+			Model:               providerModel(selectedModel, llm.Bedrock.Model),
+			Region:              ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1"),
+			GuardrailIdentifier: guardrailIdentifier,
+			GuardrailVersion:    guardrailVersion,
+		}}
+	case llm.Custom != nil:
+		formats, err := plugins.TranslateCustomProviderFormats(llm.Custom.Formats)
+		if err != nil {
+			return nil, err
+		}
+		provider.Provider = &api.AIBackend_Provider_Custom{Custom: &api.AIBackend_Custom{
+			Formats:          formats,
+			Model:            providerModel(selectedModel, llm.Custom.Model),
+			ProviderOverride: llm.Custom.ProviderOverride,
+		}}
+		if llm.Custom.BackendRef != nil {
+			ref, err := plugins.TranslateCustomProviderBackendRef(ctx.Krt, ctx.References.RouteBackend, namespace, *llm.Custom.BackendRef)
+			if err != nil {
+				return nil, err
+			}
+			provider.ProviderBackend = ref
+		}
+	default:
+		return nil, fmt.Errorf("no supported LLM provider configured")
+	}
+	return provider, nil
+}
+
+func translateModelPolicies(ctx RouteContext, namespace string, model *agentgateway.AgentgatewayModelSpec) ([]*api.BackendPolicySpec, error) {
+	if model.Policies == nil {
+		return nil, nil
+	}
+
+	policies := model.Policies
+	translated, err := translateInlineModelBackendPolicy(ctx, namespace, modelBackendPolicy(policies))
+	if err != nil {
+		return nil, err
+	}
+	if policies.Headers == nil {
+		return translated, nil
+	}
+	if request := CreateAgwHeadersFilter(policies.Headers.Request); request != nil {
+		translated = append(translated, &api.BackendPolicySpec{Kind: &api.BackendPolicySpec_RequestHeaderModifier{RequestHeaderModifier: request}})
+	}
+	if response := CreateAgwResponseHeadersFilter(policies.Headers.Response); response != nil {
+		translated = append(translated, &api.BackendPolicySpec{Kind: &api.BackendPolicySpec_ResponseHeaderModifier{ResponseHeaderModifier: response}})
+	}
+	return translated, nil
+}
+
+func modelBackendPolicy(policies *agentgateway.ModelPolicies) *agentgateway.BackendFull {
+	if policies == nil {
+		return nil
+	}
+	backend := &agentgateway.BackendFull{}
+	backend.BackendSimple.Auth = policies.Auth.BackendAuth()
+	backend.BackendSimple.TLS = policies.TLS
+	backend.BackendSimple.Tunnel = policies.Tunnel
+	backend.Health = policies.Health
+	if policies.PromptGuard != nil {
+		backend.AI = &agentgateway.BackendAI{PromptGuard: policies.PromptGuard}
+	}
+	return backend
+}
+
+func translateModelRouteAIPolicy(ctx RouteContext, namespace string, policies *agentgateway.ModelPolicies) (*api.BackendPolicySpec_Ai, error) {
+	if policies == nil || (len(policies.Transformations) == 0 && len(policies.FinalTransformations) == 0) {
+		return nil, nil
+	}
+	translated, err := translateInlineModelBackendPolicy(ctx, namespace,
+		&agentgateway.BackendFull{AI: &agentgateway.BackendAI{
+			Transformations:      policies.Transformations,
+			FinalTransformations: policies.FinalTransformations,
+		}})
+	if err != nil {
+		return nil, err
+	}
+	if len(translated) != 1 || translated[0].GetAi() == nil {
+		return nil, fmt.Errorf("model policies must translate to an AI policy")
+	}
+	return translated[0].GetAi(), nil
+}
+
+func translateInlineModelBackendPolicy(ctx RouteContext, namespace string, backend *agentgateway.BackendFull) ([]*api.BackendPolicySpec, error) {
+	return plugins.TranslateInlineBackendPolicy(modelPolicyCtx(ctx), namespace, backend)
+}
+
+func modelPolicyCtx(ctx RouteContext) plugins.PolicyCtx {
+	return plugins.PolicyCtx{
+		Krt:                ctx.Krt,
+		Collections:        ctx.Collections,
+		CredentialResolver: kubeutils.NewSecretCredentialResolver(ctx.Secrets),
+		RouteBackend:       ctx.References.RouteBackend,
+		Grants:             ctx.Grants,
+		SourceGVK:          wellknown.AgentgatewayModelGVK,
+	}
+}
+
+func modelLLMProvider(model *agentgateway.AgentgatewayModelSpec) (*agentgateway.LLMProvider, error) {
+	if model.Provider == nil {
+		return nil, nil
+	}
+	provider := &agentgateway.LLMProvider{}
+	switch *model.Provider {
+	case agentgateway.ModelProviderOpenAI:
+		provider.OpenAI = &agentgateway.OpenAIConfig{}
+	case agentgateway.ModelProviderCopilot:
+		provider.Copilot = &agentgateway.CopilotConfig{}
+	case agentgateway.ModelProviderAzure:
+		if model.Azure == nil {
+			return nil, fmt.Errorf("azure provider requires azure configuration")
+		}
+		provider.Azure = &agentgateway.AzureConfig{AzureSettings: *model.Azure}
+	case agentgateway.ModelProviderAnthropic:
+		provider.Anthropic = &agentgateway.AnthropicConfig{}
+	case agentgateway.ModelProviderGemini:
+		provider.Gemini = &agentgateway.GeminiConfig{}
+	case agentgateway.ModelProviderVertexAI:
+		if model.VertexAI == nil {
+			return nil, fmt.Errorf("vertexai provider requires vertexai configuration")
+		}
+		provider.VertexAI = &agentgateway.VertexAIConfig{VertexAISettings: *model.VertexAI}
+	case agentgateway.ModelProviderBedrock:
+		if model.Bedrock == nil {
+			return nil, fmt.Errorf("bedrock provider requires bedrock configuration")
+		}
+		provider.Bedrock = &agentgateway.BedrockConfig{BedrockSettings: *model.Bedrock}
+	case agentgateway.ModelProviderCustom:
+		if model.Custom == nil {
+			return nil, fmt.Errorf("custom provider requires custom configuration")
+		}
+		provider.Custom = &agentgateway.CustomProvider{CustomProviderSettings: *model.Custom}
+	default:
+		return nil, fmt.Errorf("unsupported model provider %q", *model.Provider)
+	}
+	return provider, nil
+}
+
+func validateModelBaseURL(model *agentgateway.AgentgatewayModelSpec) error {
+	var baseURL string
+	if model.BaseURL != nil {
+		baseURL = *model.BaseURL
+	}
+	if model.Provider != nil && *model.Provider == agentgateway.ModelProviderOllama && baseURL == "" {
+		return fmt.Errorf("ollama requires baseURL")
+	}
+	if baseURL == "" {
+		return nil
+	}
+
+	parsed, err := url.ParseRequestURI(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("baseURL must be an absolute URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("baseURL must use http or https")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("baseURL cannot include user info, query parameters, or a fragment")
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("baseURL must include a host")
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return fmt.Errorf("baseURL cannot target localhost, loopback, link-local, or unspecified addresses")
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		addr = addr.Unmap()
+		if addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified() {
+			return fmt.Errorf("baseURL cannot target localhost, loopback, link-local, or unspecified addresses")
+		}
+	} else if strings.Trim(host, ".0123456789") == "" || strings.HasPrefix(strings.ToLower(host), "0x") {
+		return fmt.Errorf("baseURL cannot use an ambiguous IP address")
+	}
+	return nil
+}
+
+func modelProviderPreset(provider agentgateway.ModelProvider) (api.AIBackend_ProviderPreset, bool) {
+	switch provider {
+	case agentgateway.ModelProviderCohere:
+		return api.AIBackend_PROVIDER_PRESET_COHERE, true
+	case agentgateway.ModelProviderOllama:
+		return api.AIBackend_PROVIDER_PRESET_OLLAMA, true
+	case agentgateway.ModelProviderBaseten:
+		return api.AIBackend_PROVIDER_PRESET_BASETEN, true
+	case agentgateway.ModelProviderCerebras:
+		return api.AIBackend_PROVIDER_PRESET_CEREBRAS, true
+	case agentgateway.ModelProviderDeepinfra:
+		return api.AIBackend_PROVIDER_PRESET_DEEPINFRA, true
+	case agentgateway.ModelProviderDeepseek:
+		return api.AIBackend_PROVIDER_PRESET_DEEPSEEK, true
+	case agentgateway.ModelProviderGroq:
+		return api.AIBackend_PROVIDER_PRESET_GROQ, true
+	case agentgateway.ModelProviderHuggingface:
+		return api.AIBackend_PROVIDER_PRESET_HUGGINGFACE, true
+	case agentgateway.ModelProviderMistral:
+		return api.AIBackend_PROVIDER_PRESET_MISTRAL, true
+	case agentgateway.ModelProviderOpenrouter:
+		return api.AIBackend_PROVIDER_PRESET_OPENROUTER, true
+	case agentgateway.ModelProviderTogetherAI:
+		return api.AIBackend_PROVIDER_PRESET_TOGETHERAI, true
+	case agentgateway.ModelProviderXAI:
+		return api.AIBackend_PROVIDER_PRESET_XAI, true
+	case agentgateway.ModelProviderFireworks:
+		return api.AIBackend_PROVIDER_PRESET_FIREWORKS, true
+	case agentgateway.ModelProviderMeta:
+		return api.AIBackend_PROVIDER_PRESET_META, true
+	case agentgateway.ModelProviderPerplexity:
+		return api.AIBackend_PROVIDER_PRESET_PERPLEXITY, true
+	case agentgateway.ModelProviderTypesafe:
+		return api.AIBackend_PROVIDER_PRESET_TYPESAFE, true
+	default:
+		return api.AIBackend_PROVIDER_PRESET_UNSPECIFIED, false
+	}
+}
+
+func resolveModelTargetName(ctx RouteContext, namespace string, target agentgateway.ModelTargetReference) (string, error) {
+	_, modelName, err := resolveModelTarget(ctx, namespace, target)
+	return modelName, err
+}
+
+func unresolvedModelTargetName(target agentgateway.ModelTargetReference) string {
+	if target.Model != nil {
+		return *target.Model
+	}
+	return target.ModelRef.Name
+}
+
+func resolveModelTarget(ctx RouteContext, namespace string, target agentgateway.ModelTargetReference) (*agentgateway.AgentgatewayModel, string, error) {
+	var ref *agentgateway.AgentgatewayModel
+	for _, candidate := range krt.Fetch(ctx.Krt, ctx.Models, krt.FilterIndex(ctx.ModelsByNamespace, namespace)) {
+		if candidate.Name == target.ModelRef.Name {
+			ref = candidate
+			break
+		}
+	}
+	if ref == nil {
+		return nil, "", fmt.Errorf("model target %s/%s not found", namespace, target.ModelRef.Name)
+	}
+	if target.Model != nil {
+		return ref, *target.Model, nil
+	}
+	modelName := effectiveModelName(ref)
+	if strings.Contains(modelName, "*") {
+		return nil, "", fmt.Errorf("model target %s/%s requires model when the referenced model uses a wildcard match.model", namespace, target.ModelRef.Name)
+	}
+	return ref, modelName, nil
+}
+
+func routeConditionMessage(condition *reporter.RouteCondition) string {
+	if condition == nil {
+		return ""
+	}
+	return condition.Message
+}
+
+func providerModel[T ~string](override *string, configured *T) *string {
+	if override != nil {
+		return override
+	}
+	if configured == nil {
+		return nil
+	}
+	return new(string(*configured))
+}
+
+func stringPtr[T ~string](v *T) *string {
+	if v == nil {
+		return nil
+	}
+	return new(string(*v))
+}
+
+func effectiveModelName(model *agentgateway.AgentgatewayModel) string {
+	if model.Spec.Match != nil && model.Spec.Match.Model != nil {
+		return *model.Spec.Match.Model
+	}
+	return model.Name
+}
+
+func translateModelVisibility(visibility agentgateway.ModelVisibility) api.ModelRoute_ConcreteModel_ModelVisibility {
+	if visibility == agentgateway.ModelVisibilityInternal {
+		return api.ModelRoute_ConcreteModel_INTERNAL
+	}
+	return api.ModelRoute_ConcreteModel_PUBLIC
+}
+
+func modelRouteKey(model *agentgateway.AgentgatewayModel, parent RouteParentReference) string {
+	key := config.NamespacedName(model).String() + modelRouteKeySuffix(parent)
+	if parent.ParentKey.Kind == wellknown.HTTPRouteKind {
+		// An HTTPRoute rule may attach to multiple listeners on the same Gateway.
+		// Backends can be shared, but model routes carry a specific listener key.
+		key += "." + parent.ListenerKey[strings.LastIndex(parent.ListenerKey, ".")+1:]
+	}
+	return key
+}
+
+func modelBackendKey(model *agentgateway.AgentgatewayModel, parent RouteParentReference, target string) string {
+	return utils.InternalBackendKey(model.Namespace, model.Name, target+modelRouteKeySuffix(parent))
+}
+
+func modelRouteKeySuffix(parent RouteParentReference) string {
+	suffix := routeKeySuffix(parent)
+	if suffix == "" && parent.ParentKey.Kind == wellknown.HTTPRouteKind {
+		return "." + parent.ParentKey.Namespace + "." + parent.ParentKey.Name
+	}
+	return suffix
+}
+
+func backendRef(key string) *api.BackendReference {
+	return &api.BackendReference{Kind: &api.BackendReference_Backend{Backend: key}}
+}
+
+func backendResource(backend *api.Backend) *api.Resource {
+	return &api.Resource{Kind: &api.Resource_Backend{Backend: backend}}
+}

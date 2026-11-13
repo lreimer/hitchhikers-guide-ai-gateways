@@ -1,0 +1,302 @@
+package settings
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+
+	"github.com/kelseyhightower/envconfig"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+// DnsLookupFamily controls the DNS lookup family for all static clusters created via Backend resources.
+type DnsLookupFamily string
+type XdsMode string
+type BackendRefGrantMode string
+
+const (
+	// DnsLookupFamilyV4Preferred is the default value for DnsLookupFamily.
+	// The DNS resolver will first perform a lookup for addresses in the IPv4 family
+	// and fallback to a lookup for addresses in the IPv6 family. The callback target
+	// will only get v6 addresses if there were no v4 addresses to return.
+	DnsLookupFamilyV4Preferred DnsLookupFamily = "V4_PREFERRED"
+	// DnsLookupFamilyV4Only is the value for DnsLookupFamily that only performs
+	// DNS lookups for addresses in the IPv4 family.
+	DnsLookupFamilyV4Only DnsLookupFamily = "V4_ONLY"
+	// DnsLookupFamilyV6Only is the value for DnsLookupFamily that only performs
+	// DNS lookups for addresses in the IPv6 family.
+	DnsLookupFamilyV6Only DnsLookupFamily = "V6_ONLY"
+	// DnsLookupFamilyAll is the value for DnsLookupFamily that performs lookups
+	// for both IPv4 and IPv6 families and returns all resolved addresses.
+	DnsLookupFamilyAll DnsLookupFamily = "ALL"
+	// DnsLookupFamilyAuto is the value for DnsLookupFamily that first performs
+	// a lookup for addresses in the IPv6 family and falls back to a lookup for
+	// addresses in the IPv4 family. This is semantically equivalent to a
+	// non-existent V6_PREFERRED option and is a legacy name that will be
+	// deprecated in favor of V6_PREFERRED in a future major version.
+	DnsLookupFamilyAuto DnsLookupFamily = "AUTO"
+
+	XdsModePlaintext XdsMode = "plaintext"
+	XdsModeTLS       XdsMode = "tls"
+	XdsModeEither    XdsMode = "either"
+
+	BackendRefGrantModeRouteAndPolicy BackendRefGrantMode = "route-and-policy"
+	BackendRefGrantModeRoute          BackendRefGrantMode = "route"
+	BackendRefGrantModeNone           BackendRefGrantMode = "none"
+)
+
+// Decode implements envconfig.Decoder.
+func (m *DnsLookupFamily) Decode(value string) error {
+	mode := DnsLookupFamily(value)
+	switch mode {
+	case DnsLookupFamilyV4Preferred, DnsLookupFamilyV4Only, DnsLookupFamilyV6Only, DnsLookupFamilyAll, DnsLookupFamilyAuto:
+		*m = mode
+		return nil
+	default:
+		return fmt.Errorf("invalid DNS lookup family: %q", value)
+	}
+}
+
+// Decode implements envconfig.Decoder.
+func (m *XdsMode) Decode(value string) error {
+	mode := XdsMode(strings.ToLower(value))
+	switch mode {
+	case XdsModePlaintext, XdsModeTLS, XdsModeEither:
+		*m = mode
+		return nil
+	case "true":
+		*m = XdsModeTLS
+		return nil
+	case "false":
+		*m = XdsModePlaintext
+		return nil
+	default:
+		return fmt.Errorf("invalid xDS mode: %q (supported: plaintext, tls, either)", value)
+	}
+}
+
+// Decode implements envconfig.Decoder.
+func (m *BackendRefGrantMode) Decode(value string) error {
+	mode := BackendRefGrantMode(strings.ToLower(value))
+	switch mode {
+	case BackendRefGrantModeRouteAndPolicy, BackendRefGrantModeRoute, BackendRefGrantModeNone:
+		*m = mode
+		return nil
+	default:
+		return fmt.Errorf("invalid backend ReferenceGrant mode: %q (supported: route-and-policy, route, none)", value)
+	}
+}
+
+func (m BackendRefGrantMode) RequireRouteBackendGrant() bool {
+	return m == "" || m == BackendRefGrantModeRouteAndPolicy || m == BackendRefGrantModeRoute
+}
+
+func (m BackendRefGrantMode) RequirePolicyBackendGrant() bool {
+	return m == BackendRefGrantModeRouteAndPolicy
+}
+
+// GatewayClassParametersRefs maps GatewayClass names to ParametersReference
+type GatewayClassParametersRefs map[string]*gwv1.ParametersReference
+
+// Decode implements envconfig.Decoder
+func (r *GatewayClassParametersRefs) Decode(value string) error {
+	if value == "" {
+		*r = nil
+		return nil
+	}
+
+	// First parse as a simple map to validate name is present
+	var simpleParsed map[string]struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		Group     string `json:"group,omitempty"`
+		Kind      string `json:"kind,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(value), &simpleParsed); err != nil {
+		return fmt.Errorf("invalid gateway class parameters refs: %w", err)
+	}
+
+	parsed := make(map[string]*gwv1.ParametersReference, len(simpleParsed))
+	for className, ref := range simpleParsed {
+		if strings.TrimSpace(ref.Name) == "" {
+			return fmt.Errorf("gateway class %q parametersRef.name must be set", className)
+		}
+		if strings.TrimSpace(ref.Namespace) == "" {
+			return fmt.Errorf("gateway class %q parametersRef.namespace must be set", className)
+		}
+		ns := gwv1.Namespace(ref.Namespace)
+		paramsRef := &gwv1.ParametersReference{
+			Name:      ref.Name,
+			Namespace: &ns,
+		}
+		if ref.Group != "" {
+			paramsRef.Group = gwv1.Group(ref.Group)
+		}
+		if ref.Kind != "" {
+			paramsRef.Kind = gwv1.Kind(ref.Kind)
+		}
+
+		parsed[className] = paramsRef
+	}
+
+	*r = parsed
+	return nil
+}
+
+const (
+	// TLSSecretName is the name of the Kubernetes Secret containing the TLS certificate,
+	// private key, and CA certificate for xDS communication. This secret must exist in the
+	// agentgateway installation namespace when TLS is enabled.
+	TLSSecretName = "kgateway-xds-cert" //nolint:gosec // G101: This is a well-known xDS TLS secret name, not a credential
+)
+
+type Settings struct {
+	// UnsafeAdminBindAddress is an IP address or the literal localhost, without a port (always 9095).
+	// Defaults to localhost. A non-loopback address unsafely makes the admin server network-accessible.
+	UnsafeAdminBindAddress string `split_words:"true" default:"localhost"`
+
+	// Controls the DnsLookupFamily for all static clusters created via Backend resources.
+	// If not set, agentgateway will default to "V4_PREFERRED". Note that this is different
+	// from the Envoy default of "AUTO", which is effectively "V6_PREFERRED".
+	// Supported values are: "ALL", "AUTO", "V4_PREFERRED", "V4_ONLY", "V6_ONLY"
+	// Details on the behavior of these options are available on the Envoy documentation:
+	// https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#enum-config-cluster-v3-cluster-dnslookupfamily
+	DnsLookupFamily DnsLookupFamily `split_words:"true" default:"V4_PREFERRED"`
+
+	// Controls the listener bind address. Can be either V4 or V6
+	ListenerBindIpv6 bool `split_words:"true" default:"true"`
+
+	// IstioNamespace is the namespace where Istio control plane components are installed.
+	// Defaults to "istio-system".
+	IstioNamespace string `split_words:"true" default:"istio-system"`
+
+	// IstioRevision is the Istio revision of the Istio control plane.
+	// Defaults to "default".
+	IstioRevision string `split_words:"true" default:"default"`
+
+	// IstioAutoEnabled, when true, enables Istio integration by default on all built-in-class
+	// gateways. Individual gateways can opt out via AgentgatewayParameters spec.istio.enabled=false.
+	// Defaults to false, meaning gateways opt in to Istio integration via spec.istio.
+	IstioAutoEnabled bool `split_words:"true"`
+
+	// IstioClusterId, IstioNetwork, and IstioCaAddress are mesh values applied to gateways that have
+	// Istio integration enabled; they do not enable it themselves. GatewayParameters override per gateway.
+	IstioClusterId string `split_words:"true"`
+	IstioNetwork   string `split_words:"true"`
+	// Defaults to "https://istiod.istio-system.svc:15012".
+	IstioCaAddress string `split_words:"true"`
+
+	// XdsServiceHost is the host that serves xDS config.
+	// It overrides xdsServiceName if set.
+	XdsServiceHost string `split_words:"true"`
+
+	// AdditionalXdsTLSHosts are extra DNS names or IP addresses to include in the generated xDS serving certificate.
+	AdditionalXdsTLSHosts []string `split_words:"true"`
+
+	// XdsServiceName is the name of the Kubernetes Service that serves xDS config.
+	// It is assumed to be in the agentgateway install namespace.
+	// Ignored if XdsServiceHost is set.
+	XdsServiceName string `split_words:"true" default:"agentgateway"`
+
+	// XdsAuth enables or disables xDS authentication between the data-plane and control-plane.
+	// By default, this is enabled.
+	XdsAuth bool `split_words:"true" default:"true"`
+
+	// XdsMode configures how xDS is served by the control-plane:
+	// - plaintext: serve only plaintext xDS
+	// - tls: serve only TLS xDS
+	// - either: serve both TLS and plaintext xDS
+	XdsMode XdsMode `split_words:"true" default:"plaintext"`
+
+	// BackendRefGrantMode controls when ReferenceGrant is required for cross-namespace backend refs.
+	// Secret refs always require ReferenceGrant.
+	// - route-and-policy: require ReferenceGrant for Route -> Backend and AgentgatewayPolicy -> Backend
+	// - route: require ReferenceGrant only for Route -> Backend
+	// - none: do not require ReferenceGrant for backend refs
+	BackendRefGrantMode BackendRefGrantMode `split_words:"true" default:"route"`
+
+	// AgentgatewayXdsServicePort is the port of the Kubernetes Service that serves xDS config for agentgateway.
+	// This is the primary xDS port and is used for TLS mode and for plaintext when mode=plaintext.
+	AgentgatewayXdsServicePort uint32 `split_words:"true" default:"9978"`
+	// NoListenersDummyPort is the port exposed on the generated Service when a Gateway has no listeners.
+	// This keeps the LoadBalancer provisioned and address stable across transitions to zero listeners.
+	NoListenersDummyPort uint16 `split_words:"true" default:"443"`
+
+	// EnableInferExt defines whether to enable/disable support for Gateway API inference extension.
+	// If enabled, EnableAgentgateway should also be set to true. Enabling inference extension without agentgateway
+	// is deprecated in v2.1 and will not be supported in v2.2.
+	EnableInferExt bool `split_words:"true"`
+
+	// EnableAgentgatewayModels enables the AgentgatewayModel API.
+	EnableAgentgatewayModels bool `split_words:"true" default:"true"`
+	// EnableXBackend enables the experimental Gateway API XBackend resource.
+	EnableXBackend bool `split_words:"true" default:"false"`
+
+	// ProxyImageRegistry is the default image registry to use for the proxy image.
+	ProxyImageRegistry string `split_words:"true" default:"cr.agentgateway.dev"`
+	// ProxyImageRepository is the default image repository to use for the proxy image.
+	ProxyImageRepository string `split_words:"true" default:"agentgateway"`
+	// ProxyImageTag is the default image tag to use for the proxy image.
+	ProxyImageTag *string `split_words:"true" default:""`
+
+	// LogLevel specifies the logging level (e.g., "trace", "debug", "info", "warn", "error").
+	// Defaults to "info" if not set.
+	LogLevel string `split_words:"true" default:"info"`
+
+	// JSON representation of list of metav1.LabelSelector to select namespaces considered for resource discovery.
+	// Defaults to an empty list which selects all namespaces.
+	// E.g., [{"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":["infra"]}]},{"matchLabels":{"app":"a"}}]
+	DiscoveryNamespaceSelectors string `split_words:"true" default:"[]"`
+
+	// EnableBuiltinDefaultMetrics enables the default builtin controller-runtime metrics and go runtime metrics.
+	// Since these metrics can be numerous, it is disabled by default.
+	EnableBuiltinDefaultMetrics bool `split_words:"true" default:"false"`
+
+	// GlobalPolicyNamespace is the namespace where policies that can attach to resources
+	// in any namespace are defined.
+	GlobalPolicyNamespace string `split_words:"true"`
+
+	// Controls if leader election is disabled. Defaults to false.
+	DisableLeaderElection bool `split_words:"true" default:"false"`
+
+	// EnableExperimentalGatewayAPIFeatures enables support for experimental features and APIs
+	EnableExperimentalGatewayAPIFeatures bool `split_words:"true" default:"true"`
+
+	// ControllerName is the value written to GatewayClass.spec.controllerName that this controller
+	// reconciles; Gateways referencing a GatewayClass with this controllerName are managed here.
+	// Defaults to wellknown.DefaultAgwControllerName ("agentgateway.dev/agentgateway").
+	// A value set programmatically via setup.Options.ControllerName takes precedence over this.
+	ControllerName string `split_words:"true" default:"agentgateway.dev/agentgateway"`
+
+	// AgentgatewayClassName is the name of the primary GatewayClass this controller creates and
+	// manages. Defaults to wellknown.DefaultAgwClassName ("agentgateway").
+	// A value set programmatically via setup.Options.AgentgatewayClassName takes precedence.
+	AgentgatewayClassName string `split_words:"true" default:"agentgateway"`
+
+	// GatewayClassParametersRefs configures the GatewayParameters references to set on the default GatewayClasses.
+	// Format: JSON map where keys are GatewayClass names and values are objects with "name" (required),
+	// "namespace" (required), "group" (optional), and "kind" (optional) fields.
+	// E.g., {"gateway-class-name":{"name":"params-name","namespace":"params-namespace","group":"gateway.networking.k8s.io","kind":"GatewayParameters"}}
+	GatewayClassParametersRefs GatewayClassParametersRefs `split_words:"true" default:"{}"`
+}
+
+// BuildSettings returns a zero-valued Settings obj if error is encountered when parsing env
+func BuildSettings() (*Settings, error) {
+	settings := &Settings{}
+	if err := envconfig.Process("AGW", settings); err != nil {
+		return settings, err
+	}
+	if settings.UnsafeAdminBindAddress != "localhost" && net.ParseIP(settings.UnsafeAdminBindAddress) == nil {
+		return settings, fmt.Errorf("invalid AGW_UNSAFE_ADMIN_BIND_ADDRESS %q: expected an IP address or the literal localhost without a port", settings.UnsafeAdminBindAddress)
+	}
+	return settings, nil
+}
+
+func (s *Settings) IsXdsTLSEnabled() bool {
+	return s.XdsMode == XdsModeTLS || s.XdsMode == XdsModeEither
+}
+
+func (s *Settings) IsXdsPlaintextEnabled() bool {
+	return s.XdsMode == XdsModePlaintext || s.XdsMode == XdsModeEither
+}

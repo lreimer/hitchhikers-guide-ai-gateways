@@ -1,0 +1,173 @@
+package plugins
+
+import (
+	"cmp"
+
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+
+	"github.com/agentgateway/agentgateway/api"
+	apisettings "github.com/agentgateway/agentgateway/controller/api/settings"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
+)
+
+type ReferenceGrantChecker interface {
+	SecretAllowed(ctx krt.HandlerContext, kind schema.GroupVersionKind, secret types.NamespacedName, namespace string) bool
+	BackendAllowed(
+		ctx krt.HandlerContext,
+		k schema.GroupVersionKind,
+		backendName gwv1b1.ObjectName,
+		backendNamespace gwv1b1.Namespace,
+		sourceNamespace string,
+		refKind schema.GroupKind,
+		mode apisettings.BackendRefGrantMode,
+	) bool
+}
+
+type PolicyPluginInput struct {
+	References ReferenceIndex
+	Grants     ReferenceGrantChecker
+}
+
+type BackendPlugin struct {
+	Build           func(PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[ir.AgwResource])
+	BuildReferences func() krt.Collection[*PolicyAttachment]
+}
+
+type PolicyPlugin struct {
+	Build func(PolicyPluginInput) (krt.StatusCollection[controllers.Object, any], krt.Collection[AgwPolicy])
+	// BuildReferences is called with the base ReferenceIndex (before PolicyAttachments)
+	// to avoid self-referential graph construction.
+	BuildReferences func(input PolicyPluginInput) krt.Collection[*PolicyAttachment]
+}
+
+// AgwPolicy wraps an Agw policy for collection handling
+type AgwPolicy struct {
+	Gateway *types.NamespacedName
+	Policy  *api.Policy
+	// TODO: track errors per policy
+}
+
+func (p AgwPolicy) Equals(in AgwPolicy) bool {
+	return ptr.Equal(p.Gateway, in.Gateway) && protoconv.Equals(p.Policy, in.Policy)
+}
+
+func (p AgwPolicy) ResourceName() string {
+	// Keep the key identical to its AgwResource projection so MapCollection
+	// can expose that wrapper without retaining another collection of policies.
+	if p.Gateway == nil || *p.Gateway == (types.NamespacedName{}) {
+		return "policy/" + p.Policy.Key
+	}
+	return p.Gateway.String() + "/policy/" + p.Policy.Key
+}
+
+type AddResourcesPlugin struct {
+	Binds            krt.Collection[ir.AgwResource]
+	Listeners        krt.Collection[ir.AgwResource]
+	Routes           krt.Collection[ir.AgwResource]
+	AncestorBackends krt.Collection[*utils.AncestorBackend]
+	GatewayStatuses  krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus]
+	// ParentResolvers contribute additional parent resolution logic to the
+	// main route pipeline.
+	ParentResolvers []ParentResolver
+}
+
+// ParentInfo holds info about a "Parent" - something that can be referenced as a ParentRef in the API.
+type ParentInfo struct {
+	ParentGateway          types.NamespacedName
+	ParentGatewayClassName string
+	// ListenerKey is the internal key of the listener resource created for this parent.
+	ListenerKey string
+	// ServiceKey (optionally) links a parent reference to an individual Service.
+	ServiceKey *types.NamespacedName
+	// ServicePorts are the ports on the ServiceKey; a route referencing a port not
+	// in this list is rejected. Distinct from Port, which is for single-port listeners.
+	ServicePorts []gwv1.PortNumber
+	// AllowedKinds indicates which kinds can be admitted by this Parent.
+	AllowedKinds []gwv1.RouteGroupKind
+	// Hostnames that must match to reference the Parent. Format is ns/hostname.
+	Hostnames []string
+	// OriginalHostname is the unprocessed form of Hostnames; how it appeared in users' config.
+	OriginalHostname string
+	// CreationTimestamp is used in determining listener precedence.
+	CreationTimestamp metav1.Time
+
+	SectionName    gwv1.SectionName
+	Port           gwv1.PortNumber
+	Protocol       gwv1.ProtocolType
+	TLSPassthrough bool
+	// Internal marks this listener's bind as internal (routing-only): no OS listener
+	// socket, no Service port, no container port. Sourced from the agentgateway.dev/internal-ports
+	// annotation on the listener's parent Gateway or ListenerSet.
+	Internal bool
+}
+
+func (g ParentInfo) Equals(other ParentInfo) bool {
+	return g.ParentGateway == other.ParentGateway &&
+		g.ParentGatewayClassName == other.ParentGatewayClassName &&
+		g.ListenerKey == other.ListenerKey &&
+		ptr.Equal(g.ServiceKey, other.ServiceKey) &&
+		slices.Equal(g.ServicePorts, other.ServicePorts) &&
+		g.OriginalHostname == other.OriginalHostname &&
+		g.SectionName == other.SectionName &&
+		g.Port == other.Port &&
+		g.Protocol == other.Protocol &&
+		g.TLSPassthrough == other.TLSPassthrough &&
+		g.Internal == other.Internal &&
+		g.CreationTimestamp == other.CreationTimestamp &&
+		slices.EqualFunc(g.AllowedKinds, other.AllowedKinds, func(a, b gwv1.RouteGroupKind) bool {
+			return a.Kind == b.Kind && ptr.Equal(a.Group, b.Group)
+		}) &&
+		slices.Equal(g.Hostnames, other.Hostnames)
+}
+
+// ParentResolver resolves parent references for routes.
+type ParentResolver interface {
+	ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo
+}
+
+func ResourceName[T config.Namer](o T) *api.ResourceName {
+	return &api.ResourceName{
+		Namespace: o.GetNamespace(),
+		Name:      o.GetName(),
+	}
+}
+
+func TypedResourceName[T config.Namer](typ string, o T) *api.TypedResourceName {
+	return &api.TypedResourceName{
+		Kind:      typ,
+		Namespace: o.GetNamespace(),
+		Name:      o.GetName(),
+	}
+}
+
+func TypedResourceFromName(typ string, o types.NamespacedName) *api.TypedResourceName {
+	return &api.TypedResourceName{
+		Kind:      typ,
+		Namespace: o.Namespace,
+		Name:      o.Name,
+	}
+}
+
+func appendPolicyForGateways(policies []AgwPolicy, gatewayTargets []types.NamespacedName, policy *api.Policy) []AgwPolicy {
+	slices.SortFunc(gatewayTargets, func(a, b types.NamespacedName) int {
+		return cmp.Compare(a.String(), b.String())
+	})
+	for _, gatewayTarget := range gatewayTargets {
+		policies = append(policies, AgwPolicy{
+			Gateway: new(gatewayTarget),
+			Policy:  policy,
+		})
+	}
+	return policies
+}

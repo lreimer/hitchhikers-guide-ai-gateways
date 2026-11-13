@@ -1,0 +1,324 @@
+[patch.crates-io]
+schemars = { git = "https://github.com/howardjohn/schemars", rev = "f3e45a59786debf49e67d6bd6d8dcffc004d39ff" }
+http-serde = { git = "https://gitlab.com/howardjohn/http-serde", rev = "c2e482be0ddf029895ba72ef8749b9f94b388fc7" }
+wiremock = { git = "https://github.com/howardjohn/wiremock-rs", rev = "79e5f488d8bc3bce2f7b397b5791b5caef5129e6" }
+async-openai = { git = "https://github.com/howardjohn/async-openai", rev = "fa0cf6c879b0ce30658df604d76d0b42f27b134c" }
+# Pending https://github.com/bldr-project/yaml-serde-edit/pull/1
+yaml-serde-edit = { git = "https://github.com/howardjohn/yaml-serde-edit", rev = "683e137f6760f47bb0db3d124c211433a4819f54" }
+# TODO: remove once https://github.com/goliajp/rust-tiktoken/pull/15 is released
+tiktoken = { git = "https://github.com/howardjohn/rust-tiktoken", rev = "14ea59ef50aed1d2935bbce06d8811427b7b972f" }
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentgateway",
+    "crates/agentgateway-app",
+    "crates/cel-fork/cel",
+    "crates/cel-fork/cel-derive",
+    "crates/celx",
+    "crates/llm",
+    "crates/pool",
+    "crates/core",
+    "crates/http",
+    "crates/policy-core",
+    "crates/policies/cors",
+    "crates/hbone",
+    "crates/htpasswd-verify-fork",
+    "crates/protos",
+    "crates/xds",
+    "crates/xtask",
+]
+default-members = [
+    "crates/agentgateway",
+    "crates/agentgateway-app",
+    "crates/cel-fork/cel",
+    "crates/cel-fork/cel-derive",
+    "crates/celx",
+    "crates/llm",
+    "crates/pool",
+    "crates/core",
+    "crates/http",
+    "crates/policy-core",
+    "crates/policies/cors",
+    "crates/hbone",
+    "crates/htpasswd-verify-fork",
+    "crates/protos",
+    "crates/xds",
+]
+
+[workspace.package]
+version = "0.0.0" # We do not use this version
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+agent-core = { path = "crates/core" }
+agent-celx = { path = "crates/celx" }
+agent-hbone = { path = "crates/hbone" }
+agent-http = { path = "crates/http" }
+agent-llm = { path = "crates/llm" }
+agent-policy = { path = "crates/policy-core" }
+agent-policy-cors = { path = "crates/policies/cors" }
+agent-pool = { path = "crates/pool" }
+agent-xds = { path = "crates/xds" }
+agentgateway = { path = "crates/agentgateway" }
+cel = { path = "crates/cel-fork/cel" }
+protos = { path = "crates/protos" }
+atomic_float = { version = "1.1.0", features = ["serde"] }
+anyhow = "1.0"
+arc-swap = "1.9"
+arcstr = { version = "1.2", features = ["serde"] }
+assert_matches = "1.5.0"
+async-openai = { version = "0.42", default-features = false, features = ["chat-completion-types", "decision-types", "moderation-types", "response-types", "realtime-types"] }
+async-stream = "0.3"
+async-trait = "0.1"
+aws-config = { version = "1.8", default-features = false, features = ["default-https-client", "rt-tokio", "sso"] }
+aws-credential-types = "1.2"
+aws-sigv4 = "1.4"
+aws-types = "1.3"
+aws-smithy-eventstream = "0.61"
+aws-smithy-runtime-api = { version = "1.19", features = ["client", "http-1x"] }
+aws-smithy-types = "1.3"
+aws-lc-rs = "1.18"
+# SymCrypt backend: symcrypt 0.5.1 dynamic-links the system libsymcrypt by default (requires libsymcrypt installed).
+symcrypt = "0.5.1"
+rustls-symcrypt = { version = "0.2.3", features = ["chacha", "x25519"] }
+axum = { version = "0.8", features = ["macros"] }
+axum-core = "0.5"
+axum-extra = { version = "0.12", features = ["json-lines", "typed-header"] }
+multer = "3.0.0"
+# Disable default features to avoid pulling in native-tls and requiring openssl
+# TODO: allow default features if we ever add an openssl feature
+azure_identity = { version = "1.0", default-features = false }
+azure_core = { version = "1.0", default-features = false }
+typespec_client_core = { default-features = false, version = "1.0" }
+base64 = "0.23.0"
+cookie = { version = "0.18", default-features = false }
+bcrypt = "0.19"
+bytes = { version = "1.11", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+clocksource = "1.0"
+crossbeam = "0.8"
+dashmap = "6.2"
+divan = "0.1"
+durationfmt = "0.1"
+go-parse-duration = "0.1"
+flurry = "0.5.2"
+fs-err = { version = "3.3", features = ["tokio"] }
+futures = "0.3"
+futures-channel = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+google-cloud-auth = { version = "1.16", default-features = false, features = [
+    "idtoken",
+    # Support the full ADC set; this one is opt in
+    "gdch",
+    # They use AWS-LC which is what we want so its fine. If they changed we would need to switch
+    # To installing a global default which is annoying so prefer to do it this way.
+    "default-rustls-provider",
+] }
+hashbrown = "0.17"
+h2 = "0.4"
+headers = "0.4"
+hex = "0.4"
+hickory-resolver = { version = "0.26", features = ["serde"] }
+htpasswd-verify-fork = { path = "crates/htpasswd-verify-fork" }
+httpdate = "1.0"
+http = "1.4"
+http-body = "1"
+http-body-util = "0.1.3"
+hyper = { version = "1.9", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+include_dir = "0.7"
+indexmap = { version = "2.13", features = ["serde"] }
+insta = { version = "1.47", features = ["json", "redactions", "filters", "yaml"] }
+ipnet = { version = "2.12", features = ["serde"] }
+itertools = "0.15"
+jsonwebtoken = { version = "11" }
+lazy_static = "1.5"
+libc = "0.2"
+notify = "8.2"
+notify-debouncer-full = "0.7"
+md-5 = "0.11"
+num_cpus = "1.17"
+once_cell = "1.21"
+openapiv3 = "2.2"
+opentelemetry = "0.33"
+opentelemetry-http = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "internal-logs", "trace", "grpc-tonic", "logs"] }
+opentelemetry-proto = { version = "0.33", features = ["gen-tonic", "logs"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "logs"] }
+parking_lot = "0.12"
+pem = "4.0.0"
+percent-encoding = "2.3"
+phonenumber = "0.3"
+pin-project-lite = "0.2"
+pingora-pool = "0.9"
+ppp = "2.3"
+pprof-alloc = "0.6"
+# NOTE: the "frame-pointer" feature is NOT enabled here. pprof 0.15's
+# frame-pointer unwinder only supports x86_64/aarch64/riscv64/loongarch64, and
+# its call site is not arch-gated, so enabling it breaks the build on other
+# arches (e.g. s390x). Consumers add "frame-pointer" per-target where supported.
+pprof = { version = "0.15", features = [
+    "protobuf",
+    "protobuf-codec",
+    "criterion",
+] }
+prometheus-client =  { version = "0.25", features = [
+    "prometheus_protobuf",
+    "protobuf-protox"
+] }
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+prost-wkt-types = { version = "0.7", features = ["vendored-protox"] }
+prost-wkt-build = "0.7"
+pwhash = "1"
+rand = "0.10"
+quick_cache = "0.7.0"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "x509-parser", "aws_lc_rs"] }
+regex = "1.12"
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "charset",
+    "rustls",
+] }
+rstest = "0.28"
+rust_decimal = { version = "1", default-features = false }
+mime_guess = "2.0"
+rustc_version = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["tls12", "std", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.14"
+schemars = { version = "=1.2.1", git = "https://github.com/howardjohn/schemars", rev = "f3e45a59786debf49e67d6bd6d8dcffc004d39ff", features = [
+    "bytes1",
+    "arcstr1",
+    "raw_value",
+    "preserve_order",
+] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+serde-untagged = "0.1"
+serde_regex = "1.1"
+serde_norway = "0.9.42"
+yaml-serde-edit = "0.1.1"
+sha1 = "0.11"
+sha2 = "0.11"
+shellexpand = "3.1"
+socket2 = "0.6"
+spiffe = { version = "0.18", default-features = false, features = ["workload-api", "x509-source", "x509", "transport-grpc", "tracing"] }
+split-iter = "0.1"
+sse-stream = "0.3"
+sqlx = { version = "0.9", default-features = false, features = [
+    "chrono",
+    "json",
+    "macros",
+    "migrate",
+    "postgres",
+    "runtime-tokio",
+    "sqlite",
+    "tls-rustls-aws-lc-rs",
+    "uuid",
+] }
+sqlx-core = { version = "0.9", default-features = false, features = ["rustls-native-certs"] }
+stacker = "0.1"
+subtle = "2"
+tempfile = "3.27"
+thiserror = "2.0"
+tiktoken = { version = "4.1", default-features = false, features = ["vocab-o200k_base"] }
+tokio = { version = "1.53", features = ["full", "macros", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "logging"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio_sse_codec = "0.0.2"
+tonic = { version = "0.14", features = ["codegen", "transport"] }
+tonic-types = "0.14"
+tonic-prost = { version = "0.14" }
+tonic-prost-build = { version = "0.14", features = ["transport"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.7", features = ["cors"] }
+tower-serve-static = "0.1"
+tower-service = "0.3"
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "registry",
+    "json",
+] }
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
+url = "2.5"
+uuid = { version = "1.23", features = ["v4", "v7"] }
+wiremock = { version = "0.6", features = ["tls"] }
+x509-parser = { version = "0.18", default-features = false, features = ["verify-aws"] }
+zstd = "0.14"
+which = "8.0"
+websocket-sans-io = '0.1'
+vector-map = "1.1.0"
+flagset = "0.4.7"
+crossbeam-channel = "0.5"
+http-serde = "2.1"
+itoa = "1.0"
+serde_urlencoded = "0.7"
+serde_with = { version = "3.20", features = [
+    "schemars_1",
+    "macros",
+    "alloc",
+], default-features = false }
+value-bag = { version = "1.12", features = ["serde", "value-bag-serde1"] }
+time = "0.3"
+tikv-jemallocator = { version = "0.7", features = [
+    "profiling",
+    "unprefixed_malloc_on_supported_platforms",
+] }
+jemalloc_pprof = { version = "0.9", features = ["symbolize"] }
+protox = "0.10"
+async-compression = { version = "0.4", features = [
+    "brotli",
+    "zlib",
+    "gzip",
+    "zstd",
+    "tokio",
+] }
+core_affinity = "0.8"
+frozen-collections = { version = "0.9", default-features = false, features = ["std", "serde"] }
+heck = "0.5"
+macro_rules_attribute = "0.2"
+
+[profile.dev.package.cel]
+opt-level = 1
+
+# Unoptimized SQLite makes request-log analytics queries several times slower in dev builds.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 1
+
+# Release optimized but without as many dependencies, suitable for incremental development
+[profile.quick-release-debug]
+inherits = "quick-release"
+debug = true
+
+[profile.quick-release]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true
+
+# Keep CI builds fast and the resulting binary small. CI does not need optimized
+# code or debugging symbols.
+[profile.ci]
+inherits = "dev"
+debug = 0
+strip = "symbols"
+
+[profile.release]
+codegen-units = 1
+lto = true
+
+[profile.bench]
+inherits = "quick-release"
+debug = true

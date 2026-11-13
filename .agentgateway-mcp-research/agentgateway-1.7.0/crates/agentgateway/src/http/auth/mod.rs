@@ -1,0 +1,596 @@
+pub mod aws;
+pub mod azure;
+mod copilot;
+pub mod gcp;
+pub(crate) mod jws;
+pub mod jwt_sign;
+pub mod oauth;
+
+use std::borrow::Cow;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ::http::HeaderValue;
+use anyhow::Context;
+pub use aws::{AwsAssumeRole, AwsAuth};
+pub use azure::AzureAuth;
+use cookie::Cookie;
+pub use gcp::GcpAuth;
+pub use jws::JwtSigningAlg;
+pub(crate) use jws::signing_alg_from_proto;
+pub use jwt_sign::JwtSignAuth;
+pub use oauth::{
+	CrossAppAccessAuth, OAuthClientAuth, OAuthClientAuthMethod, OAuthGrantType,
+	OAuthTokenExchangeAuth, PrivateKeyJwt,
+};
+use secrecy::{ExposeSecret, SecretString};
+
+use crate::http::Request;
+use crate::http::jwt::Claims;
+use crate::proxy::ProxyError;
+use crate::proxy::ProxyError::ProcessingString;
+use crate::types::agent::{BackendTarget, Target};
+use crate::*;
+
+const CLOUD_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JwtClaimTimes {
+	issued_at: u64,
+	expires_at: u64,
+}
+
+fn unix_timestamp_now() -> anyhow::Result<u64> {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.context("system clock is before the unix epoch")
+		.map(|duration| duration.as_secs())
+}
+
+fn jwt_claim_times(
+	now: u64,
+	lifetime: Duration,
+	issued_at_backdate: Duration,
+) -> anyhow::Result<JwtClaimTimes> {
+	let issued_at = now.saturating_sub(issued_at_backdate.as_secs());
+	let expires_at = now
+		.checked_add(numeric_date_seconds(lifetime))
+		.context("JWT lifetime overflows the exp timestamp")?;
+
+	Ok(JwtClaimTimes {
+		issued_at,
+		expires_at,
+	})
+}
+
+fn numeric_date_seconds(duration: Duration) -> u64 {
+	duration
+		.as_secs()
+		.saturating_add(u64::from(duration.subsec_nanos() > 0))
+}
+
+#[apply(schema_ser!)]
+pub enum BackendAuthKind {
+	/// Forward the validated incoming JWT to the backend.
+	Passthrough {
+		/// Where to place the forwarded credential in the backend request.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		location: Option<AuthorizationLocation>,
+	},
+	/// Send a configured secret value, or a value computed from the request, to the backend.
+	Key {
+		/// Value to send to the backend.
+		value: BackendAuthValue,
+		/// Where to place the secret in the backend request.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		location: Option<AuthorizationLocation>,
+	},
+	/// Authenticate to Google Cloud services.
+	#[serde(rename = "gcp")]
+	Gcp(gcp::GcpAuth),
+	/// Sign backend requests with AWS credentials.
+	#[serde(rename = "aws")]
+	Aws(aws::AwsAuth),
+	/// Authenticate to Azure services.
+	#[serde(rename = "azure")]
+	Azure(azure::AzureAuth),
+	/// Authenticate to GitHub Copilot.
+	#[serde(rename = "copilot")]
+	Copilot,
+	/// Sign a short-lived JWT with a private key on each request.
+	#[serde(rename = "jwtSign")]
+	JwtSign(Box<jwt_sign::JwtSignAuth>),
+	/// Use OAuth token exchange flows to obtain a backend access token.
+	#[serde(rename = "oauthTokenExchange")]
+	OAuthTokenExchange(Box<OAuthTokenExchangeAuth>),
+	/// Use Cross App Access (Identity Assertion / ID-JAG) to obtain a backend access token.
+	#[serde(rename = "crossAppAccess")]
+	CrossAppAccess(Box<CrossAppAccessAuth>),
+	/// Configuration that could not be loaded. Requests using it are rejected.
+	Invalid {
+		/// The configured auth kind, such as `oauthTokenExchange`.
+		kind: &'static str,
+		#[serde(rename = "translationError")]
+		reason: String,
+	},
+}
+
+/// Backend authentication configuration.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct BackendAuth {
+	#[serde(flatten, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<BackendAuthKind>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub credentials: Vec<BackendAuthCredential>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackendAuthError {
+	#[error(transparent)]
+	Local(anyhow::Error),
+	#[error(transparent)]
+	CredentialProvider(anyhow::Error),
+}
+
+impl BackendAuthError {
+	fn local(error: impl Into<anyhow::Error>) -> Self {
+		Self::Local(error.into())
+	}
+
+	fn credential_provider(error: impl Into<anyhow::Error>) -> Self {
+		Self::CredentialProvider(error.into())
+	}
+}
+
+impl BackendAuth {
+	pub fn new(kind: BackendAuthKind) -> Self {
+		Self {
+			kind: Some(kind),
+			credentials: Vec::new(),
+		}
+	}
+
+	/// CEL expressions this auth config evaluates per request, for registration
+	/// with the CEL context builder.
+	pub fn cel_expressions(&self) -> impl Iterator<Item = &crate::cel::Expression> {
+		let kind = match self.kind.as_ref() {
+			Some(BackendAuthKind::Key { value, .. }) => value.expression(),
+			_ => None,
+		};
+		let aws = match self.kind.as_ref() {
+			Some(BackendAuthKind::Aws(aws)) => Some(aws.cel_expressions()),
+			_ => None,
+		};
+		kind
+			.into_iter()
+			.chain(aws.into_iter().flatten())
+			.chain(self.credentials.iter().filter_map(|c| c.key.expression()))
+	}
+}
+
+/// An additional credential to inject on the backend request.
+#[apply(schema_ser!)]
+pub struct BackendAuthCredential {
+	/// Where the credential is inserted on the backend request.
+	pub location: AuthorizationLocation,
+	/// Credential value.
+	pub key: BackendAuthValue,
+}
+
+/// A credential value inserted on the backend request.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum BackendAuthValue {
+	Static(#[serde(serialize_with = "ser_redact")] SecretString),
+	Expression {
+		expression: Arc<crate::cel::Expression>,
+	},
+}
+
+impl From<SecretString> for BackendAuthValue {
+	fn from(value: SecretString) -> Self {
+		Self::Static(value)
+	}
+}
+
+impl BackendAuthValue {
+	/// Resolves the value for this request. An expression that fails or does not
+	/// produce a string yields no value, and the target location is cleared instead.
+	fn resolve(&self, req: &Request) -> Option<Cow<'_, str>> {
+		match self {
+			BackendAuthValue::Static(value) => Some(Cow::Borrowed(value.expose_secret())),
+			BackendAuthValue::Expression { expression } => {
+				let value = crate::cel::Executor::new_request(req)
+					.eval(expression)
+					.ok()
+					.and_then(|v| v.as_str().ok().map(Cow::into_owned));
+				if value.is_none() {
+					debug!(
+						"backend auth expression {:?} produced no string value",
+						expression.original_expression
+					);
+				}
+				value.map(Cow::Owned)
+			},
+		}
+	}
+
+	fn expression(&self) -> Option<&crate::cel::Expression> {
+		match self {
+			BackendAuthValue::Static(_) => None,
+			BackendAuthValue::Expression { expression } => Some(expression),
+		}
+	}
+}
+
+/// Records whether the backend auth location was explicitly configured by the user
+/// (vs. defaulted).
+///
+/// Downstream providers (e.g. Anthropic) inspect this to decide whether to rewrite
+/// auth headers.
+#[derive(Clone, Debug)]
+pub struct AppliedBackendAuthLocation {
+	pub explicit: bool,
+}
+
+#[derive(Clone)]
+pub struct BackendInfo {
+	pub target: BackendTarget,
+	pub call_target: Target,
+	pub inputs: Arc<ProxyInputs>,
+}
+
+pub fn apply_tunnel_auth(auth: &BackendAuth) -> Result<HeaderValue, ProxyError> {
+	if !auth.credentials.is_empty() {
+		return Err(ProcessingString(
+			"backendAuth.credentials is not supported on tunnel-bound backends".to_string(),
+		));
+	}
+	match auth.kind.as_ref() {
+		Some(BackendAuthKind::Key {
+			value: BackendAuthValue::Static(key),
+			location,
+		}) => {
+			let resolved = location.as_ref().unwrap_or(&DEFAULT_AUTHORIZATION_LOCATION);
+			match resolved {
+				AuthorizationLocation::Header { name: _, prefix } => {
+					let value = key.expose_secret();
+					let value = match prefix {
+						Some(prefix) => Cow::Owned(format!("{prefix}{value}")),
+						None => Cow::Borrowed(value),
+					};
+					let mut header_value =
+						HeaderValue::from_str(&value).map_err(|e| ProxyError::Processing(e.into()))?;
+					header_value.set_sensitive(true);
+					Ok(header_value)
+				},
+				_ => Err(ProcessingString(
+					"only header auth is supported in tunnel".to_string(),
+				)),
+			}
+		},
+		Some(BackendAuthKind::Key {
+			value: BackendAuthValue::Expression { .. },
+			..
+		}) => Err(ProcessingString(
+			"key expression is not supported on tunnel-bound backends".to_string(),
+		)),
+		_ => Err(ProcessingString(
+			"only key auth is supported in tunnel".to_string(),
+		)),
+	}
+}
+pub async fn apply_backend_auth(
+	backend_info: &BackendInfo,
+	auth: &BackendAuth,
+	req: &mut Request,
+) -> Result<(), ProxyError> {
+	if let Some(kind) = auth.kind.as_ref() {
+		apply_backend_auth_kind(backend_info, kind, req).await?;
+	}
+	for credential in &auth.credentials {
+		let Some(value) = credential.key.resolve(req) else {
+			credential.location.remove(req)?;
+			continue;
+		};
+		insert_local_auth(&credential.location, req, &value)?;
+		// Credential locations are always explicitly configured. Mark Authorization writes
+		// so providers (e.g. Anthropic) do not rewrite or relocate the header. Other
+		// locations must not touch the marker set by the primary auth kind.
+		if matches!(&credential.location, AuthorizationLocation::Header { name, .. } if *name == http::header::AUTHORIZATION)
+		{
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit: true });
+		}
+	}
+	Ok(())
+}
+
+fn insert_local_auth(
+	location: &AuthorizationLocation,
+	req: &mut Request,
+	value: &str,
+) -> Result<(), BackendAuthError> {
+	location.insert(req, value).map_err(BackendAuthError::local)
+}
+
+async fn apply_backend_auth_kind(
+	backend_info: &BackendInfo,
+	auth: &BackendAuthKind,
+	req: &mut Request,
+) -> Result<(), ProxyError> {
+	match auth {
+		BackendAuthKind::Passthrough { location } => {
+			let explicit = location.is_some();
+			let resolved = location.as_ref().unwrap_or(&DEFAULT_AUTHORIZATION_LOCATION);
+			// They should have a JWT policy defined. That will strip the token. Here we add it back
+			// TODO: should we also support API key, etc?
+			if let Some(token) = req
+				.extensions()
+				.get::<Claims>()
+				.map(|claim| claim.jwt.expose_secret().to_string())
+			{
+				insert_local_auth(resolved, req, &token)?;
+			}
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit });
+		},
+		BackendAuthKind::Key { value, location } => {
+			let explicit = location.is_some();
+			let resolved = location.as_ref().unwrap_or(&DEFAULT_AUTHORIZATION_LOCATION);
+			match value.resolve(req) {
+				Some(value) => insert_local_auth(resolved, req, &value)?,
+				None => resolved.remove(req)?,
+			}
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit });
+		},
+		BackendAuthKind::Gcp(g) => {
+			gcp::insert_token(g, &backend_info.call_target, req.headers_mut()).await?;
+		},
+		BackendAuthKind::Aws(_) => {
+			// We handle this in 'apply_late_backend_auth' since it must come at the end (due to request signing)!
+		},
+		BackendAuthKind::Azure(azure_auth) => {
+			let token = azure::get_token(
+				&backend_info.inputs.upstream,
+				azure_auth,
+				&backend_info.call_target,
+			)
+			.await?;
+			req.headers_mut().insert(http::header::AUTHORIZATION, token);
+		},
+		BackendAuthKind::Copilot => {
+			copilot::insert_headers(req)
+				.await
+				.map_err(BackendAuthError::local)?;
+		},
+		BackendAuthKind::JwtSign(cfg) => {
+			let token = cfg.sign().map_err(BackendAuthError::local)?;
+			let explicit = cfg.location().is_some();
+			let resolved = cfg.location().unwrap_or(&DEFAULT_AUTHORIZATION_LOCATION);
+			insert_local_auth(resolved, req, &token)?;
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit });
+		},
+		BackendAuthKind::OAuthTokenExchange(te_auth) => {
+			let explicit = oauth::apply_token_exchange(&backend_info.inputs, te_auth, req).await?;
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit });
+		},
+		BackendAuthKind::CrossAppAccess(auth) => {
+			let explicit = oauth::apply_identity_assertion(&backend_info.inputs, auth, req).await?;
+			req
+				.extensions_mut()
+				.insert(AppliedBackendAuthLocation { explicit });
+		},
+		BackendAuthKind::Invalid { kind, .. } => {
+			return Err(
+				BackendAuthError::local(anyhow::anyhow!("{kind} configuration is invalid")).into(),
+			);
+		},
+	}
+	Ok(())
+}
+
+pub async fn apply_late_backend_auth(
+	client: &crate::client::Client,
+	auth: Option<&BackendAuth>,
+	req: &mut Request,
+) -> Result<(), ProxyError> {
+	let Some(BackendAuth {
+		kind: Some(BackendAuthKind::Aws(aws_auth)),
+		..
+	}) = auth
+	else {
+		return Ok(());
+	};
+
+	aws::sign_request(client, req, aws_auth)
+		.await
+		.map_err(ProxyError::BackendAuthenticationFailed)
+}
+
+#[apply(schema!)]
+pub enum AuthorizationLocation {
+	/// Read the credential from an HTTP header.
+	Header {
+		/// Header name containing the credential.
+		#[serde(with = "http_serde::header_name")]
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		name: http::HeaderName,
+		/// Prefix to remove from the header value before validation, such as `Bearer ` or `Basic `.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		prefix: Option<Strng>,
+	},
+	/// Read the credential from a URL query parameter.
+	QueryParameter {
+		/// Query parameter name containing the credential.
+		name: Strng,
+	},
+	/// Read the credential from a request cookie.
+	Cookie {
+		/// Cookie name containing the credential.
+		name: Strng,
+	},
+	/// Read the credential from a CEL expression evaluated against the incoming request.
+	/// CEL expression that returns the credential string. This location can extract credentials but cannot insert them.
+	Expression(Arc<crate::cel::Expression>),
+}
+
+impl Default for AuthorizationLocation {
+	fn default() -> Self {
+		Self::bearer_header()
+	}
+}
+
+pub static DEFAULT_AUTHORIZATION_LOCATION: AuthorizationLocation =
+	AuthorizationLocation::bearer_header();
+
+impl AuthorizationLocation {
+	pub const fn bearer_header() -> Self {
+		Self::Header {
+			name: http::header::AUTHORIZATION,
+			prefix: Some(strng::literal!("Bearer ")),
+		}
+	}
+
+	pub fn basic_header() -> Self {
+		Self::Header {
+			name: http::header::AUTHORIZATION,
+			prefix: Some(strng::literal!("Basic ")),
+		}
+	}
+
+	/// Returns true if credentials are read from the `Proxy-Authorization` header.
+	///
+	/// Per RFC 9110, credentials sent in `Proxy-Authorization` are addressed to the proxy itself,
+	/// so failures must be challenged with `407` + `Proxy-Authenticate` rather than
+	/// `401` + `WWW-Authenticate`.
+	pub fn is_proxy_header(&self) -> bool {
+		matches!(self, AuthorizationLocation::Header { name, .. } if name == http::header::PROXY_AUTHORIZATION)
+	}
+
+	pub fn extract<'a>(&self, req: &'a Request) -> Option<Cow<'a, str>> {
+		match self {
+			AuthorizationLocation::Header { name, prefix } => {
+				let value = req.headers().get(name)?.to_str().ok()?;
+				match prefix.as_deref() {
+					Some(prefix) => strip_prefix_ascii_case_insensitive(value, prefix).map(Cow::Borrowed),
+					None => Some(Cow::Borrowed(value)),
+				}
+			},
+			AuthorizationLocation::QueryParameter { name } => {
+				crate::http::query_parameter(req.uri(), name)
+			},
+			AuthorizationLocation::Cookie { name } => crate::http::read_request_cookie(req, name),
+			AuthorizationLocation::Expression(expression) => crate::cel::Executor::new_request(req)
+				.eval(expression)
+				.ok()
+				.and_then(|v| v.as_str().ok().map(Cow::into_owned))
+				.map(Cow::Owned),
+		}
+	}
+
+	pub fn remove(&self, req: &mut Request) -> Result<(), ProxyError> {
+		match self {
+			AuthorizationLocation::Header { name, .. } => {
+				req.headers_mut().remove(name);
+			},
+			AuthorizationLocation::QueryParameter { name } => {
+				crate::http::modify_query_parameters(
+					req.uri_mut(),
+					std::iter::empty::<(&str, &str)>(),
+					[name.as_str()],
+				)
+				.map_err(ProxyError::Processing)?;
+			},
+			AuthorizationLocation::Cookie { name } => {
+				set_request_cookie(req, name, None)?;
+			},
+			AuthorizationLocation::Expression(_) => {},
+		}
+		Ok(())
+	}
+
+	pub fn insert(&self, req: &mut Request, value: &str) -> Result<(), ProxyError> {
+		match self {
+			AuthorizationLocation::Header { name, prefix } => {
+				let value = match prefix {
+					Some(prefix) => Cow::Owned(format!("{prefix}{value}")),
+					None => Cow::Borrowed(value),
+				};
+				let mut header_value =
+					HeaderValue::from_str(&value).map_err(|e| ProxyError::Processing(e.into()))?;
+				header_value.set_sensitive(true);
+				req.headers_mut().insert(name, header_value);
+			},
+			AuthorizationLocation::QueryParameter { name } => {
+				crate::http::modify_query_parameters(
+					req.uri_mut(),
+					[(name.as_str(), value)],
+					std::iter::empty::<&str>(),
+				)
+				.map_err(ProxyError::Processing)?;
+			},
+			AuthorizationLocation::Cookie { name } => {
+				set_request_cookie(req, name, Some(value))?;
+			},
+			AuthorizationLocation::Expression(_) => {
+				return Err(ProcessingString(
+					"expression auth location is only supported for credential extraction".to_string(),
+				));
+			},
+		}
+		Ok(())
+	}
+
+	pub fn expression(&self) -> Option<&crate::cel::Expression> {
+		match self {
+			AuthorizationLocation::Expression(expression) => Some(expression),
+			_ => None,
+		}
+	}
+}
+
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+	if value.len() < prefix.len() {
+		return None;
+	}
+	let (candidate, remainder) = value.split_at(prefix.len());
+	if candidate.eq_ignore_ascii_case(prefix) {
+		Some(remainder)
+	} else {
+		None
+	}
+}
+
+fn set_request_cookie(
+	req: &mut Request,
+	name: &str,
+	value: Option<&str>,
+) -> Result<(), ProxyError> {
+	let mut preserved: Vec<String> = crate::http::iter_request_cookies(req)
+		.filter(|cookie| cookie.name() != name)
+		.map(|cookie| cookie.to_string())
+		.collect();
+	if let Some(value) = value {
+		preserved.push(Cookie::new(name.to_string(), value.to_string()).to_string());
+	}
+	req.headers_mut().remove(http::header::COOKIE);
+	if !preserved.is_empty() {
+		let mut header_value =
+			HeaderValue::from_str(&preserved.join("; ")).map_err(|e| ProxyError::Processing(e.into()))?;
+		header_value.set_sensitive(true);
+		req.headers_mut().insert(http::header::COOKIE, header_value);
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

@@ -1,0 +1,1489 @@
+use std::time::Instant;
+
+use agent_core::strng;
+use agent_http::Body;
+use bytes::Bytes;
+use http::Response;
+use itertools::Itertools;
+use tracing::debug;
+
+use crate::{StreamingUsageGuard, logged_response_parsing, parse, types};
+
+#[cfg(test)]
+#[path = "completions_tests.rs"]
+mod tests;
+
+/// Parse a Google error response, handling both single object and array-wrapped formats.
+/// Google's OpenAI-compatible endpoints consistently return `[{"error": {...}}]`
+/// rather than `{"error": {...}}` when using the Vertex AI shim.
+pub(crate) fn parse_google_error(
+	bytes: &Bytes,
+) -> Result<types::completions::typed::GoogleErrorResponse, crate::AIError> {
+	serde_json::from_slice::<types::completions::typed::GoogleErrorResponse>(bytes).or_else(|_| {
+		serde_json::from_slice::<Vec<types::completions::typed::GoogleErrorResponse>>(bytes)
+			.map_err(logged_response_parsing(bytes))?
+			.into_iter()
+			.next()
+			.ok_or_else(|| {
+				crate::AIError::InvalidResponse(agent_core::strng::literal!(
+					"error response missing error details"
+				))
+			})
+	})
+}
+
+pub(crate) fn google_error_type(error: &types::completions::typed::GoogleError) -> &'static str {
+	match error.status.as_deref() {
+		Some("INVALID_ARGUMENT") | Some("FAILED_PRECONDITION") => "invalid_request_error",
+		Some("NOT_FOUND") => "not_found_error",
+		Some("PERMISSION_DENIED") | Some("UNAUTHENTICATED") => "authentication_error",
+		Some("RESOURCE_EXHAUSTED") => "rate_limit_error",
+		_ => "api_error",
+	}
+}
+
+pub(crate) fn parse_chat_completion_error(
+	bytes: &Bytes,
+) -> Result<types::completions::typed::ChatCompletionErrorResponse, crate::AIError> {
+	serde_json::from_slice::<types::completions::typed::ChatCompletionErrorResponse>(bytes)
+		.map_err(logged_response_parsing(bytes))
+}
+
+/// Translate a Google error response into an OpenAI Chat Completions error response.
+pub fn translate_google_error(bytes: &Bytes) -> Result<Bytes, crate::AIError> {
+	let res = parse_google_error(bytes)?;
+	let m = types::completions::typed::ChatCompletionErrorResponse {
+		event_id: None,
+		error: types::completions::typed::ChatCompletionError {
+			r#type: Some(google_error_type(&res.error).to_string()),
+			message: res.error.message.clone(),
+			param: None,
+			code: res.error.status.clone().map(serde_json::Value::String),
+			event_id: None,
+		},
+	};
+	Ok(Bytes::from(
+		serde_json::to_vec(&m).map_err(crate::AIError::ResponseMarshal)?,
+	))
+}
+
+pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+	let raw = url.strip_prefix("data:")?;
+	let (meta, data) = raw.split_once(',')?;
+	// RFC 2397 allows media-type parameters before the encoding marker:
+	// data:<mediatype>[;param=value]*;base64,<data>
+	let idx = meta.len().checked_sub(";base64".len())?;
+	if !meta.get(idx..)?.eq_ignore_ascii_case(";base64") {
+		return None;
+	}
+	// Parameters such as charset are not part of the media type.
+	let media_type = meta.get(..idx)?.split(';').next().unwrap_or_default();
+	Some((media_type, data))
+}
+
+pub mod from_messages {
+	use std::collections::{HashMap, HashSet};
+	use std::time::Instant;
+
+	use agent_core::strng;
+	use agent_http::Body;
+	use bytes::Bytes;
+	use itertools::Itertools;
+	use messages::{ToolResultContent, ToolResultContentPart};
+	use serde_json::Value;
+	use types::completions::typed as completions;
+	use types::messages::typed as messages;
+
+	use crate::conversion::GeminiThoughtSignature;
+	use crate::parse::sse::SseJsonEvent;
+	use crate::types::ResponseType;
+	use crate::{AIError, StreamingUsageGuard, json, logged_response_parsing, types};
+
+	/// translate an Anthropic messages to an OpenAI completions request
+	pub fn translate(req: &types::messages::Request) -> Result<Vec<u8>, AIError> {
+		let xlated = translate_request(req)?;
+		serde_json::to_vec(&xlated).map_err(AIError::RequestMarshal)
+	}
+
+	pub fn translate_request(
+		req: &types::messages::Request,
+	) -> Result<types::completions::typed::Request, AIError> {
+		let typed = json::convert::<_, messages::Request>(req)
+			.map_err(|err| AIError::RequestParsing(crate::InputFormat::Messages, err))?;
+		Ok(translate_internal(typed))
+	}
+
+	pub fn translate_response(bytes: &Bytes) -> Result<Box<dyn ResponseType>, AIError> {
+		let resp = serde_json::from_slice::<completions::Response>(bytes)
+			.map_err(logged_response_parsing(bytes))?;
+		let provider_usage = resp.usage.as_ref().map(|u| super::super::ProviderUsage {
+			input_tokens: u.prompt_tokens as u64,
+			total_tokens: u.total_tokens as u64,
+			reasoning_tokens: u
+				.completion_tokens_details
+				.as_ref()
+				.and_then(|d| d.reasoning_tokens),
+			..Default::default()
+		});
+		let anthropic = translate_response_internal(resp)?;
+		Ok(Box::new(super::super::ResponseWithProviderUsage {
+			response: anthropic,
+			provider_usage,
+		}))
+	}
+
+	/// First string among the candidate extension values, in precedence order.
+	/// Integers (stop token ids) and empty strings are not stop sequences.
+	pub(crate) fn stop_sequence_from_fields<'a>(
+		candidates: impl IntoIterator<Item = Option<&'a Value>>,
+	) -> Option<String> {
+		candidates
+			.into_iter()
+			.flatten()
+			.filter_map(|v| v.as_str())
+			.find(|s| !s.is_empty())
+			.map(str::to_owned)
+	}
+
+	/// The stop sequence an engine reports on a buffered or streamed choice, if
+	/// any: vLLM uses `stop_reason`; SGLang uses `matched_stop`.
+	pub(crate) fn choice_stop_sequence(rest: &Value) -> Option<String> {
+		stop_sequence_from_fields([rest.get("stop_reason"), rest.get("matched_stop")])
+	}
+
+	pub(crate) fn translate_response_internal(
+		resp: completions::Response,
+	) -> Result<messages::MessagesResponse, AIError> {
+		let completions::Response {
+			id,
+			choices,
+			model,
+			usage,
+			service_tier,
+			..
+		} = resp;
+		// Anthropic only supports one choice
+		let choice = choices
+			.into_iter()
+			.next()
+			.ok_or_else(|| AIError::InvalidResponse(strng::literal!("chat response missing choices")))?;
+
+		let mut content: Vec<messages::ContentBlock> = Vec::new();
+		// Engines report reasoning beside the text; the Messages contract puts it first. A turn whose
+		// reasoning text is withheld carries the signature alone, so the signature is enough to send
+		// the block: it is what the next turn has to replay.
+		let thinking = choice.message.reasoning().unwrap_or_default().to_string();
+		let signature = choice.message.reasoning_signature.unwrap_or_default();
+		if !thinking.is_empty() || !signature.is_empty() {
+			content.push(messages::ContentBlock::Thinking {
+				thinking,
+				signature,
+			});
+		}
+		if let Some(text) = choice.message.content {
+			content.push(messages::ContentBlock::text(text));
+		}
+		content.extend(
+			choice
+				.message
+				.tool_calls
+				.into_iter()
+				.flatten()
+				.filter_map(|tc| match tc {
+					completions::MessageToolCalls::Function(call) => Some(call),
+					completions::MessageToolCalls::Custom(_) => None,
+				})
+				.flat_map(tool_call_blocks),
+		);
+
+		let (mut stop_reason, may_have_stop_sequence) = match choice.finish_reason {
+			Some(completions::FinishReason::Stop) => (messages::StopReason::EndTurn, true),
+			Some(completions::FinishReason::Length) => (messages::StopReason::MaxTokens, false),
+			Some(completions::FinishReason::ToolCalls) => (messages::StopReason::ToolUse, false),
+			Some(completions::FinishReason::ContentFilter) => (messages::StopReason::Refusal, false),
+			Some(completions::FinishReason::FunctionCall) => (messages::StopReason::ToolUse, false),
+			None => (messages::StopReason::EndTurn, false),
+		};
+		// When the engine names the stop sequence that ended generation, the
+		// Messages contract is `stop_reason: "stop_sequence"` plus the matched
+		// string — not `end_turn`, which clients read as "the model finished".
+		let stop_sequence = may_have_stop_sequence
+			.then(|| choice_stop_sequence(&choice.rest))
+			.flatten();
+		if stop_sequence.is_some() {
+			stop_reason = messages::StopReason::StopSequence;
+		}
+
+		let cache_creation_input_tokens = usage.as_ref().and_then(|u| {
+			u.prompt_tokens_details
+				.as_ref()
+				.and_then(|d| d.cache_write_tokens)
+				.or(u.cache_creation_input_tokens)
+				.map(|tokens| tokens as usize)
+		});
+		let cache_read_input_tokens = usage.as_ref().and_then(|u| {
+			u.prompt_tokens_details
+				.as_ref()
+				.and_then(|d| d.cached_tokens)
+				.or(u.cache_read_input_tokens)
+				.map(|tokens| tokens as usize)
+		});
+		Ok(messages::MessagesResponse {
+			content,
+			stop_reason: Some(stop_reason),
+			stop_sequence,
+			usage: messages::Usage {
+				input_tokens: usage
+					.as_ref()
+					.map(|u| u.prompt_tokens as usize)
+					.unwrap_or(0)
+					.saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+					.saturating_sub(cache_read_input_tokens.unwrap_or(0)),
+				output_tokens: usage
+					.as_ref()
+					.map(|u| u.output_tokens() as usize)
+					.unwrap_or(0),
+				cache_creation_input_tokens,
+				cache_read_input_tokens,
+				service_tier,
+				..Default::default()
+			},
+			input_audio_tokens: usage.as_ref().and_then(|u| {
+				u.prompt_tokens_details
+					.as_ref()
+					.and_then(|d| d.audio_tokens)
+					.map(|t| t as usize)
+			}),
+			output_audio_tokens: usage.as_ref().and_then(|u| {
+				u.completion_tokens_details
+					.as_ref()
+					.and_then(|d| d.audio_tokens)
+					.map(|t| t as usize)
+			}),
+			..messages::MessagesResponse::start(id, model)
+		})
+	}
+
+	/// A Gemini thought signature rides in a `Thinking` block placed before the tool call it belongs to.
+	fn tool_call_blocks(
+		call: completions::MessageToolCall,
+	) -> impl Iterator<Item = messages::ContentBlock> {
+		let thinking = call
+			.thought_signature()
+			.map(|signature| messages::ContentBlock::Thinking {
+				thinking: String::new(),
+				signature: GeminiThoughtSignature::encode(&call.id, signature),
+			});
+		let tool_use = messages::ContentBlock::ToolUse {
+			input: crate::conversion::tool_arguments_to_input(&call.function.arguments),
+			id: call.id,
+			name: call.function.name,
+			cache_control: None,
+		};
+		thinking.into_iter().chain(std::iter::once(tool_use))
+	}
+
+	pub fn translate_stream(
+		b: Body,
+		buffer_limit: usize,
+		log: StreamingUsageGuard,
+		log_content: crate::LogContentFields,
+	) -> Body {
+		#[derive(Debug)]
+		struct PendingToolCall {
+			id: Option<String>,
+			name: Option<String>,
+			pending_json: String,
+			arguments: String,
+		}
+
+		#[derive(Debug, Default)]
+		struct StreamState {
+			sent_message_start: bool,
+			sent_message_stop: bool,
+			sent_first_token: bool,
+			last_token_at: Option<Instant>,
+			next_block_index: usize,
+			text_block_index: Option<usize>,
+			thinking_block_index: Option<usize>,
+			thinking_signature: Option<String>,
+			tool_block_indices: HashMap<u32, usize>,
+			open_tool_blocks: HashSet<u32>,
+			pending_tool_calls: HashMap<u32, PendingToolCall>,
+			pending_stop_reason: Option<messages::StopReason>,
+			pending_stop_sequence: Option<String>,
+			pending_usage: Option<completions::Usage>,
+		}
+
+		fn push_event(
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+			event: messages::MessagesStreamEvent,
+		) {
+			let name = event.event_name();
+			events.push((name, event));
+		}
+
+		fn close_text_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) {
+			if let Some(index) = state.text_block_index.take() {
+				push_event(
+					events,
+					messages::MessagesStreamEvent::ContentBlockStop { index },
+				);
+			}
+		}
+
+		fn close_thinking_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) {
+			if let Some(index) = state.thinking_block_index.take() {
+				if let Some(signature) = state.thinking_signature.take() {
+					push_event(
+						events,
+						messages::MessagesStreamEvent::ContentBlockDelta {
+							index,
+							delta: messages::ContentBlockDelta::SignatureDelta { signature },
+						},
+					);
+				}
+				push_event(
+					events,
+					messages::MessagesStreamEvent::ContentBlockStop { index },
+				);
+			}
+		}
+
+		fn open_thinking_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) -> usize {
+			if let Some(index) = state.thinking_block_index {
+				return index;
+			}
+			close_text_block(state, events);
+			close_all_tool_blocks(state, events);
+			let index = state.next_block_index;
+			state.next_block_index += 1;
+			state.thinking_block_index = Some(index);
+			push_event(
+				events,
+				messages::MessagesStreamEvent::ContentBlockStart {
+					index,
+					content_block: messages::ContentBlock::Thinking {
+						thinking: String::new(),
+						signature: String::new(),
+					},
+				},
+			);
+			index
+		}
+
+		fn close_all_tool_blocks(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) {
+			let mut blocks: Vec<(u32, usize)> = state
+				.open_tool_blocks
+				.iter()
+				.filter_map(|tool_index| {
+					state
+						.tool_block_indices
+						.get(tool_index)
+						.map(|index| (*tool_index, *index))
+				})
+				.collect();
+			blocks.sort_by_key(|(_, index)| *index);
+			for (tool_index, index) in blocks {
+				push_event(
+					events,
+					messages::MessagesStreamEvent::ContentBlockStop { index },
+				);
+				state.open_tool_blocks.remove(&tool_index);
+			}
+		}
+
+		fn open_text_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+		) -> usize {
+			if let Some(index) = state.text_block_index {
+				return index;
+			}
+			close_all_tool_blocks(state, events);
+			close_thinking_block(state, events);
+			let index = state.next_block_index;
+			state.next_block_index += 1;
+			state.text_block_index = Some(index);
+			push_event(
+				events,
+				messages::MessagesStreamEvent::ContentBlockStart {
+					index,
+					content_block: messages::ContentBlock::text("".to_string()),
+				},
+			);
+			index
+		}
+
+		fn open_tool_block(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+			tool_index: u32,
+			id: String,
+			name: String,
+		) -> usize {
+			close_text_block(state, events);
+			close_thinking_block(state, events);
+			let index = *state
+				.tool_block_indices
+				.entry(tool_index)
+				.or_insert_with(|| {
+					let idx = state.next_block_index;
+					state.next_block_index += 1;
+					idx
+				});
+
+			// Keep each tool-use block open across interleaved deltas to avoid
+			// emitting duplicate start events for the same block index.
+			if state.open_tool_blocks.insert(tool_index) {
+				push_event(
+					events,
+					messages::MessagesStreamEvent::ContentBlockStart {
+						index,
+						content_block: messages::ContentBlock::ToolUse {
+							id,
+							name,
+							input: Value::Object(serde_json::Map::new()),
+							cache_control: None,
+						},
+					},
+				);
+			}
+			index
+		}
+
+		fn maybe_set_first_token(state: &mut StreamState, log: &StreamingUsageGuard) {
+			let now = Instant::now();
+			if !state.sent_first_token {
+				state.sent_first_token = true;
+				state.last_token_at = Some(now);
+				log.update(|r| {
+					r.response.first_token = Some(now);
+				});
+				return;
+			}
+			if let Some(prev) = state.last_token_at.replace(now) {
+				let gap = now.duration_since(prev);
+				log.update(|r| r.response.inter_chunk_latencies.record(gap));
+			}
+		}
+
+		fn flush_message_end(
+			state: &mut StreamState,
+			events: &mut Vec<(&'static str, messages::MessagesStreamEvent)>,
+			log: &StreamingUsageGuard,
+			force: bool,
+			log_tool_calls: bool,
+		) {
+			if state.sent_message_stop {
+				return;
+			}
+			let stop_reason = match state.pending_stop_reason.take() {
+				Some(stop_reason) => stop_reason,
+				None if force => messages::StopReason::EndTurn,
+				None => return,
+			};
+			let usage = match state.pending_usage.take() {
+				Some(usage) => Some(usage),
+				None if force => None,
+				None => {
+					state.pending_stop_reason = Some(stop_reason);
+					return;
+				},
+			};
+			let finish_reason = crate::types::serialize_str(&stop_reason);
+
+			close_thinking_block(state, events);
+			close_text_block(state, events);
+			close_all_tool_blocks(state, events);
+
+			let cache_creation_input_tokens = usage.as_ref().and_then(|u| {
+				u.prompt_tokens_details
+					.as_ref()
+					.and_then(|d| d.cache_write_tokens)
+					.or(u.cache_creation_input_tokens)
+					.map(|tokens| tokens as usize)
+			});
+			let cache_read_input_tokens = usage.as_ref().and_then(|u| {
+				u.prompt_tokens_details
+					.as_ref()
+					.and_then(|d| d.cached_tokens)
+					.or(u.cache_read_input_tokens)
+					.map(|tokens| tokens as usize)
+			});
+			let (input_tokens, output_tokens) = usage
+				.as_ref()
+				.map(|u| {
+					(
+						(u.prompt_tokens as usize)
+							.saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+							.saturating_sub(cache_read_input_tokens.unwrap_or(0)),
+						u.output_tokens() as usize,
+					)
+				})
+				.unwrap_or((0, 0));
+
+			push_event(
+				events,
+				messages::MessagesStreamEvent::MessageDelta {
+					delta: messages::MessageDelta {
+						stop_reason: Some(stop_reason),
+						stop_sequence: state.pending_stop_sequence.take(),
+					},
+					usage: messages::MessageDeltaUsage {
+						input_tokens: Some(input_tokens),
+						output_tokens: Some(output_tokens),
+						cache_creation_input_tokens,
+						cache_read_input_tokens,
+						..Default::default()
+					},
+				},
+			);
+			push_event(events, messages::MessagesStreamEvent::MessageStop);
+			state.sent_message_stop = true;
+
+			if let Some(usage) = usage {
+				log.update(|r| {
+					r.response.input_tokens = Some(usage.prompt_tokens as u64);
+					r.response.output_tokens = Some(usage.output_tokens() as u64);
+					r.response.total_tokens = Some(usage.total_tokens as u64);
+					r.response.reasoning_tokens = usage
+						.completion_tokens_details
+						.as_ref()
+						.and_then(|d| d.reasoning_tokens);
+					r.response.cache_creation_input_tokens =
+						cache_creation_input_tokens.map(|tokens| tokens as u64);
+					r.response.cached_input_tokens = cache_read_input_tokens.map(|tokens| tokens as u64);
+				});
+			}
+
+			if log_tool_calls
+				&& let Some(tool_parts) = super::finalize_streaming_tool_calls(
+					state
+						.pending_tool_calls
+						.drain()
+						.map(|(idx, call)| (idx, call.id, call.name, call.arguments)),
+				) {
+				let mut tool_parts = Some(tool_parts);
+				let mut finish_reason = finish_reason;
+				log.update(|r| {
+					super::build_output_messages(&mut r.response, tool_parts.take(), finish_reason.take());
+				});
+			}
+		}
+
+		let mut state = StreamState::default();
+
+		crate::parse::sse::json_transform_multi::<
+			completions::StreamResponse,
+			messages::MessagesStreamEvent,
+			_,
+		>(b, buffer_limit, move |evt| {
+			let mut events: Vec<(&'static str, messages::MessagesStreamEvent)> = Vec::new();
+			match evt {
+				SseJsonEvent::Eof | SseJsonEvent::Error => return events,
+				SseJsonEvent::Done => {
+					flush_message_end(&mut state, &mut events, &log, true, log_content.tool_calls);
+					return events;
+				},
+				SseJsonEvent::Data(Err(e)) => {
+					tracing::debug!(
+						"Failed to parse OpenAI stream response during translation: {}",
+						e
+					);
+					return events;
+				},
+				SseJsonEvent::Data(Ok(f)) => {
+					if !state.sent_message_start {
+						state.sent_message_start = true;
+						push_event(
+							&mut events,
+							messages::MessagesStreamEvent::MessageStart {
+								message: messages::MessagesResponse::start(f.id.clone(), f.model.clone()),
+							},
+						);
+
+						log.update(|r| r.response.provider_model = Some(strng::new(&f.model)));
+					}
+
+					if let Some(usage) = f.usage {
+						state.pending_usage = Some(usage);
+					}
+
+					if let Some(choice) = f.choices.first() {
+						if let Some(thinking) = choice.delta.reasoning() {
+							let index = open_thinking_block(&mut state, &mut events);
+							maybe_set_first_token(&mut state, &log);
+							push_event(
+								&mut events,
+								messages::MessagesStreamEvent::ContentBlockDelta {
+									index,
+									delta: messages::ContentBlockDelta::ThinkingDelta {
+										thinking: thinking.to_string(),
+									},
+								},
+							);
+						}
+						// The signature goes out when the block closes, as a Messages stream sends it.
+						// Reasoning that is withheld arrives as a signature with no text, before any block
+						// has been opened, and opens one of its own to carry it.
+						if let Some(signature) = choice
+							.delta
+							.reasoning_signature
+							.as_deref()
+							.filter(|s| !s.is_empty())
+							&& (state.thinking_block_index.is_some() || state.next_block_index == 0)
+						{
+							open_thinking_block(&mut state, &mut events);
+							state.thinking_signature = Some(signature.to_string());
+						}
+						if let Some(content) = choice.delta.content.as_deref().filter(|s| !s.is_empty()) {
+							let index = open_text_block(&mut state, &mut events);
+							maybe_set_first_token(&mut state, &log);
+							push_event(
+								&mut events,
+								messages::MessagesStreamEvent::ContentBlockDelta {
+									index,
+									delta: messages::ContentBlockDelta::TextDelta {
+										text: content.to_string(),
+									},
+								},
+							);
+						}
+
+						if let Some(tool_calls) = &choice.delta.tool_calls {
+							for tool_call in tool_calls {
+								let tool_index = tool_call.index;
+								let (should_open, id, name, pending_json) = {
+									let entry =
+										state
+											.pending_tool_calls
+											.entry(tool_index)
+											.or_insert(PendingToolCall {
+												id: None,
+												name: None,
+												pending_json: String::new(),
+												arguments: String::new(),
+											});
+									if let Some(id) = &tool_call.id {
+										entry.id = Some(id.clone());
+									}
+									if let Some(function) = &tool_call.function {
+										if let Some(name) = &function.name {
+											entry.name = Some(name.clone());
+										}
+										if let Some(args) = &function.arguments {
+											entry.pending_json.push_str(args);
+											if log_content.tool_calls {
+												entry.arguments.push_str(args);
+											}
+										}
+									}
+
+									let should_open = entry.name.is_some();
+									let id = entry.id.clone();
+									let name = entry.name.clone();
+									let pending_json = if should_open && !entry.pending_json.is_empty() {
+										Some(std::mem::take(&mut entry.pending_json))
+									} else {
+										None
+									};
+									(should_open, id, name, pending_json)
+								};
+
+								if should_open {
+									let id = id.unwrap_or_else(|| format!("tool_call_{tool_index}"));
+									let name = name.unwrap_or_default();
+									let index = open_tool_block(&mut state, &mut events, tool_index, id, name);
+
+									if let Some(pending_json) = pending_json {
+										maybe_set_first_token(&mut state, &log);
+										let delta = messages::ContentBlockDelta::InputJsonDelta {
+											partial_json: pending_json,
+										};
+										push_event(
+											&mut events,
+											messages::MessagesStreamEvent::ContentBlockDelta { index, delta },
+										);
+									}
+								}
+							}
+						}
+
+						if let Some(finish_reason) = &choice.finish_reason {
+							let mut stop_reason = match finish_reason {
+								completions::FinishReason::Stop => messages::StopReason::EndTurn,
+								completions::FinishReason::Length => messages::StopReason::MaxTokens,
+								completions::FinishReason::ToolCalls => messages::StopReason::ToolUse,
+								completions::FinishReason::ContentFilter => messages::StopReason::Refusal,
+								completions::FinishReason::FunctionCall => messages::StopReason::ToolUse,
+							};
+							// Same contract as the buffered path: a named stop sequence is
+							// `stop_sequence`, not `end_turn`.
+							if stop_reason == messages::StopReason::EndTurn
+								&& let Some(seq) = choice_stop_sequence(&choice.rest)
+							{
+								stop_reason = messages::StopReason::StopSequence;
+								state.pending_stop_sequence = Some(seq);
+							}
+							state.pending_stop_reason = Some(stop_reason);
+						}
+					}
+
+					if state.pending_stop_reason.is_some() && state.pending_usage.is_some() {
+						flush_message_end(&mut state, &mut events, &log, false, log_content.tool_calls);
+					}
+				},
+			}
+			events
+		})
+	}
+
+	fn normalized_error_type(status: ::http::StatusCode, error_type: Option<&str>) -> &str {
+		error_type.unwrap_or(match status {
+			::http::StatusCode::BAD_REQUEST => "invalid_request_error",
+			::http::StatusCode::UNAUTHORIZED | ::http::StatusCode::FORBIDDEN => "authentication_error",
+			::http::StatusCode::NOT_FOUND => "not_found_error",
+			::http::StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+			_ => "api_error",
+		})
+	}
+
+	pub fn translate_error(bytes: &Bytes, status: ::http::StatusCode) -> Result<Bytes, AIError> {
+		let mut res = super::parse_chat_completion_error(bytes)?;
+		// Claude Code uses this marker to compact and retry a rejected prompt.
+		// Do not override an existing capability marker or a different structured code.
+		let context_overflow = status == ::http::StatusCode::BAD_REQUEST
+			&& match res.error.code.as_ref().and_then(Value::as_str) {
+				Some(code) => code == "context_length_exceeded",
+				None => {
+					let message = res.error.message.to_ascii_lowercase();
+					[
+						"prompt is too long",
+						"input is too long for requested model",
+						"exceeds the context window",
+						"exceed context limit",
+						"maximum context length is",
+						"model's maximum context limit",
+						"is longer than the model's context length",
+						"input tokens exceed the configured limit",
+						"exceeds the available context size",
+					]
+					.iter()
+					.any(|pattern| message.contains(pattern))
+				},
+			};
+		if context_overflow {
+			res.error.r#type = Some("invalid_request_error".to_string());
+			if !res.error.message.contains("capability_rejected:") {
+				// Keep a whitespace boundary after the capability token.
+				res.error.message = format!("capability_rejected: prompt_too_long {}", res.error.message);
+			}
+		}
+		let m = messages::MessagesErrorResponse {
+			r#type: "error".to_string(),
+			error: messages::MessagesError {
+				r#type: normalized_error_type(status, res.error.r#type.as_deref()).to_string(),
+				message: res.error.message,
+			},
+		};
+		Ok(Bytes::from(
+			serde_json::to_vec(&m).map_err(AIError::ResponseMarshal)?,
+		))
+	}
+
+	/// Convert an Anthropic image source JSON value into an OpenAI-compatible URL string.
+	/// Base64 sources become `data:` URIs; URL sources pass through directly.
+	fn anthropic_source_to_url(source: &serde_json::Value) -> Option<String> {
+		let source_type = source.get("type")?.as_str()?;
+		match source_type {
+			"base64" => {
+				let media_type = source.get("media_type")?.as_str()?;
+				let data = source.get("data")?.as_str()?;
+				Some(format!("data:{media_type};base64,{data}"))
+			},
+			"url" => {
+				let url = source.get("url")?.as_str()?;
+				Some(url.to_string())
+			},
+			_ => None,
+		}
+	}
+
+	#[allow(deprecated)]
+	fn translate_internal(req: messages::Request) -> completions::Request {
+		let messages::Request {
+			messages,
+			system,
+			model,
+			max_tokens,
+			stop_sequences,
+			stream,
+			temperature,
+			top_p,
+			top_k: _,
+			tools,
+			tool_choice,
+			metadata,
+			thinking,
+			output_config,
+			cache_control: _,
+		} = req;
+
+		// Explicit prompt-cache breakpoints are accepted only by GPT 5.6 and newer models.
+		let supports_prompt_cache_breakpoint =
+			crate::conversion::supports_prompt_cache_breakpoint(&model);
+		let cache_breakpoint = |cache_control: Option<messages::CacheControlEphemeral>| {
+			cache_control
+				.filter(|_| supports_prompt_cache_breakpoint)
+				.map(Into::into)
+		};
+
+		let output_effort = output_config
+			.as_ref()
+			.and_then(|cfg| cfg.effort)
+			.or_else(|| {
+				if let Some(messages::ThinkingInput::Enabled { budget_tokens }) = &thinking {
+					Some(crate::types::anthropic_effort_for_thinking_budget(
+						*budget_tokens,
+					))
+				} else {
+					None
+				}
+			});
+		let reasoning_requested = match thinking {
+			Some(messages::ThinkingInput::Disabled {}) => false,
+			Some(messages::ThinkingInput::Adaptive {}) => true,
+			_ => output_effort.is_some(),
+		};
+		let reasoning_effort =
+			if reasoning_requested && crate::conversion::supports_reasoning_effort(&model) {
+				Some(match output_effort {
+					Some(messages::ThinkingEffort::Low) => completions::ReasoningEffort::Low,
+					Some(messages::ThinkingEffort::Medium) => completions::ReasoningEffort::Medium,
+					Some(messages::ThinkingEffort::High) => completions::ReasoningEffort::High,
+					Some(messages::ThinkingEffort::Xhigh) => completions::ReasoningEffort::Xhigh,
+					Some(messages::ThinkingEffort::Max) => completions::ReasoningEffort::Max,
+					// Anthropic adaptive thinking defaults to high effort when omitted.
+					None => completions::ReasoningEffort::High,
+				})
+			} else {
+				None
+			};
+		let response_format = output_config
+			.as_ref()
+			.and_then(|cfg| cfg.format.as_ref())
+			.map(|format| match format {
+				messages::OutputFormat::JsonSchema { schema } => completions::ResponseFormat::JsonSchema {
+					json_schema: completions::ResponseFormatJsonSchema {
+						description: None,
+						name: "structured_output".to_string(),
+						schema: schema.clone(),
+						strict: None,
+					},
+				},
+			});
+
+		let mut msgs: Vec<completions::RequestMessage> = Vec::new();
+
+		// Preserve system block boundaries regardless of caching metadata.
+		if let Some(system) = system {
+			let content = match system {
+				messages::SystemPrompt::Text(text) => completions::RequestSystemMessageContent::Text(text),
+				messages::SystemPrompt::Blocks(blocks) => completions::RequestSystemMessageContent::Array(
+					blocks
+						.into_iter()
+						.map(|block| match block {
+							messages::SystemContentBlock::Text {
+								text,
+								cache_control,
+							} => completions::RequestSystemMessageContentPart::Text(
+								completions::RequestMessageContentPartText {
+									text,
+									prompt_cache_breakpoint: cache_breakpoint(cache_control),
+								},
+							),
+						})
+						.collect(),
+				),
+			};
+			msgs.push(completions::RequestMessage::System(
+				completions::RequestSystemMessage {
+					content,
+					name: None,
+				},
+			));
+		}
+
+		// Convert messages from Anthropic to universal format
+		for msg in messages {
+			match msg.role {
+				messages::Role::User => {
+					let mut parts: Vec<completions::RequestUserMessageContentPart> = Vec::new();
+
+					for block in msg.content {
+						match block {
+							messages::ContentBlock::Text(messages::ContentTextBlock {
+								text,
+								cache_control,
+								..
+							}) => {
+								parts.push(completions::RequestUserMessageContentPart::Text(
+									completions::RequestMessageContentPartText {
+										text,
+										prompt_cache_breakpoint: cache_breakpoint(cache_control),
+									},
+								));
+							},
+							messages::ContentBlock::Image(messages::ContentImageBlock { source, .. }) => {
+								if let Some(url) = anthropic_source_to_url(&source) {
+									parts.push(completions::RequestUserMessageContentPart::ImageUrl(
+										completions::RequestMessageContentPartImage {
+											image_url: completions::ImageUrl { url, detail: None },
+											// OpenAI rejects cache breakpoints on image parts even though the
+											// Chat Completions schema exposes this field.
+											prompt_cache_breakpoint: None,
+										},
+									));
+								}
+							},
+							messages::ContentBlock::ToolResult {
+								tool_use_id,
+								content,
+								cache_control,
+								..
+							} => {
+								let tool_content = match content {
+									ToolResultContent::Text(t) => match cache_breakpoint(cache_control) {
+										Some(breakpoint) => completions::RequestToolMessageContent::Array(vec![
+											completions::RequestToolMessageContentPart::Text(
+												completions::RequestMessageContentPartText {
+													text: t,
+													prompt_cache_breakpoint: Some(breakpoint),
+												},
+											),
+										]),
+										None => completions::RequestToolMessageContent::Text(t),
+									},
+									ToolResultContent::Array(arr) => {
+										let mut tool_parts = Vec::new();
+										let mut trailing_cache_control =
+											cache_control.filter(|_| supports_prompt_cache_breakpoint);
+										for part in arr {
+											match part {
+												ToolResultContentPart::Text {
+													text,
+													cache_control,
+													..
+												}
+												| ToolResultContentPart::ToolReference {
+													tool_name: text,
+													cache_control,
+												} => tool_parts.push(completions::RequestToolMessageContentPart::Text(
+													completions::RequestMessageContentPartText {
+														text,
+														prompt_cache_breakpoint: cache_breakpoint(cache_control),
+													},
+												)),
+												ToolResultContentPart::Image { cache_control, .. }
+												| ToolResultContentPart::Document { cache_control, .. }
+												| ToolResultContentPart::SearchResult { cache_control, .. } => {
+													if supports_prompt_cache_breakpoint {
+														trailing_cache_control = trailing_cache_control.or(cache_control);
+													}
+												},
+												ToolResultContentPart::Unknown => {},
+											}
+										}
+										if let Some(cache_control) = trailing_cache_control {
+											let breakpoint = Some(cache_control.into());
+											if let Some(completions::RequestToolMessageContentPart::Text(part)) =
+												tool_parts.last_mut()
+											{
+												part.prompt_cache_breakpoint = breakpoint;
+											} else {
+												tool_parts.push(completions::RequestToolMessageContentPart::Text(
+													completions::RequestMessageContentPartText {
+														text: String::new(),
+														prompt_cache_breakpoint: breakpoint,
+													},
+												));
+											}
+										}
+										completions::RequestToolMessageContent::Array(tool_parts)
+									},
+								};
+								msgs.push(completions::RequestMessage::Tool(
+									completions::RequestToolMessage {
+										content: tool_content,
+										tool_call_id: tool_use_id,
+									},
+								));
+							},
+							messages::ContentBlock::ServerToolUse { .. }
+							| messages::ContentBlock::ToolUse { .. } => {},
+							_ => {},
+						}
+					}
+
+					if !parts.is_empty() {
+						msgs.push(completions::RequestMessage::User(
+							completions::RequestUserMessage {
+								content: completions::RequestUserMessageContent::Array(parts),
+								name: None,
+							},
+						));
+					}
+				},
+				messages::Role::Assistant => {
+					let mut gemini_signatures: HashMap<_, _> = msg
+						.content
+						.iter()
+						.filter_map(|block| match block {
+							messages::ContentBlock::Thinking { signature, .. } => {
+								crate::conversion::GeminiThoughtSignature::decode(signature)
+							},
+							_ => None,
+						})
+						.map(|value| (value.call_id, value.signature))
+						.collect();
+					let mut assistant_parts = Vec::new();
+					let mut tool_calls: Vec<completions::MessageToolCalls> = Vec::new();
+					let mut reasoning_content: Option<String> = None;
+					let mut reasoning_signatures = Vec::new();
+					for block in msg.content {
+						match block {
+							messages::ContentBlock::Text(messages::ContentTextBlock {
+								text,
+								cache_control,
+								..
+							}) => assistant_parts.push(completions::RequestAssistantMessageContentPart::Text(
+								completions::RequestMessageContentPartText {
+									text,
+									prompt_cache_breakpoint: cache_breakpoint(cache_control),
+								},
+							)),
+							messages::ContentBlock::ToolUse {
+								id, name, input, ..
+							} => {
+								let signature = gemini_signatures.remove(&id);
+								let mut call = completions::MessageToolCall {
+									id,
+									function: completions::FunctionCall {
+										name,
+										arguments: serde_json::to_string(&input).unwrap_or_default(),
+									},
+									extra_content: None,
+								};
+								if let Some(signature) = signature {
+									call.set_thought_signature(signature);
+								}
+								tool_calls.push(completions::MessageToolCalls::Function(call));
+							},
+							// Chat Completions carries one reasoning text per turn, so the blocks are joined.
+							messages::ContentBlock::Thinking {
+								thinking,
+								signature,
+							} => {
+								if GeminiThoughtSignature::decode(&signature).is_some() {
+									continue;
+								}
+								match reasoning_content.as_mut() {
+									Some(text) => {
+										text.push_str("\n\n");
+										text.push_str(&thinking);
+									},
+									None => reasoning_content = Some(thinking),
+								}
+								reasoning_signatures.push(signature);
+							},
+							// A redacted block holds nothing an OpenAI-compatible engine could replay.
+							messages::ContentBlock::RedactedThinking { .. } => {},
+							_ => {},
+						}
+					}
+					// A signature attests to one block, so it only survives a turn with exactly one.
+					let reasoning_signature = match reasoning_signatures.as_slice() {
+						[signature] if !signature.is_empty() => Some(signature.clone()),
+						_ => None,
+					};
+					if !assistant_parts.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some() {
+						msgs.push(completions::RequestMessage::Assistant(
+							completions::RequestAssistantMessage {
+								content: if assistant_parts.is_empty() {
+									None
+								} else {
+									Some(completions::RequestAssistantMessageContent::Array(
+										assistant_parts,
+									))
+								},
+								name: None,
+								tool_calls: if tool_calls.is_empty() {
+									None
+								} else {
+									Some(tool_calls)
+								},
+								refusal: None,
+								audio: None,
+								function_call: None,
+								reasoning_content,
+								reasoning_signature,
+							},
+						));
+					}
+				},
+				messages::Role::System => {
+					let parts = msg
+						.content
+						.into_iter()
+						.filter_map(|block| match block {
+							messages::ContentBlock::Text(messages::ContentTextBlock {
+								text,
+								cache_control,
+								..
+							}) => Some(completions::RequestSystemMessageContentPart::Text(
+								completions::RequestMessageContentPartText {
+									text,
+									prompt_cache_breakpoint: cache_breakpoint(cache_control),
+								},
+							)),
+							_ => None,
+						})
+						.collect::<Vec<_>>();
+					if !parts.is_empty() {
+						msgs.push(completions::RequestMessage::System(
+							completions::RequestSystemMessage {
+								content: completions::RequestSystemMessageContent::Array(parts),
+								name: None,
+							},
+						));
+					}
+				},
+			}
+		}
+
+		let tools: Vec<completions::Tool> = tools
+			.into_iter()
+			.flat_map(|tools| tools.into_iter())
+			.filter_map(|tool| match tool {
+				messages::Tool::Custom(tool) => {
+					Some(completions::Tool::Function(completions::FunctionTool {
+						function: completions::FunctionObject {
+							name: tool.name,
+							description: tool.description,
+							parameters: Some(tool.input_schema),
+							strict: tool.strict,
+						},
+					}))
+				},
+				// OpenAI completions has no equivalent of an Anthropic server-executed tool
+				// (e.g. web_search_20250305); drop it rather than fail the whole request.
+				messages::Tool::Server(tool) => {
+					tracing::warn!(
+						"Unsupported server tool in completions conversion: {:?}",
+						tool
+					);
+					None
+				},
+			})
+			.collect_vec();
+
+		// OpenAI rejects reasoning+tools+modern models+chat completions API combination.
+		// TODO: Move Messages requests with reasoning and function tools to the Responses API.
+		// Disable reasoning for GPT-5 tool requests except the allowed GPT-5/5.1/5.2 models.
+		// Leave other models unchanged; gpt-4o rejects reasoning_effort.
+		let supports_reasoning_with_tools = !model.starts_with("gpt-5")
+			|| model == "gpt-5"
+			|| model.starts_with("gpt-5-")
+			|| model.starts_with("gpt-5.1")
+			|| model.starts_with("gpt-5.2");
+		let reasoning_effort = if !tools.is_empty() && !supports_reasoning_with_tools {
+			Some(completions::ReasoningEffort::None)
+		} else {
+			reasoning_effort
+		};
+
+		let mut parallel_tool_calls = None;
+		let tool_choice = tool_choice.map(|choice| match choice {
+			messages::ToolChoice::Auto {
+				disable_parallel_tool_use,
+			} => {
+				parallel_tool_calls = disable_parallel_tool_use.map(|d| !d);
+				completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::Auto)
+			},
+			messages::ToolChoice::Any {
+				disable_parallel_tool_use,
+			} => {
+				parallel_tool_calls = disable_parallel_tool_use.map(|d| !d);
+				completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::Required)
+			},
+			messages::ToolChoice::Tool {
+				name,
+				disable_parallel_tool_use,
+			} => {
+				parallel_tool_calls = disable_parallel_tool_use.map(|d| !d);
+				completions::ToolChoiceOption::Function(completions::NamedToolChoice {
+					function: completions::FunctionName { name },
+				})
+			},
+			messages::ToolChoice::None {} => {
+				completions::ToolChoiceOption::Mode(completions::ToolChoiceOptions::None)
+			},
+		});
+
+		// Preserve the common `user_id` field when mapping Messages -> OpenAI chat completions.
+		// The rest of `messages.metadata` is handled only on provider-native Messages paths.
+		// Forwarding it here breaks OpenAI-compatible backends because `metadata` requires `store=true`,
+		// which agentgateway does not set on this path.
+		let user_id = metadata
+			.as_ref()
+			.and_then(|m| m.fields.get("user_id").cloned());
+
+		let stop = if stop_sequences.is_empty() {
+			None
+		} else {
+			Some(completions::Stop::StringArray(stop_sequences))
+		};
+
+		completions::Request {
+			model: Some(model),
+			moderation: None,
+			messages: msgs,
+			stream: Some(stream),
+			temperature,
+			top_p,
+			max_completion_tokens: Some(max_tokens as u32),
+			max_tokens: None,
+			stop,
+			tools: if tools.is_empty() { None } else { Some(tools) },
+			tool_choice,
+			user: user_id,
+			// Internal vendor extensions are only for completions-originated requests.
+			// messages -> completions should emit OpenAI-compatible payloads only.
+			vendor_extensions: completions::RequestVendorExtensions::default(),
+			stream_options: if stream {
+				Some(completions::StreamOptions {
+					include_usage: Some(true),
+					include_obfuscation: None,
+				})
+			} else {
+				None
+			},
+			frequency_penalty: None,
+			presence_penalty: None,
+			seed: None,
+			// Fields not applicable from Anthropic Messages
+			store: None,
+			reasoning_effort,
+			metadata: None,
+			logit_bias: None,
+			logprobs: None,
+			top_logprobs: None,
+			n: None,
+			modalities: None,
+			prediction: None,
+			audio: None,
+			response_format,
+			#[allow(deprecated)]
+			function_call: None,
+			#[allow(deprecated)]
+			functions: None,
+			service_tier: None,
+			parallel_tool_calls,
+			web_search_options: None,
+		}
+	}
+}
+
+/// Build the observability tool-call content parts from accumulated streaming deltas,
+/// keyed by tool-call index. Synthesizes an id when the provider omitted one,
+/// and returns `None` when there are no tool calls.
+pub(crate) fn finalize_streaming_tool_calls(
+	entries: impl IntoIterator<Item = (u32, Option<String>, Option<String>, String)>,
+) -> Option<Vec<crate::OutputMessagePart>> {
+	let parts: Vec<crate::OutputMessagePart> = entries
+		.into_iter()
+		.sorted_by_key(|(idx, ..)| *idx)
+		.map(|(idx, id, name, arguments)| {
+			let arguments = match serde_json::from_str(&arguments) {
+				Ok(arguments) => arguments,
+				Err(_) if arguments.trim().is_empty() => serde_json::Value::Object(Default::default()),
+				Err(_) => serde_json::Value::String(arguments),
+			};
+			crate::OutputMessagePart::ToolCall {
+				id: id.unwrap_or_else(|| format!("tool_call_{idx}")).into(),
+				name: name.unwrap_or_default().into(),
+				arguments,
+			}
+		})
+		.collect();
+	(!parts.is_empty()).then_some(parts)
+}
+
+/// Builds `output_messages` on `LLMResponse` from accumulated tool call parts.
+pub(crate) fn build_output_messages(
+	response: &mut crate::LLMResponse,
+	tool_parts: Option<Vec<crate::OutputMessagePart>>,
+	finish_reason: Option<agent_core::strng::Strng>,
+) {
+	if let Some(content) = tool_parts.filter(|parts| !parts.is_empty()) {
+		response.output_messages = Some(vec![crate::OutputMessage {
+			role: agent_core::strng::literal!("assistant"),
+			content,
+			finish_reason,
+		}]);
+	}
+}
+
+pub fn passthrough_stream(
+	mut log: StreamingUsageGuard,
+	log_content: crate::LogContentFields,
+	resp: Response<Body>,
+) -> Response<Body> {
+	#[derive(Default)]
+	struct PendingPassthroughToolCall {
+		id: Option<String>,
+		name: Option<String>,
+		arguments: String,
+	}
+
+	fn finalize_tool_calls(
+		pending: &mut std::collections::HashMap<u32, PendingPassthroughToolCall>,
+	) -> Option<Vec<crate::OutputMessagePart>> {
+		finalize_streaming_tool_calls(
+			pending
+				.drain()
+				.map(|(idx, call)| (idx, call.id, call.name, call.arguments)),
+		)
+	}
+
+	let mut completion = log_content.completion.then(String::new);
+	let mut finish_reason = None;
+	let mut pending_tool_calls: Option<std::collections::HashMap<u32, PendingPassthroughToolCall>> =
+		log_content.tool_calls.then(std::collections::HashMap::new);
+	let buffer_limit = agent_http::response_buffer_limit(&resp);
+	resp.map(|b| {
+		let mut seen_provider = false;
+		let mut saw_token = false;
+		let mut last_token_at: Option<Instant> = None;
+		parse::sse::json_passthrough::<types::completions::typed::StreamResponse>(
+			b,
+			buffer_limit,
+			move |f| {
+				match f {
+					Some(Ok(f)) => {
+						if let Some(reason) = f
+							.choices
+							.first()
+							.and_then(|choice| choice.finish_reason.as_ref())
+						{
+							finish_reason = crate::types::serialize_str(reason);
+						}
+						if let Some(c) = completion.as_mut()
+							&& let Some(delta) = f.choices.first().and_then(|c| c.delta.content.as_deref())
+						{
+							c.push_str(delta);
+						}
+						if let Some(pending) = pending_tool_calls.as_mut()
+							&& let Some(deltas) = f.choices.first().and_then(|c| c.delta.tool_calls.as_ref())
+						{
+							for chunk in deltas {
+								let entry = pending.entry(chunk.index).or_default();
+								if let Some(id) = &chunk.id {
+									entry.id = Some(id.clone());
+								}
+								if let Some(function) = &chunk.function {
+									if let Some(name) = &function.name {
+										entry.name = Some(name.clone());
+									}
+									if let Some(args) = &function.arguments {
+										entry.arguments.push_str(args);
+									}
+								}
+							}
+						}
+						let now = Instant::now();
+						if !saw_token {
+							saw_token = true;
+							last_token_at = Some(now);
+							log.update(|r| {
+								r.response.first_token = Some(now);
+							});
+						} else if let Some(prev) = last_token_at.replace(now) {
+							let gap = now.duration_since(prev);
+							log.update(|r| r.response.inter_chunk_latencies.record(gap));
+						}
+						if !seen_provider {
+							seen_provider = true;
+							log.update(|r| {
+								r.response.provider_model = Some(strng::new(&f.model));
+								r.response.service_tier = f.service_tier.as_deref().map(Into::into);
+							});
+						}
+						if let Some(u) = f.usage {
+							log.update(|r| {
+								r.response.input_tokens = Some(u.prompt_tokens as u64);
+								r.response.input_audio_tokens = u
+									.prompt_tokens_details
+									.as_ref()
+									.and_then(|d| d.audio_tokens);
+								r.response.output_tokens = Some(u.output_tokens() as u64);
+								r.response.output_audio_tokens = u
+									.completion_tokens_details
+									.as_ref()
+									.and_then(|d| d.audio_tokens);
+								r.response.total_tokens = Some(u.total_tokens as u64);
+								r.response.cached_input_tokens = u
+									.prompt_tokens_details
+									.as_ref()
+									.and_then(|d| d.cached_tokens);
+								r.response.cache_creation_input_tokens = u
+									.prompt_tokens_details
+									.as_ref()
+									.and_then(|d| d.cache_write_tokens)
+									.or(u.cache_creation_input_tokens);
+								r.response.reasoning_tokens = u
+									.completion_tokens_details
+									.as_ref()
+									.and_then(|d| d.reasoning_tokens);
+								if let Some(c) = completion.take() {
+									r.response.completion = Some(vec![c]);
+								}
+								let tool_parts = pending_tool_calls.as_mut().and_then(finalize_tool_calls);
+								build_output_messages(&mut r.response, tool_parts, finish_reason.take());
+							});
+
+							log.report_usage();
+						}
+					},
+					Some(Err(e)) => {
+						debug!("failed to parse streaming response: {e}");
+					},
+					None => {
+						// We are done, try to set completion if we haven't already
+						// This is useful in case we never see "usage"
+						log.update(|r| {
+							if let Some(c) = completion.take() {
+								r.response.completion = Some(vec![c]);
+							}
+							let tool_parts = pending_tool_calls.as_mut().and_then(finalize_tool_calls);
+							build_output_messages(&mut r.response, tool_parts, finish_reason.take());
+						});
+					},
+				}
+			},
+		)
+	})
+}

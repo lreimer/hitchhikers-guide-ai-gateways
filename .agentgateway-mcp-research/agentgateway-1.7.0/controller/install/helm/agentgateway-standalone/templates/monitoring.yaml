@@ -1,0 +1,44 @@
+{{- if .Values.monitoring.enabled }}
+{{- if .Values.monitoring.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "agentgateway-standalone.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentgateway-standalone.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.monitoring.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "agentgateway-standalone.selectorLabels" . | nindent 6 }}
+  scrapeNativeHistograms: {{ .Values.monitoring.podMonitor.scrapeNativeHistograms }}
+  scrapeClassicHistograms: {{ .Values.monitoring.podMonitor.scrapeClassicHistograms }}
+  scrapeProtocols:
+    {{- if .Values.monitoring.podMonitor.scrapeNativeHistograms }}
+    - PrometheusProto
+    {{- end }}
+    - OpenMetricsText1.0.0
+    - OpenMetricsText0.0.1
+    - PrometheusText1.0.0
+    - PrometheusText0.0.4
+  podMetricsEndpoints:
+  - port: metrics
+    path: /metrics
+    interval: {{ .Values.monitoring.podMonitor.interval }}
+    {{- with .Values.monitoring.podMonitor.relabelings }}
+    relabelings:
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.monitoring.podMonitor.metricRelabelings }}
+    metricRelabelings:
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}

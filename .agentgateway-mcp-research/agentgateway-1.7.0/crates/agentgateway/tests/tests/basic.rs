@@ -1,0 +1,859 @@
+use agentgateway::test_helpers::{extauthmock, oteltracemock};
+use ppp::v2::{
+	Builder as ProxyV2Builder, Command as ProxyV2Command, Protocol as ProxyV2Protocol,
+	Version as ProxyV2Version,
+};
+use tokio::net::TcpListener;
+
+use crate::common::prelude::*;
+
+fn build_proxy_v1_header(src: &str, dst: &str) -> Vec<u8> {
+	let src: std::net::SocketAddrV4 = src.parse().unwrap();
+	let dst: std::net::SocketAddrV4 = dst.parse().unwrap();
+	format!(
+		"PROXY TCP4 {} {} {} {}\r\n",
+		src.ip(),
+		dst.ip(),
+		src.port(),
+		dst.port()
+	)
+	.into_bytes()
+}
+
+fn build_proxy_v2_header(src: &str, dst: &str) -> Vec<u8> {
+	let src: std::net::SocketAddrV4 = src.parse().unwrap();
+	let dst: std::net::SocketAddrV4 = dst.parse().unwrap();
+	let addresses = ppp::v2::Addresses::IPv4(ppp::v2::IPv4 {
+		source_address: *src.ip(),
+		destination_address: *dst.ip(),
+		source_port: src.port(),
+		destination_port: dst.port(),
+	});
+	ProxyV2Builder::with_addresses(
+		ProxyV2Version::Two | ProxyV2Command::Proxy,
+		ProxyV2Protocol::Stream,
+		addresses,
+	)
+	.build()
+	.unwrap()
+}
+
+async fn raw_header_backend() -> (std::net::SocketAddr, oneshot::Receiver<String>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let (tx, rx) = oneshot::channel();
+	tokio::spawn(async move {
+		let (mut stream, _) = listener.accept().await.unwrap();
+		let mut buf = Vec::new();
+		loop {
+			let mut chunk = [0; 1024];
+			let n = stream.read(&mut chunk).await.unwrap();
+			assert!(
+				n > 0,
+				"raw header backend connection closed before request headers"
+			);
+			buf.extend_from_slice(&chunk[..n]);
+			if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+				break;
+			}
+		}
+		let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+		tx.send(String::from_utf8(buf[..header_end].to_vec()).unwrap())
+			.unwrap();
+		stream
+			.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+	});
+	(addr, rx)
+}
+
+#[tokio::test]
+async fn basic_handling() {
+	let (_mock, _bind, io) = basic_setup().await;
+	let res = send_request(io, Method::POST, "http://lo").await;
+	assert_eq!(res.status(), 200);
+	let body = read_body(res.into_body()).await;
+	assert_eq!(body.version, Version::HTTP_11);
+	assert_eq!(body.method, Method::POST);
+}
+
+#[tokio::test]
+async fn http_header_case_preserve_forwards_original_case_to_backend() {
+	let (backend_addr, captured_request) = raw_header_backend().await;
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(backend_addr)
+		.with_bind(simple_bind())
+		.with_route(basic_route(backend_addr));
+	t.attach_frontend_policy(json!({
+		"http": {
+			"http1HeaderCase": "preserve",
+		},
+	}))
+	.await;
+
+	let mut io = t.serve(BIND_KEY);
+	io.write_all(
+		b"GET / HTTP/1.1\r\nHost: lo\r\nX-Case-Probe: preserve-me\r\nConnection: close\r\n\r\n",
+	)
+	.await
+	.unwrap();
+
+	let captured_request = tokio::time::timeout(Duration::from_secs(5), captured_request)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(
+		captured_request.contains("\r\nX-Case-Probe: preserve-me\r\n"),
+		"backend request did not preserve header case:\n{captured_request}"
+	);
+	assert!(
+		!captured_request.contains("\r\nx-case-probe: preserve-me\r\n"),
+		"backend request lowercased preserved header:\n{captured_request}"
+	);
+}
+
+#[tokio::test]
+async fn proxy_policy_optional_mode_allows_plain_http() {
+	let mock = simple_mock().await;
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	t.attach_frontend_policy(json!({
+		"proxyProtocol": {
+			"version": "all",
+			"mode": "optional",
+		},
+	}))
+	.await;
+
+	let io = t.serve_http(BIND_KEY);
+	let res = send_request(io, Method::GET, "http://lo").await;
+	assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn proxy_policy_v1_accepts_v1_header() {
+	let mock = simple_mock().await;
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	t.attach_frontend_policy(json!({
+		"proxyProtocol": {
+			"version": "v1",
+		},
+	}))
+	.await;
+
+	let mut io = t.serve_tunnel(BIND_KEY);
+	io.write_all(&build_proxy_v1_header("192.168.1.10:40000", "127.0.0.1:80"))
+		.await
+		.unwrap();
+	let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+		.await
+		.unwrap();
+	let conn = tokio::spawn(conn);
+	let res = sender
+		.send_request(
+			::http::Request::builder()
+				.method(Method::GET)
+				.uri("/")
+				.header(header::HOST, "lo")
+				.header(header::CONNECTION, "close")
+				.body(Body::empty())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(res.status(), 200);
+	conn.abort();
+}
+
+#[tokio::test]
+async fn proxy_policy_v1_rejects_v2_header() {
+	let mock = simple_mock().await;
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	t.attach_frontend_policy(json!({
+		"proxyProtocol": {
+			"version": "v1",
+		},
+	}))
+	.await;
+
+	let mut io = t.serve_tunnel(BIND_KEY);
+	io.write_all(&build_proxy_v2_header("192.168.1.10:40000", "127.0.0.1:80"))
+		.await
+		.unwrap();
+	io.write_all(b"GET / HTTP/1.1\r\nHost: lo\r\n\r\n")
+		.await
+		.unwrap();
+	io.shutdown().await.unwrap();
+
+	let mut response = [0u8; 1];
+	let read = tokio::time::timeout(Duration::from_secs(2), io.read(&mut response))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn tracing_exports_to_otel_trace_mock() {
+	unsafe {
+		// Drop export time to make tests fast
+		std::env::set_var("OTEL_BLRP_SCHEDULE_DELAY", "20");
+		std::env::set_var("OTEL_BSP_SCHEDULE_DELAY", "20");
+	}
+	struct CountingTraceHandler {
+		spans: Arc<StdMutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl oteltracemock::Handler for CountingTraceHandler {
+		async fn export(
+			&mut self,
+			request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+		) -> Result<
+			opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+			tonic::Status,
+		> {
+			self.spans.lock().unwrap().extend(
+				request
+					.resource_spans
+					.iter()
+					.flat_map(|resource| &resource.scope_spans)
+					.flat_map(|scope| &scope.spans)
+					.cloned(),
+			);
+			oteltracemock::ok_response()
+		}
+	}
+	struct AllowExtAuthz;
+	#[async_trait::async_trait]
+	impl extauthmock::Handler for AllowExtAuthz {}
+
+	let spans = Arc::new(StdMutex::new(Vec::new()));
+	let otel = oteltracemock::OtelTraceMock::new({
+		let spans = Arc::clone(&spans);
+		move || CountingTraceHandler {
+			spans: Arc::clone(&spans),
+		}
+	})
+	.spawn()
+	.await;
+	let authz = extauthmock::ExtAuthMock::new(|| AllowExtAuthz)
+		.spawn()
+		.await;
+
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_frontend_policy(json!({
+			"tracing": {
+				"host": otel.address.to_string(),
+				"randomSampling": true
+			}
+		}))
+		.await;
+	bind
+		.attach_gateway_policy(json!({
+			"extAuthz": {
+				"host": authz.address,
+			},
+		}))
+		.await;
+
+	let res = send_request(io, Method::GET, "http://lo").await;
+	assert_eq!(res.status(), 200);
+
+	tokio::time::timeout(Duration::from_secs(2), async {
+		while spans.lock().unwrap().len() < 2 {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+
+	let spans = spans.lock().unwrap();
+	let ext_authz = spans
+		.iter()
+		.find(|span| span.name == "ExtAuthz")
+		.expect("ExtAuthz span should be exported");
+	let request = spans
+		.iter()
+		.find(|span| span.trace_id == ext_authz.trace_id && span.span_id == ext_authz.parent_span_id)
+		.expect("parent request span should be exported");
+	assert_eq!(ext_authz.trace_id, request.trace_id);
+	assert_eq!(ext_authz.parent_span_id, request.span_id);
+}
+
+/// `parentNotSampled` exports spans for a request whose incoming `traceparent` is `-00`, and
+/// reflects that recording decision by forwarding `-01` upstream.
+#[tokio::test]
+async fn tracing_parent_not_sampled_exports_and_propagates_sampled_flag() {
+	unsafe {
+		std::env::set_var("OTEL_BLRP_SCHEDULE_DELAY", "20");
+		std::env::set_var("OTEL_BSP_SCHEDULE_DELAY", "20");
+	}
+	struct CountingTraceHandler {
+		spans: Arc<StdMutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl oteltracemock::Handler for CountingTraceHandler {
+		async fn export(
+			&mut self,
+			request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+		) -> Result<
+			opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+			tonic::Status,
+		> {
+			self.spans.lock().unwrap().extend(
+				request
+					.resource_spans
+					.iter()
+					.flat_map(|resource| &resource.scope_spans)
+					.flat_map(|scope| &scope.spans)
+					.cloned(),
+			);
+			oteltracemock::ok_response()
+		}
+	}
+
+	const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+	const PARENT_SPAN_ID: &str = "b7ad6b7169203331";
+	let unsampled = format!("00-{TRACE_ID}-{PARENT_SPAN_ID}-00");
+
+	let spans = Arc::new(StdMutex::new(Vec::new()));
+	let otel = oteltracemock::OtelTraceMock::new({
+		let spans = Arc::clone(&spans);
+		move || CountingTraceHandler {
+			spans: Arc::clone(&spans),
+		}
+	})
+	.spawn()
+	.await;
+
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_frontend_policy(json!({
+			"tracing": {
+				"host": otel.address.to_string(),
+				"parentNotSampled": true
+			}
+		}))
+		.await;
+
+	let res = send_request_headers(
+		io.clone(),
+		Method::GET,
+		"http://lo",
+		&[("traceparent", unsampled.as_str())],
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+
+	let upstream = read_body(res.into_body()).await;
+	let forwarded = upstream
+		.headers
+		.get("traceparent")
+		.expect("traceparent should be forwarded upstream")
+		.to_str()
+		.unwrap()
+		.to_string();
+	assert!(
+		forwarded.ends_with("-01"),
+		"upstream traceparent must reflect the gateway's recording decision, got {forwarded}"
+	);
+	assert!(
+		forwarded.starts_with(&format!("00-{TRACE_ID}-")),
+		"upstream traceparent must stay in the client's trace, got {forwarded}"
+	);
+	assert!(
+		!forwarded.contains(PARENT_SPAN_ID),
+		"upstream traceparent must carry the gateway's own span id, got {forwarded}"
+	);
+
+	tokio::time::timeout(Duration::from_secs(10), async {
+		while spans.lock().unwrap().is_empty() {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.expect("a span should be exported for an unsampled parent");
+
+	let spans = spans.lock().unwrap();
+	let request = spans
+		.iter()
+		.find(|span| hex::encode(&span.trace_id) == TRACE_ID)
+		.expect("exported span should stay in the client's trace");
+	assert_eq!(hex::encode(&request.parent_span_id), PARENT_SPAN_ID);
+	assert_eq!(request.flags & 0x01, 0x01);
+}
+
+/// Without `parentNotSampled`, an incoming `-00` is honored and nothing is exported.
+#[tokio::test]
+async fn tracing_honors_unsampled_parent_by_default() {
+	unsafe {
+		std::env::set_var("OTEL_BLRP_SCHEDULE_DELAY", "20");
+		std::env::set_var("OTEL_BSP_SCHEDULE_DELAY", "20");
+	}
+	struct CountingTraceHandler {
+		spans: Arc<StdMutex<Vec<opentelemetry_proto::tonic::trace::v1::Span>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl oteltracemock::Handler for CountingTraceHandler {
+		async fn export(
+			&mut self,
+			request: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+		) -> Result<
+			opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+			tonic::Status,
+		> {
+			self.spans.lock().unwrap().extend(
+				request
+					.resource_spans
+					.iter()
+					.flat_map(|resource| &resource.scope_spans)
+					.flat_map(|scope| &scope.spans)
+					.cloned(),
+			);
+			oteltracemock::ok_response()
+		}
+	}
+
+	let spans = Arc::new(StdMutex::new(Vec::new()));
+	let otel = oteltracemock::OtelTraceMock::new({
+		let spans = Arc::clone(&spans);
+		move || CountingTraceHandler {
+			spans: Arc::clone(&spans),
+		}
+	})
+	.spawn()
+	.await;
+
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_frontend_policy(json!({
+			"tracing": {
+				"host": otel.address.to_string(),
+				"clientSampling": true
+			}
+		}))
+		.await;
+
+	let res = send_request_headers(
+		io.clone(),
+		Method::GET,
+		"http://lo",
+		&[(
+			"traceparent",
+			"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00",
+		)],
+	)
+	.await;
+	assert_eq!(res.status(), 200);
+
+	let upstream = read_body(res.into_body()).await;
+	let forwarded = upstream
+		.headers
+		.get("traceparent")
+		.expect("traceparent should be forwarded upstream")
+		.to_str()
+		.unwrap()
+		.to_string();
+	assert_eq!(
+		forwarded, "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00",
+		"an unsampled request must pass the client's traceparent through untouched, so downstream \
+		 does not parent onto a span the gateway never recorded"
+	);
+
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	assert!(spans.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn multiple_requests() {
+	let (_mock, _bind, io) = basic_setup().await;
+	let res = send_request(io.clone(), Method::GET, "http://lo").await;
+	assert_eq!(res.status(), 200);
+	let res = send_request(io.clone(), Method::GET, "http://lo").await;
+	assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn debug_trace_only_captures_one_request_on_keepalive_connection() {
+	let (_mock, _bind, io) = basic_setup().await;
+	const PATH: &str = "/debug-trace-only-captures-one-request";
+	let mut trace_rx = agentgateway::proxy::dtrace::track_expression(Some(
+		agentgateway::cel::Expression::new_strict(format!("request.path == '{PATH}'")).unwrap(),
+	));
+
+	let url = format!("http://lo{PATH}");
+	let res = send_request(io.clone(), Method::GET, &url).await;
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	let res = send_request(io.clone(), Method::GET, "http://lo/keepalive").await;
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	let mut events = Vec::new();
+	while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(50), trace_rx.recv()).await {
+		events.push(serde_json::to_value(msg).unwrap())
+	}
+
+	let request_started = events
+		.iter()
+		.filter(|event| event["message"]["type"] == "requestStarted")
+		.count();
+	assert_eq!(request_started, 1, "{events:#?}");
+}
+
+#[tokio::test]
+async fn debug_trace_expression_watchers_match_first_request() {
+	let (_mock, _bind, io) = basic_setup().await;
+	const FIRST_PATH: &str = "/debug-trace-expression-watchers-first";
+	const SECOND_PATH: &str = "/debug-trace-expression-watchers-second";
+	let mut first_trace_rx = agentgateway::proxy::dtrace::track_expression(Some(
+		agentgateway::cel::Expression::new_strict(format!("request.path == '{FIRST_PATH}'")).unwrap(),
+	));
+	let mut second_trace_rx = agentgateway::proxy::dtrace::track_expression(Some(
+		agentgateway::cel::Expression::new_strict(format!("request.path == '{SECOND_PATH}'")).unwrap(),
+	));
+
+	let second_url = format!("http://lo{SECOND_PATH}");
+	let res = send_request(io.clone(), Method::GET, &second_url).await;
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	assert!(
+		tokio::time::timeout(Duration::from_millis(50), first_trace_rx.recv())
+			.await
+			.is_err(),
+		"first watcher should remain queued when its expression does not match",
+	);
+	let second_event = tokio::time::timeout(Duration::from_secs(1), second_trace_rx.recv())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		serde_json::to_value(second_event).unwrap()["message"]["type"],
+		"requestStarted"
+	);
+
+	let first_url = format!("http://lo{FIRST_PATH}");
+	let res = send_request(io.clone(), Method::GET, &first_url).await;
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	let first_event = tokio::time::timeout(Duration::from_secs(1), first_trace_rx.recv())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		serde_json::to_value(first_event).unwrap()["message"]["type"],
+		"requestStarted"
+	);
+}
+
+#[tokio::test]
+async fn basic_http2() {
+	let mock = simple_mock().await;
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	let io = t.serve_http2(strng::new("bind"));
+	let res = RequestBuilder::new(Method::GET, "http://lo")
+		.version(Version::HTTP_2)
+		.send(io)
+		.await
+		.unwrap();
+	assert_eq!(res.status(), 200);
+	assert_eq!(read_body(res.into_body()).await.version, Version::HTTP_2);
+}
+
+#[rstest::rstest]
+#[case::http1(Version::HTTP_11, Version::HTTP_11, false)]
+#[case::http2(Version::HTTP_2, Version::HTTP_2, false)]
+#[case::http2_to_http1(Version::HTTP_2, Version::HTTP_11, false)]
+#[case::http1_to_http2(Version::HTTP_11, Version::HTTP_2, false)]
+#[case::http2_content_length(Version::HTTP_2, Version::HTTP_2, true)]
+#[case::http2_to_http1_content_length(Version::HTTP_2, Version::HTTP_11, true)]
+#[tokio::test]
+async fn request_trailers(
+	#[case] version: Version,
+	#[case] backend_version: Version,
+	#[case] content_length: bool,
+) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let (tx, rx) = oneshot::channel();
+	let tx = Arc::new(StdMutex::new(Some(tx)));
+	let server = tokio::spawn(async move {
+		let (stream, _) = listener.accept().await.unwrap();
+		let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+			let tx = tx.clone();
+			async move {
+				let (parts, body) = req.into_parts();
+				let body = body.collect().await.unwrap();
+				let trailers = body.trailers().cloned();
+				tx.lock()
+					.unwrap()
+					.take()
+					.unwrap()
+					.send((parts, body.to_bytes(), trailers))
+					.unwrap();
+				Ok::<_, Infallible>(hyper::Response::new(Body::empty()))
+			}
+		});
+		hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+			.serve_connection(TokioIo::new(stream), svc)
+			.await
+			.unwrap();
+	});
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", addr), "".into()),
+				Target::Address(addr),
+			),
+			inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+				version: Some(backend_version),
+				..Default::default()
+			})],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(addr));
+	let io = if version == Version::HTTP_2 {
+		t.serve_http2(BIND_KEY)
+	} else {
+		t.serve_http(BIND_KEY)
+	};
+	let mut trailers = HeaderMap::new();
+	trailers.insert("x-input-trailer", "input-done".parse().unwrap());
+	let body = Body::new(StreamBody::new(tokio_stream::iter([
+		Ok::<_, Infallible>(Frame::data(bytes::Bytes::from_static(b"grpc-payload"))),
+		Ok(Frame::trailers(trailers.clone())),
+	])));
+	let mut request = RequestBuilder::new(Method::POST, "http://lo")
+		.version(version)
+		.header(header::TRAILER, "x-input-trailer")
+		.body(body);
+	if content_length {
+		request = request.header(header::CONTENT_LENGTH, "12");
+	}
+	let res = request.send(io).await.unwrap();
+	assert_eq!(res.status(), 200);
+	let (parts, bytes, received_trailers) = rx.await.unwrap();
+	server.abort();
+	assert_eq!(parts.version, backend_version);
+	assert_eq!(parts.headers.get_all(header::TRAILER).iter().count(), 1);
+	if backend_version == Version::HTTP_11 {
+		assert!(!parts.headers.contains_key(header::CONTENT_LENGTH));
+		assert_eq!(parts.headers[header::TRANSFER_ENCODING], "chunked");
+	} else if content_length {
+		assert_eq!(parts.headers[header::CONTENT_LENGTH], "12");
+	}
+	assert_eq!(bytes, "grpc-payload");
+	assert_eq!(received_trailers, Some(trailers));
+}
+
+#[tokio::test]
+async fn http2_host_header_without_authority() {
+	let mock = simple_mock().await;
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	let (mut client, connection) = h2::client::handshake(t.serve(BIND_KEY)).await.unwrap();
+	let connection = tokio::spawn(connection);
+
+	// h2 encodes an HTTP/1.x-version request on an HTTP/2 connection without
+	// :authority, preserving the regular Host header instead.
+	let request = ::http::Request::builder()
+		.method(Method::GET)
+		.uri("/")
+		.version(Version::HTTP_11)
+		.header(header::HOST, "lo")
+		.body(())
+		.unwrap();
+	let (response, _) = client.send_request(request, true).unwrap();
+	assert_eq!(response.await.unwrap().status(), 200);
+
+	connection.abort();
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn grpc_bidirectional_stream_half_close(#[case] retry: bool) {
+	use futures_util::StreamExt;
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let backend = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		let (stream, _) = listener.accept().await.unwrap();
+		let svc = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+			let mut trailers = HeaderMap::new();
+			trailers.insert("grpc-status", "0".parse().unwrap());
+			let body = StreamBody::new(
+				req
+					.into_body()
+					.into_stream()
+					.chain(tokio_stream::iter([Ok(Frame::trailers(trailers))])),
+			);
+			Ok::<_, Infallible>(
+				::http::Response::builder()
+					.header(header::CONTENT_TYPE, "application/grpc")
+					.body(body)
+					.unwrap(),
+			)
+		});
+		hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+			.serve_connection(TokioIo::new(stream), svc)
+			.await
+			.unwrap();
+	});
+	let mut t = setup_proxy_test("{}")
+		.unwrap()
+		.with_raw_backend(BackendWithPolicies {
+			backend: Backend::Opaque(
+				ResourceName::new(strng::format!("{}", backend), "".into()),
+				Target::Address(backend),
+			),
+			inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+				version: Some(Version::HTTP_2),
+				..Default::default()
+			})],
+		})
+		.with_bind(simple_bind())
+		.with_route(basic_route(backend));
+	if retry {
+		t.attach_route_policy(json!({"retry": {"attempts": 2, "codes": [503]}}))
+			.await;
+	}
+	let (mut client, connection) = h2::client::handshake(t.serve(BIND_KEY)).await.unwrap();
+	let connection = tokio::spawn(connection);
+	let request = ::http::Request::builder()
+		.method(Method::POST)
+		.uri("http://lo/echo.Echo/Bidi")
+		.header(header::CONTENT_TYPE, "application/grpc")
+		.body(())
+		.unwrap();
+	let (response, mut send) = client.send_request(request, false).unwrap();
+	tokio::time::timeout(Duration::from_secs(5), async {
+		let mut recv = response.await.unwrap().into_body();
+		for i in 0..3 {
+			let message = bytes::Bytes::from(vec![0, 0, 0, 0, 1, i]);
+			send.send_data(message.clone(), false).unwrap();
+			assert_eq!(recv.data().await.unwrap().unwrap(), message);
+			recv.flow_control().release_capacity(message.len()).unwrap();
+		}
+		// grpc-go's CloseSend ends the request with an empty DATA frame.
+		send.send_data(bytes::Bytes::new(), true).unwrap();
+		while let Some(data) = recv.data().await {
+			assert!(data.unwrap().is_empty());
+		}
+		assert_eq!(recv.trailers().await.unwrap().unwrap()["grpc-status"], "0");
+	})
+	.await
+	.expect("bidirectional stream must finish after the request ends");
+	connection.abort();
+	server.abort();
+}
+
+async fn grpc_trailer_backend(status: &'static str) -> std::net::SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((stream, _)) = listener.accept().await else {
+				return;
+			};
+			tokio::spawn(async move {
+				let svc = service_fn(move |_| async move {
+					let mut trailers = HeaderMap::new();
+					trailers.insert("grpc-status", status.parse().unwrap());
+					let body = StreamBody::new(tokio_stream::iter([
+						Ok::<_, Infallible>(Frame::data(bytes::Bytes::new())),
+						Ok(Frame::trailers(trailers)),
+					]));
+					Ok::<_, Infallible>(
+						::http::Response::builder()
+							.status(200)
+							.header(header::CONTENT_TYPE, "application/grpc")
+							.body(body)
+							.unwrap(),
+					)
+				});
+				let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+					.serve_connection(TokioIo::new(stream), svc)
+					.await;
+			});
+		}
+	});
+	addr
+}
+
+#[tokio::test]
+async fn grpc_status_trailer_is_available_to_access_log_cel() {
+	let backend = grpc_trailer_backend("13").await;
+	let path = format!("/grpc-{}", rand::rng().random::<u128>());
+	let t = setup_proxy_test(
+		r#"{"config":{"logging":{"fields":{"add":{"cel_grpc_status":"response.grpcStatus"}}}}}"#,
+	)
+	.unwrap()
+	.with_raw_backend(BackendWithPolicies {
+		backend: Backend::Opaque(
+			ResourceName::new(strng::format!("{}", backend), "".into()),
+			Target::Address(backend),
+		),
+		inline_policies: vec![BackendTrafficPolicy::HTTP(backend::HTTP {
+			version: Some(Version::HTTP_2),
+			..Default::default()
+		})],
+	})
+	.with_bind(simple_bind())
+	.with_route(basic_route(backend));
+	let io = t.serve_http2(strng::new("bind"));
+	let res = RequestBuilder::new(Method::POST, &format!("http://lo{path}"))
+		.version(Version::HTTP_2)
+		.header(header::CONTENT_TYPE, "application/grpc")
+		.body(Body::empty())
+		.send(io)
+		.await
+		.unwrap();
+	assert_eq!(res.status(), 200);
+	read_body_raw(res.into_body()).await;
+
+	let log =
+		agent_core::telemetry::testing::eventually_find(&[("scope", "request"), ("http.path", &path)])
+			.await
+			.unwrap();
+	assert_eq!(log["grpc.status"].as_u64(), Some(13));
+	assert_eq!(log["cel_grpc_status"].as_u64(), Some(13));
+}
+
+#[tokio::test]
+async fn basic_tcp() {
+	let mock = simple_mock().await;
+	let (_mock, _bind, io) = setup_tcp_mock(mock);
+	let res = send_request(io, Method::POST, "http://lo").await;
+	assert_eq!(res.status(), 200);
+	let body = read_body(res.into_body()).await;
+	assert_eq!(body.method, Method::POST);
+}

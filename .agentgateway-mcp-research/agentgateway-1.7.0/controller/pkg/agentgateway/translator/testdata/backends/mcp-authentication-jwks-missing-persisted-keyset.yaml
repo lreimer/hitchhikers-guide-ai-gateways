@@ -1,0 +1,56 @@
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  namespace: default
+  name: mcp-backend
+spec:
+  mcp:
+    targets:
+    - name: mcp-example
+      selector:
+        namespaces:
+          matchLabels:
+            kubernetes.io/metadata.name: mcp-servers
+  policies:
+    mcp:
+      authentication:
+        jwks:
+          jwksPath: /
+          backendRef:
+              group: ""
+              kind: Service
+              name: store-uninitialized
+              port: 8080
+---
+# Output
+output:
+- gateway:
+    Name: basic
+    Namespace: default
+  resource:
+    backend:
+      inlinePolicies:
+      - mcpAuthentication:
+          jwksInline: '{"keys":[]}'
+          mode: STRICT
+          resourceMetadata: {}
+      key: default/mcp-backend
+      mcp: {}
+      name:
+        name: mcp-backend
+        namespace: default
+status:
+- apiVersion: agentgateway.dev/v1alpha1
+  kind: AgentgatewayBackend
+  metadata:
+    name: mcp-backend
+    namespace: default
+  spec: null
+  status:
+    conditions:
+    - lastTransitionTime: fake
+      message: 'failed to translate backend: jwks keyset for "http://store-uninitialized.default.svc.cluster.local:8080/"
+        isn''t available (not yet fetched or fetch failed)'
+      reason: PartiallyValid
+      status: "True"
+      type: Accepted

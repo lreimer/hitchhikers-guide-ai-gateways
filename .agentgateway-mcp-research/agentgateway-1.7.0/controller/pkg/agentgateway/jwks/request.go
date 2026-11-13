@@ -1,0 +1,36 @@
+package jwks
+
+import (
+	"errors"
+
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
+
+	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
+)
+
+var (
+	errResolverNotInitialized = errors.New("remote http resolver hasn't been initialized")
+)
+
+func ResolveEndpoint(
+	krtctx krt.HandlerContext,
+	resolver remotehttp.Resolver,
+	parentKind OwnerKind,
+	parentName, defaultNS string,
+	remoteProvider agentgateway.RemoteJWKS,
+) (*remotehttp.ResolvedTarget, error) {
+	if resolver == nil {
+		return nil, errResolverNotInitialized
+	}
+
+	return resolver.Resolve(krtctx, remotehttp.ResolveInput{
+		ParentKind:       string(parentKind),
+		ParentName:       parentName,
+		DefaultNamespace: defaultNS,
+		BackendRef:       remoteProvider.BackendRef,
+		URL:              remoteProvider.URL,
+		Path:             ptr.OrDefault(remoteProvider.JwksPath, ""),
+	})
+}

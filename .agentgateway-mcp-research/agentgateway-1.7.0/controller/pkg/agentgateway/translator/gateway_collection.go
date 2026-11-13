@@ -1,0 +1,869 @@
+package translator
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"fmt"
+	"strings"
+
+	"google.golang.org/protobuf/proto"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
+	certificatesv1 "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/agentgateway/agentgateway/api"
+	"github.com/agentgateway/agentgateway/controller/api/annotations"
+	apisettings "github.com/agentgateway/agentgateway/controller/api/settings"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/utils"
+	"github.com/agentgateway/agentgateway/controller/pkg/logging"
+	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
+	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
+	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
+	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
+)
+
+var (
+	logger = logging.New("agentgateway/translator")
+)
+
+// ToAgwResource converts an internal representation to a resource for agentgateway
+func ToAgwResource(t any) *api.Resource {
+	switch tt := t.(type) {
+	case AgwBind:
+		return &api.Resource{Kind: &api.Resource_Bind{Bind: tt.Bind}}
+	case AgwListener:
+		return &api.Resource{Kind: &api.Resource_Listener{Listener: tt.Listener}}
+	case AgwRoute:
+		return &api.Resource{Kind: &api.Resource_Route{Route: tt.Route}}
+	case AgwTCPRoute:
+		return &api.Resource{Kind: &api.Resource_TcpRoute{TcpRoute: tt.TCPRoute}}
+	case AgwPolicy:
+		return &api.Resource{Kind: &api.Resource_Policy{Policy: tt.Policy}}
+	case *api.ModelRoute:
+		return &api.Resource{Kind: &api.Resource_ModelRoute{ModelRoute: tt}}
+	case *api.Resource:
+		return tt
+	}
+	panic(fmt.Sprintf("unknown resource kind %T", t))
+}
+
+func ToResourceForGateway(gw types.NamespacedName, resource any) ir.AgwResource {
+	return ir.AgwResource{
+		Resource: ToAgwResource(resource),
+		Gateway:  gw,
+	}
+}
+
+func ToResourceGlobal(resource any) ir.AgwResource {
+	return ir.AgwResource{
+		Resource: ToAgwResource(resource),
+	}
+}
+
+// AgwBind is a wrapper type that contains the bind on the gateway, as well as the status for the bind.
+type AgwBind struct {
+	*api.Bind
+}
+
+func (g AgwBind) ResourceName() string {
+	return g.Key
+}
+
+func (g AgwBind) Equals(other AgwBind) bool {
+	return protoconv.Equals(g, other)
+}
+
+// AgwListener is a wrapper type that contains the listener on the gateway, as well as the status for the listener.
+type AgwListener struct {
+	*api.Listener
+}
+
+func (g AgwListener) ResourceName() string {
+	return g.Key
+}
+
+func (g AgwListener) Equals(other AgwListener) bool {
+	return protoconv.Equals(g, other)
+}
+
+// AgwPolicy is a wrapper type that contains the policy on the gateway, as well as the status for the policy.
+type AgwPolicy = plugins.AgwPolicy
+
+// AgwBackend is a wrapper type that contains the backend on the gateway, as well as the status for the backend.
+type AgwBackend struct {
+	*api.Backend
+}
+
+func (g AgwBackend) ResourceName() string {
+	return g.Key
+}
+
+func (g AgwBackend) Equals(other AgwBackend) bool {
+	return protoconv.Equals(g, other)
+}
+
+// AgwRoute is a wrapper type that contains the route on the gateway, as well as the status for the route.
+type AgwRoute struct {
+	*api.Route
+}
+
+func (g AgwRoute) ResourceName() string {
+	return g.Key
+}
+
+func (g AgwRoute) Equals(other AgwRoute) bool {
+	return protoconv.Equals(g, other)
+}
+
+// AgwTCPRoute is a wrapper type that contains the tcp route on the gateway, as well as the status for the tcp route.
+type AgwTCPRoute struct {
+	*api.TCPRoute
+}
+
+func (g AgwTCPRoute) ResourceName() string {
+	return g.Key
+}
+
+func (g AgwTCPRoute) Equals(other AgwTCPRoute) bool {
+	return protoconv.Equals(g, other)
+}
+
+// TLSInfo contains the TLS certificate and key for a gateway listener.
+type TLSInfo struct {
+	Cert                []byte
+	Key                 []byte `json:"-"`
+	CaCert              []byte
+	MtlsFallbackEnabled bool
+	IstioWorkloadCert   bool
+	IstioMutual         bool
+	DynamicCA           bool
+	Spiffe              bool
+}
+
+// PortBindings is a wrapper type that contains the listener on the gateway, as well as the status for the listener.
+type PortBindings struct {
+	GatewayListener
+	Port string
+}
+
+func (g PortBindings) ResourceName() string {
+	return g.GatewayListener.Name
+}
+
+func (g PortBindings) Equals(other PortBindings) bool {
+	return g.GatewayListener.Equals(&other.GatewayListener) &&
+		g.Port == other.Port
+}
+
+// GatewayListener is a wrapper type that contains the listener on the gateway, as well as the status for the listener.
+// This allows binding to a specific listener.
+type GatewayListener struct {
+	Name string
+	// The Gateway this listener is bound to
+	ParentGateway types.NamespacedName
+	// The actual real parent (could be a ListenerSet)
+	ParentObject utils.TypedNamespacedName
+	ParentInfo   ParentInfo
+	TLSInfo      *TLSInfo
+	Filters      *gwv1.ListenerFilters
+	FilterResult ListenerFilterResult
+	Valid        bool
+	Conflict     ListenerConflict
+}
+
+func (g GatewayListener) ResourceName() string {
+	return g.Name
+}
+
+func (g *GatewayListener) Equals(other *GatewayListener) bool {
+	if (g.TLSInfo != nil) != (other.TLSInfo != nil) {
+		return false
+	}
+	if g.TLSInfo != nil {
+		if !bytes.Equal(g.TLSInfo.Cert, other.TLSInfo.Cert) ||
+			!bytes.Equal(g.TLSInfo.Key, other.TLSInfo.Key) ||
+			!bytes.Equal(g.TLSInfo.CaCert, other.TLSInfo.CaCert) ||
+			g.TLSInfo.MtlsFallbackEnabled != other.TLSInfo.MtlsFallbackEnabled ||
+			g.TLSInfo.IstioWorkloadCert != other.TLSInfo.IstioWorkloadCert ||
+			g.TLSInfo.IstioMutual != other.TLSInfo.IstioMutual ||
+			g.TLSInfo.DynamicCA != other.TLSInfo.DynamicCA ||
+			g.TLSInfo.Spiffe != other.TLSInfo.Spiffe {
+			return false
+		}
+	}
+	return g.Valid == other.Valid &&
+		g.Conflict == other.Conflict &&
+		apiequality.Semantic.DeepEqual(g.Filters, other.Filters) &&
+		g.FilterResult.Error == other.FilterResult.Error &&
+		slices.EqualFunc(g.FilterResult.Policies, other.FilterResult.Policies, func(a, b *api.TrafficPolicySpec) bool { return proto.Equal(a, b) }) &&
+		g.Name == other.Name &&
+		g.ParentGateway == other.ParentGateway &&
+		g.ParentObject == other.ParentObject &&
+		g.ParentInfo.Equals(other.ParentInfo)
+}
+
+type GatewayCollectionConfig struct {
+	ControllerName           string
+	Gateways                 krt.Collection[*gwv1.Gateway]
+	ListenerSets             krt.Collection[*ListenerSet]
+	GatewayClasses           krt.Collection[GatewayClass]
+	Namespaces               krt.Collection[*corev1.Namespace]
+	Grants                   ReferenceGrants
+	Secrets                  krt.Collection[*corev1.Secret]
+	ConfigMaps               krt.Collection[*corev1.ConfigMap]
+	ClusterTrustBundles      krt.Collection[*certificatesv1.ClusterTrustBundle]
+	References               plugins.ReferenceTypes
+	BackendRefGrantMode      apisettings.BackendRefGrantMode
+	KrtOpts                  krtutil.KrtOptions
+	EnableAgentgatewayModels bool
+
+	listenerIndex      krt.Index[types.NamespacedName, *ListenerSet]
+	transformationFunc GatewayTransformationFunction
+}
+
+// GatewayCollection returns a collection of the internal representations GatewayListeners for the given gateway.
+func GatewayCollection(
+	cfg GatewayCollectionConfig,
+	opts ...GatewayCollectionConfigOption,
+) (
+	krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus],
+	krt.Collection[*GatewayListener],
+) {
+	processGatewayCollectionOptions(&cfg, opts...)
+	statusCol, gw := krt.NewStatusManyCollection(cfg.Gateways, cfg.transformationFunc(cfg), cfg.KrtOpts.ToOptions("translator/GatewayListeners")...)
+	return statusCol, gw
+}
+
+func GatewayTransformationFunc(cfg GatewayCollectionConfig) func(ctx krt.HandlerContext, obj *gwv1.Gateway) (*gwv1.GatewayStatus, []*GatewayListener) {
+	return func(ctx krt.HandlerContext, obj *gwv1.Gateway) (*gwv1.GatewayStatus, []*GatewayListener) {
+		class := krt.FetchOne(ctx, cfg.GatewayClasses, krt.FilterKey(string(obj.Spec.GatewayClassName)))
+		if class == nil {
+			logger.Debug("gateway class not found, skipping", "gw_name", obj.GetName(), "gateway_class_name", obj.Spec.GatewayClassName)
+			return nil, nil
+		}
+		if string(class.Controller) != cfg.ControllerName {
+			logger.Debug("skipping gateway not managed by our controller", "gw_name", obj.GetName(), "gateway_class_name", obj.Spec.GatewayClassName, "controller_name", class.Controller)
+			return nil, nil // ignore gateways not managed by our controller
+		}
+		rm := reports.NewReportMap()
+		statusReporter := reports.NewReporter(&rm)
+		gwReporter := statusReporter.Gateway(obj)
+		logger.Debug("translating Gateway", "gw_name", obj.GetName(), "resource_version", obj.GetResourceVersion())
+
+		kgw := obj.Spec
+		status := obj.Status.DeepCopy()
+
+		// Extract the addresses. A gwv1 will bind to a specific Service
+		gatewayServices, err := ExtractGatewayServices(obj)
+		if len(gatewayServices) == 0 && err != nil {
+			// Short circuit if it's a hard failure
+			logger.Error("failed to translate gwv1", "name", obj.GetName(), "namespace", obj.GetNamespace(), "err", err.Message)
+			gwReporter.SetCondition(reporter.GatewayCondition{
+				Type:    gwv1.GatewayConditionAccepted,
+				Status:  metav1.ConditionFalse,
+				Reason:  gwv1.GatewayReasonInvalid,
+				Message: err.Message,
+			})
+			return rm.BuildGWStatus(context.Background(), *obj, 0), nil
+		}
+
+		listenersFromSets := krt.Fetch(ctx, cfg.ListenerSets, krt.FilterIndex(cfg.listenerIndex, config.NamespacedName(obj)))
+		result := make([]*GatewayListener, 0, len(kgw.Listeners)+len(listenersFromSets))
+
+		// Ports whose bind should be internal, from the gateway's internal-ports annotation.
+		// May only reference this gateway's own listener ports.
+		internalPorts, internalErrs := annotations.ParseInternalPorts(
+			obj.GetAnnotations()[annotations.InternalPorts],
+			func(p int32) bool {
+				for _, l := range kgw.Listeners {
+					if l.Port == p {
+						return true
+					}
+				}
+				return false
+			},
+		)
+
+		for i, l := range kgw.Listeners {
+			// Attached Routes count starts at 0 and gets updated later in the status syncer
+			// when the real count is available after route processing
+
+			hostnames, tlsInfo, filterResult, updatedStatus, programmed := BuildListener(ctx, cfg.Secrets, cfg.ConfigMaps, cfg.ClusterTrustBundles, cfg.Grants, cfg.References, cfg.BackendRefGrantMode, cfg.Namespaces, obj, status.Listeners, kgw, l, i, nil, false, cfg.EnableAgentgatewayModels)
+			status.Listeners = updatedStatus
+
+			lstatus := status.Listeners[i]
+
+			// Generate supported kinds for the listener
+			allowed, _ := GenerateSupportedKinds(l, cfg.EnableAgentgatewayModels)
+
+			// Report the listener conditions managed by this controller.
+			for _, lcond := range lstatus.Conditions {
+				switch gwv1.ListenerConditionType(lcond.Type) {
+				case gwv1.ListenerConditionAccepted, gwv1.ListenerConditionProgrammed,
+					gwv1.ListenerConditionConflicted, gwv1.ListenerConditionResolvedRefs:
+				default:
+					continue
+				}
+				gwReporter.Listener(&l).SetCondition(reporter.ListenerCondition{
+					Type:    gwv1.ListenerConditionType(lcond.Type),
+					Status:  lcond.Status,
+					Reason:  gwv1.ListenerConditionReason(lcond.Reason),
+					Message: lcond.Message,
+				})
+			}
+
+			// Set supported kinds for the listener
+			gwReporter.Listener(&l).SetSupportedKinds(allowed)
+
+			name := utils.InternalGatewayName(obj.Namespace, obj.Name, string(l.Name))
+			pri := ParentInfo{
+				ParentGateway:          config.NamespacedName(obj),
+				ParentGatewayClassName: string(obj.Spec.GatewayClassName),
+				ListenerKey:            name,
+				AllowedKinds:           allowed,
+				Hostnames:              hostnames,
+				OriginalHostname:       string(ptr.OrEmpty(l.Hostname)),
+				SectionName:            l.Name,
+				Port:                   l.Port,
+				Protocol:               l.Protocol,
+				TLSPassthrough:         l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
+				Internal:               internalPorts.Has(l.Port),
+			}
+
+			res := &GatewayListener{
+				Name:          name,
+				Valid:         programmed,
+				TLSInfo:       tlsInfo,
+				Filters:       l.Filters,
+				FilterResult:  filterResult,
+				ParentGateway: config.NamespacedName(obj),
+				ParentObject: utils.TypedNamespacedName{
+					Kind: wellknown.GatewayGVK.Kind,
+					NamespacedName: types.NamespacedName{
+						Name:      obj.Name,
+						Namespace: obj.Namespace,
+					},
+				},
+				ParentInfo: pri,
+			}
+			gwReporter.SetCondition(reporter.GatewayCondition{
+				Type:   gwv1.GatewayConditionAccepted,
+				Status: metav1.ConditionTrue,
+				Reason: gwv1.GatewayReasonAccepted,
+			})
+			result = append(result, res)
+		}
+		if len(internalErrs) > 0 {
+			gwReporter.SetCondition(reporter.GatewayCondition{
+				Type:    gwv1.GatewayConditionAccepted,
+				Status:  metav1.ConditionFalse,
+				Reason:  gwv1.GatewayReasonInvalid,
+				Message: "invalid " + annotations.InternalPorts + " annotation: " + strings.Join(internalErrs, "; "),
+			})
+		}
+		// Sort by listener precedence
+		// Ref: https://gateway-api.sigs.k8s.io/geps/gep-1713/#listener-precedence
+		// - ListenerSet ordered by creation time (oldest first)
+		// - ListenerSet ordered alphabetically by “{namespace}/{name}”
+		slices.SortFunc(listenersFromSets, func(a, b *ListenerSet) int {
+			// primary sort: creation timestamp (oldest first)
+			if r := a.ParentInfo.CreationTimestamp.Compare(b.ParentInfo.CreationTimestamp.Time); r != 0 {
+				return r
+			}
+			// secondary sort: alphabetically by "{namespace}/{name}"
+			if r := cmp.Compare(a.ParentObject.Namespace, b.ParentObject.Namespace); r != 0 {
+				return r
+			}
+			if r := cmp.Compare(a.ParentObject.Name, b.ParentObject.Name); r != 0 {
+				return r
+			}
+			return cmp.Compare(a.ListenerIndex, b.ListenerIndex)
+		})
+
+		for _, ls := range listenersFromSets {
+			result = append(result, &ls.GatewayListener)
+		}
+		validateListenerConflicts(result)
+		for i, listener := range result[:len(kgw.Listeners)] {
+			var reason gwv1.ListenerConditionReason
+			var message string
+			switch listener.Conflict {
+			case ListenerConflictHostname:
+				reason = gwv1.ListenerReasonHostnameConflict
+				message = "Found conflicting hostnames on listeners, all listeners on a single port must have unique hostnames"
+			case ListenerConflictProtocol:
+				reason = gwv1.ListenerReasonProtocolConflict
+				message = "Found conflicting protocols on listeners, a single port can only contain listeners with compatible protocols"
+			default:
+				continue
+			}
+			listenerReporter := gwReporter.Listener(&kgw.Listeners[i])
+			for _, condition := range []reporter.ListenerCondition{
+				{Type: gwv1.ListenerConditionConflicted, Status: metav1.ConditionTrue},
+				{Type: gwv1.ListenerConditionAccepted, Status: metav1.ConditionFalse},
+				{Type: gwv1.ListenerConditionProgrammed, Status: metav1.ConditionFalse},
+			} {
+				condition.Reason = reason
+				condition.Message = message
+				listenerReporter.SetCondition(condition)
+			}
+		}
+		// Precedence sorting groups listeners from each ListenerSet together. Count
+		// a parent once when its first valid, non-conflicting listener is encountered.
+		var attachedListenerSets int32
+		var lastParent utils.TypedNamespacedName
+		for _, ls := range result {
+			if !(ls.Valid && ls.Conflict == "" && ls.ParentObject.Kind == wellknown.ListenerSetGVK.Kind) {
+				continue
+			}
+			if ls.ParentObject != lastParent {
+				attachedListenerSets++
+				lastParent = ls.ParentObject
+			}
+		}
+		gws := rm.BuildGWStatus(context.Background(), *obj, attachedListenerSets)
+		return gws, result
+	}
+}
+
+// portProtocol is the state accumulated for one port from the listeners accepted on it so far.
+type portProtocol struct {
+	// hostnames are the keys already claimed on this port; a later listener claiming any of
+	// them conflicts. Keys are bare listener hostnames, independent of allowed route namespaces:
+	//   - SNI ports (HTTPS/TLS): the bare listener hostname, e.g. "foo.example.com" or "*".
+	//     The listener is chosen from the TLS ClientHello, which carries no namespace, so two
+	//     listeners with the same hostname are indistinguishable regardless of allowedRoutes.
+	//   - Other ports: also the bare listener hostname, not the
+	//     "<allowed route namespace>/<hostname>" entries from buildHostnameMatch.
+	//     allowedRoutes controls route attachment, not which listener receives traffic.
+	hostnames sets.String
+	// protocol is the protocol of the first listener accepted on this port.
+	protocol gwv1.ProtocolType
+	// internal is the bind mode of the first listener accepted on this port.
+	internal bool
+}
+
+type ListenerConflict string
+
+const (
+	ListenerConflictHostname = "hostname"
+	ListenerConflictProtocol = "protocol"
+	ListenerConflictBindMode = "bind-mode"
+)
+
+// usesSNI reports whether listeners of this protocol are selected by SNI. HTTPS and TLS
+// listeners both produce a TLS bind, where the dataplane picks the listener from the SNI and
+// then serves it as HTTP (HTTPS) or TCP (TLS), so the two may share a port.
+func usesSNI(p gwv1.ProtocolType) bool {
+	return p == gwv1.HTTPSProtocolType || p == gwv1.TLSProtocolType
+}
+
+// validateListenerConflicts marks each listener that cannot share its port with the listeners
+// before it. listeners must be sorted by Gateway API precedence: the first listener on a port
+// fixes the port's bind mode and protocol, and earlier listeners win hostname conflicts.
+// A conflicted listener claims nothing, so it never causes later listeners to conflict.
+//
+// For a listener on a port that already has accepted listeners, checks run in order:
+//  1. Bind mode differs (internal vs standard)             -> ListenerConflictBindMode
+//  2. Protocol differs, unless both are HTTPS/TLS           -> ListenerConflictProtocol
+//  3. Hostname already claimed (see portProtocol.hostnames) -> ListenerConflictHostname
+func validateListenerConflicts(listeners []*GatewayListener) {
+	// Count how many hostname keys each port will hold so each set is allocated once at its
+	// final size: one bare hostname per listener, regardless of protocol or allowed namespaces.
+	hostnameCounts := make(map[gwv1.PortNumber]int)
+	for _, listener := range listeners {
+		hostnameCounts[listener.ParentInfo.Port]++
+	}
+	portMap := make(map[gwv1.PortNumber]*portProtocol)
+	for i, listener := range listeners {
+		pi := &listener.ParentInfo
+		// The served hostname key. A listener without a hostname matches any host (any SNI
+		// on HTTPS/TLS ports), so it claims "*".
+		hostname := pi.OriginalHostname
+		if hostname == "" {
+			hostname = "*"
+		}
+		var conflict ListenerConflict
+		if p, ok := portMap[pi.Port]; ok {
+			// The port already has an accepted listener; check this one against it.
+			if p.internal != pi.Internal {
+				// Listeners are ordered by Gateway API precedence before validation.
+				// Preserve the winning bind mode and reject only the later listener.
+				conflict = ListenerConflictBindMode
+			} else if p.protocol != pi.Protocol && !(usesSNI(pi.Protocol) && usesSNI(p.protocol)) {
+				// Different protocols cannot share a bind, except HTTPS with TLS.
+				conflict = ListenerConflictProtocol
+			} else if p.hostnames.Contains(hostname) {
+				// Hostnames must be unique across the port, regardless of namespace.
+				conflict = ListenerConflictHostname
+			} else {
+				p.hostnames.Insert(hostname)
+			}
+		} else {
+			// The first listener on a port is always accepted and fixes the port's protocol
+			// and bind mode for every later listener.
+			hostnames := sets.NewWithLength[string](hostnameCounts[pi.Port])
+			hostnames.Insert(hostname)
+			portMap[pi.Port] = &portProtocol{
+				hostnames: hostnames,
+				protocol:  pi.Protocol,
+				internal:  pi.Internal,
+			}
+		}
+		if conflict != listener.Conflict {
+			// Candidates belong to the ListenerSet collection. Copy only the
+			// conflict field's containing value so subsequent reconciliations
+			// start from the original candidate and can recover from conflicts.
+			cloned := *listener
+			cloned.Conflict = conflict
+			listeners[i] = &cloned //nolint:gosec // G602: i comes from ranging over listeners, whose length is unchanged.
+		}
+	}
+}
+
+// ListenerSet owns a prebuilt, immutable listener candidate. Embedding the value
+// keeps both in one allocation; Gateway aggregation shares its address.
+type ListenerSet struct {
+	GatewayListener
+	ListenerIndex int `json:"listenerIndex"`
+}
+
+func (g *ListenerSet) ResourceName() string {
+	return g.Name
+}
+
+func (g *ListenerSet) Equals(other *ListenerSet) bool {
+	return g.ListenerIndex == other.ListenerIndex && g.GatewayListener.Equals(&other.GatewayListener)
+}
+
+func ListenerSetBuilder(
+	ctx krt.HandlerContext, obj *gwv1.ListenerSet,
+	controllerName string,
+	gateways krt.Collection[*gwv1.Gateway],
+	gatewayClasses krt.Collection[GatewayClass],
+	namespaces krt.Collection[*corev1.Namespace],
+	grants ReferenceGrants,
+	secrets krt.Collection[*corev1.Secret],
+	configMaps krt.Collection[*corev1.ConfigMap],
+	clusterTrustBundles krt.Collection[*certificatesv1.ClusterTrustBundle],
+	references plugins.ReferenceTypes,
+	backendRefGrantMode apisettings.BackendRefGrantMode,
+	enableAgentgatewayModels bool,
+) (*gwv1.ListenerSetStatus, []*ListenerSet) {
+	result := []*ListenerSet{}
+	ls := obj.Spec
+	status := obj.Status.DeepCopy()
+
+	p := ls.ParentRef
+	if NormalizeReference(p.Group, p.Kind, wellknown.GatewayGVK.GroupKind()) != wellknown.GatewayGVK.GroupKind() {
+		// Cannot report status since we don't know if it is for us
+		return nil, nil
+	}
+
+	pns := ptr.OrDefault(p.Namespace, gwv1.Namespace(obj.Namespace))
+	// ListenerSet translation depends on the parent Gateway's spec, name, and namespace.
+	parentGwObj := krtutil.FetchOneSpec(ctx, gateways,
+		func(gw *gwv1.Gateway) gwv1.GatewaySpec { return gw.Spec },
+		krt.FilterKey(string(pns)+"/"+string(p.Name)),
+	)
+	if parentGwObj == nil {
+		// Cannot report status since we don't know if it is for us
+		return nil, nil
+	}
+	class := krt.FetchOne(ctx, gatewayClasses, krt.FilterKey(string(parentGwObj.Spec.GatewayClassName)))
+	if class == nil {
+		logger.Debug("gateway class not found, skipping", "gw_name", obj.GetName(), "gateway_class_name", parentGwObj.Spec.GatewayClassName)
+		return nil, nil
+	}
+	if string(class.Controller) != controllerName {
+		logger.Debug("skipping gateway not managed by our controller", "gw_name", obj.GetName(), "gateway_class_name", parentGwObj.Spec.GatewayClassName, "controller_name", class.Controller)
+		return nil, nil // ignore gateways not managed by our controller
+	}
+
+	if !AllowedListenersAcceptNamespace(parentGwObj.Spec.AllowedListeners, obj.Namespace, parentGwObj.Namespace, func(s string) *corev1.Namespace {
+		return ptr.Flatten(krt.FetchOne(ctx, namespaces, krt.FilterKey(s)))
+	}) {
+		reportNotAllowedListenerSet(status, obj)
+		return status, nil
+	}
+
+	// Ports whose bind should be internal, from the ListenerSet's internal-ports
+	// annotation. May only reference this ListenerSet's own listener ports.
+	internalPorts, internalErrs := annotations.ParseInternalPorts(
+		obj.GetAnnotations()[annotations.InternalPorts],
+		func(p int32) bool {
+			for _, l := range ls.Listeners {
+				if port, err := kubeutils.DetectListenerPortNumber(l.Protocol, l.Port); err == nil && port == p {
+					return true
+				}
+			}
+			return false
+		},
+	)
+
+	for i, l := range ls.Listeners {
+		port, portErr := kubeutils.DetectListenerPortNumber(l.Protocol, l.Port)
+		l.Port = port
+		standardListener := convertListenerSetToListener(l)
+		originalStatus := slices.Map(status.Listeners, convertListenerSetStatusToStandardStatus)
+		hostnames, tlsInfo, filterResult, updatedStatus, programmed := BuildListener(ctx, secrets, configMaps, clusterTrustBundles, grants, references, backendRefGrantMode, namespaces,
+			obj, originalStatus, parentGwObj.Spec, standardListener, i, portErr, true, enableAgentgatewayModels)
+		status.Listeners = slices.Map(updatedStatus, convertStandardStatusToListenerSetStatus)
+
+		if controllerName == constants.ManagedGatewayMeshController || controllerName == constants.ManagedGatewayEastWestController {
+			// Waypoint doesn't actually convert the routes to VirtualServices
+			continue
+		}
+		name := utils.InternalGatewayName(obj.Namespace, obj.Name, string(l.Name))
+
+		allowed, _ := GenerateSupportedKinds(standardListener, enableAgentgatewayModels)
+		pri := ParentInfo{
+			ParentGateway:     parentGwObj.NamespacedName,
+			ListenerKey:       name,
+			AllowedKinds:      allowed,
+			Hostnames:         hostnames,
+			OriginalHostname:  string(ptr.OrEmpty(l.Hostname)),
+			SectionName:       l.Name,
+			Port:              l.Port,
+			Protocol:          l.Protocol,
+			TLSPassthrough:    l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
+			Internal:          internalPorts.Has(l.Port),
+			CreationTimestamp: obj.CreationTimestamp,
+		}
+
+		res := &ListenerSet{
+			Name:          name,
+			Valid:         programmed,
+			TLSInfo:       tlsInfo,
+			Filters:       l.Filters,
+			FilterResult:  filterResult,
+			ParentObject:  utils.TypedNamespacedName{Kind: wellknown.ListenerSetGVK.Kind, NamespacedName: config.NamespacedName(obj)},
+			ParentGateway: parentGwObj.NamespacedName,
+			ParentInfo:    pri,
+			ListenerIndex: i,
+		}
+		result = append(result, res)
+	}
+
+	if len(internalErrs) > 0 {
+		status.Conditions = SetConditions(obj.Generation, status.Conditions, map[string]*Condition{
+			string(gwv1.GatewayConditionAccepted): {
+				Reason:  string(gwv1.GatewayReasonInvalid),
+				Status:  metav1.ConditionFalse,
+				Message: "invalid " + annotations.InternalPorts + " annotation: " + strings.Join(internalErrs, "; "),
+			},
+		})
+	}
+
+	reportListenerSetStatus(obj, status)
+	return status, result
+}
+
+func reportNotAllowedListenerSet(status *gwv1.ListenerSetStatus, obj *gwv1.ListenerSet) {
+	notAllowedMessage := "Gateway does not allow ListenerSet attachment"
+	gatewayConditions := map[string]*Condition{
+		string(gwv1.GatewayConditionAccepted): {
+			Reason:  string(gwv1.ListenerSetReasonNotAllowed),
+			Status:  metav1.ConditionFalse,
+			Message: notAllowedMessage,
+		},
+		string(gwv1.GatewayConditionProgrammed): {
+			Reason:  string(gwv1.ListenerSetReasonNotAllowed),
+			Status:  metav1.ConditionFalse,
+			Message: notAllowedMessage,
+		},
+	}
+
+	status.Conditions = SetConditions(obj.Generation, status.Conditions, gatewayConditions)
+}
+
+type ParentResolver = plugins.ParentResolver
+
+// RouteParents holds information about things Routes can reference as parents.
+type RouteParents struct {
+	Parents     krt.Collection[*RouteParent]
+	ParentIndex krt.Index[utils.TypedNamespacedName, *RouteParent]
+}
+
+// RouteParent is the subset of a GatewayListener that routes depend on. Routes fetch this rather
+// than the GatewayListener, so listener changes routes do not read (such as TLS certificates) do
+// not recompute every attached route.
+type RouteParent struct {
+	Name         string
+	ParentObject utils.TypedNamespacedName
+	ParentInfo
+}
+
+func (p *RouteParent) ResourceName() string {
+	return p.Name
+}
+
+func (p *RouteParent) Equals(other *RouteParent) bool {
+	return p.Name == other.Name && p.ParentObject == other.ParentObject && p.ParentInfo.Equals(other.ParentInfo)
+}
+
+// Fetch returns the parents for a given parent key.
+func (p RouteParents) ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+	return slices.Map(krt.Fetch(ctx, p.Parents, krt.FilterIndex(p.ParentIndex, pk)), func(rp *RouteParent) *ParentInfo {
+		return &rp.ParentInfo
+	})
+}
+
+// CompositeParentResolver combines multiple ParentResolvers, concatenating
+// results from each. This allows plugins to contribute additional parent
+// resolution logic alongside the default Gateway-based resolution.
+type CompositeParentResolver struct {
+	Resolvers []ParentResolver
+}
+
+func (c *CompositeParentResolver) ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+	var result []*ParentInfo
+	for _, r := range c.Resolvers {
+		result = append(result, r.ParentsFor(ctx, pk)...)
+	}
+	return result
+}
+
+// BuildRouteParents builds a RouteParents from a collection of gateways.
+func BuildRouteParents(
+	gateways krt.Collection[*GatewayListener],
+	krtopts krtutil.KrtOptions,
+) RouteParents {
+	parents := krt.MapCollection(gateways, func(gw *GatewayListener) *RouteParent {
+		return &RouteParent{Name: gw.Name, ParentObject: gw.ParentObject, ParentInfo: gw.ParentInfo}
+	}, append(krtopts.ToOptions("translator/RouteParents"), krt.WithMapDiscardEqual())...)
+	idx := krt.NewIndex(parents, "Parent", func(o *RouteParent) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.ParentObject}
+	})
+	return RouteParents{
+		Parents:     parents,
+		ParentIndex: idx,
+	}
+}
+
+// AllowedListenersAcceptNamespace takes the policy as an argument rather than reading
+// spec.allowedListeners, so callers can supply one for Gateways whose CRD predates the field.
+func AllowedListenersAcceptNamespace(
+	lr *gwv1.AllowedListeners,
+	localNamespace string,
+	parentNamespace string,
+	lookupNamespace func(string) *corev1.Namespace,
+) bool {
+	// Default allows none
+	if lr == nil || lr.Namespaces == nil {
+		return false
+	}
+	n := *lr.Namespaces
+	if n.From != nil {
+		switch *n.From {
+		case gwv1.NamespacesFromAll:
+			return true
+		case gwv1.NamespacesFromSame:
+			return localNamespace == parentNamespace
+		case gwv1.NamespacesFromNone:
+			return false
+		case gwv1.NamespacesFromSelector:
+			// handled below
+		default:
+			// Unknown?
+			return false
+		}
+	}
+	if lr.Namespaces.Selector == nil {
+		// Should never happen, invalid config
+		return false
+	}
+	ls, err := metav1.LabelSelectorAsSelector(lr.Namespaces.Selector)
+	if err != nil {
+		return false
+	}
+	localNamespaceObject := lookupNamespace(localNamespace)
+	if localNamespaceObject == nil {
+		// Couldn't find the namespace
+		return false
+	}
+	return ls.Matches(toNamespaceSet(localNamespaceObject.Name, localNamespaceObject.Labels))
+}
+
+func convertListenerSetToListener(l gwv1.ListenerEntry) gwv1.Listener {
+	// For now, structs are identical enough Go can cast them. I doubt this will hold up forever, but we can adjust as needed.
+	return gwv1.Listener(l)
+}
+
+func convertStandardStatusToListenerSetStatus(e gwv1.ListenerStatus) gwv1.ListenerEntryStatus {
+	return gwv1.ListenerEntryStatus{
+		Name:           e.Name,
+		SupportedKinds: e.SupportedKinds,
+		AttachedRoutes: e.AttachedRoutes,
+		Conditions:     e.Conditions,
+	}
+}
+
+func convertListenerSetStatusToStandardStatus(e gwv1.ListenerEntryStatus) gwv1.ListenerStatus {
+	return gwv1.ListenerStatus{
+		Name:           e.Name,
+		SupportedKinds: e.SupportedKinds,
+		AttachedRoutes: e.AttachedRoutes,
+		Conditions:     e.Conditions,
+	}
+}
+
+func reportListenerSetStatus(
+	obj *gwv1.ListenerSet,
+	gs *gwv1.ListenerSetStatus,
+) {
+	//internal, _, _, _, warnings, allUsable := r.ResolveGatewayInstances(parentGwObj.Namespace, gatewayServices, servers)
+
+	// Setup initial conditions to the success state. If we encounter errors, we will update this.
+	// We have two status
+	// Accepted: is the configuration valid. We only have errors in listeners, and the status is not supposed to
+	// be tied to listeners, so this is always accepted
+	// Programmed: is the data plane "ready" (note: eventually consistent)
+	gatewayConditions := map[string]*Condition{
+		string(gwv1.GatewayConditionAccepted): {
+			Reason:  string(gwv1.GatewayReasonAccepted),
+			Message: "Resource accepted",
+		},
+		string(gwv1.GatewayConditionProgrammed): {
+			Reason:  string(gwv1.GatewayReasonProgrammed),
+			Message: "Resource programmed",
+		},
+	}
+
+	invalidListeners := []string{}
+	for _, l := range gs.Listeners {
+		for _, cond := range l.Conditions {
+			if cond.Type == string(gwv1.ListenerConditionAccepted) && cond.Status == metav1.ConditionFalse {
+				invalidListeners = append(invalidListeners, string(l.Name))
+			}
+		}
+	}
+	if len(invalidListeners) > 0 {
+		gatewayConditions[string(gwv1.ListenerSetConditionAccepted)].Error = &ConfigError{
+			Reason:  ConfigErrorReason(gwv1.ListenerSetReasonListenersNotValid),
+			Message: "Some listeners are not accepted: " + strings.Join(invalidListeners, ", "),
+		}
+		gatewayConditions[string(gwv1.ListenerSetConditionProgrammed)].Error = &ConfigError{
+			Reason:  ConfigErrorReason(gwv1.ListenerSetReasonListenersNotValid),
+			Message: "Some listeners are not accepted: " + strings.Join(invalidListeners, ", "),
+		}
+	}
+	// TODO: valid ones
+	//setProgrammedCondition(gatewayConditions, internal, gatewayServices, warnings, allUsable)
+
+	gs.Conditions = SetConditions(obj.Generation, gs.Conditions, gatewayConditions)
+}

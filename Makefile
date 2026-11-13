@@ -1,11 +1,12 @@
 BIFROST_NAMESPACE ?= bifrost-demo
 KRAKEND_NAMESPACE ?= krakend-demo
-AGENTGATEWAY_NAMESPACE ?= agentgateway-demo
+AGENTGATEWAY_NAMESPACE ?= $(if $(NAMESPACE),$(NAMESPACE),agentgateway-demo)
 ENVOY_AI_GATEWAY_NAMESPACE ?= envoy-ai-gateway-demo
 ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 ENVOY_AI_GATEWAY_SYSTEM_NAMESPACE ?= envoy-ai-gateway-system
 
 .PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall
+.PHONY: agentgateway-mcp-install agentgateway-mcp-demo agentgateway-mcp-uninstall
 
 help:
 	@printf '%s\n' \
@@ -21,6 +22,9 @@ help:
 	  'agentgateway-port-forward Forward the agentgateway service to localhost:8080' \
 	  'agentgateway-demo     Exercise agentgateway authentication, limits, and revocation' \
 	  'agentgateway-uninstall Remove the agentgateway demo resources' \
+	  'agentgateway-mcp-install Install the MCP federation add-on (base demo required)' \
+	  'agentgateway-mcp-demo  Assert JWT authentication, tool access, and per-user limits' \
+	  'agentgateway-mcp-uninstall Remove only MCP add-on resources' \
 	  'envoy-ai-gateway-install      Install the Agent Router (formerly Envoy AI Gateway) demo' \
 	  'envoy-ai-gateway-port-forward Forward the generated Gateway to localhost:8080' \
 	  'envoy-ai-gateway-demo         Run the authenticated token-limit walkthrough' \
@@ -31,6 +35,7 @@ validate:
 	@for script in scripts/*.sh; do bash -n "$$script" || exit $$?; done
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
+	@python3 -c 'import ast, pathlib; [ast.parse(p.read_text(encoding="utf-8"), filename=str(p)) for p in pathlib.Path("gateways/agentgateway/mcp").glob("*.py")]'
 
 bifrost-install:
 	@BIFROST_NAMESPACE="$(BIFROST_NAMESPACE)" ./scripts/install-bifrost.sh
@@ -81,10 +86,19 @@ agentgateway-install:
 	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-agentgateway.sh
 
 agentgateway-port-forward:
-	kubectl port-forward -n "$(AGENTGATEWAY_NAMESPACE)" svc/agentgateway-proxy 8080:80
+	kubectl port-forward --address 127.0.0.1 -n "$(AGENTGATEWAY_NAMESPACE)" svc/agentgateway-proxy 8080:80
 
 agentgateway-demo:
 	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/demo-agentgateway.sh
 
 agentgateway-uninstall:
 	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/uninstall-agentgateway.sh
+
+agentgateway-mcp-install:
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-agentgateway-mcp.sh
+
+agentgateway-mcp-demo:
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/demo-agentgateway-mcp.sh
+
+agentgateway-mcp-uninstall:
+	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/uninstall-agentgateway-mcp.sh

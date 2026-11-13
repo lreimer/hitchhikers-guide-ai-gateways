@@ -1,0 +1,8 @@
+target
+.idea
+.vscode
+.DS_Store
+manifests
+examples
+**/node_modules
+ui/dist

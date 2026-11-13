@@ -1,0 +1,481 @@
+package syncer
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"istio.io/istio/pkg/kube/kclient"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	inf "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwxv1a1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
+
+	"github.com/agentgateway/agentgateway/controller/pkg/reports"
+	syncstatus "github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
+)
+
+func TestMergePolicyAncestorStatuses_SortsOurEntriesOnly(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "kgateway.dev/kgateway"
+
+	existing := []gwv1.PolicyAncestorStatus{
+		{ControllerName: gwv1.GatewayController(other), AncestorRef: gwv1.ParentReference{Name: "b"}},
+		{ControllerName: gwv1.GatewayController(other), AncestorRef: gwv1.ParentReference{Name: "a"}},
+	}
+	desired := []gwv1.PolicyAncestorStatus{
+		{ControllerName: gwv1.GatewayController(our), AncestorRef: gwv1.ParentReference{Name: "z"}},
+		{ControllerName: gwv1.GatewayController(our), AncestorRef: gwv1.ParentReference{Name: "m"}},
+	}
+
+	out := mergePolicyAncestorStatuses(our, existing, desired)
+	require.Len(t, out, 4)
+
+	// Other-controller entries preserved (including order).
+	require.Equal(t, string(out[0].ControllerName), other)
+	require.Equal(t, string(out[1].ControllerName), other)
+	require.Equal(t, string(out[0].AncestorRef.Name), "b")
+	require.Equal(t, string(out[1].AncestorRef.Name), "a")
+
+	// Our entries appended, but sorted deterministically.
+	require.Equal(t, string(out[2].ControllerName), our)
+	require.Equal(t, string(out[3].ControllerName), our)
+	require.Equal(t, string(out[2].AncestorRef.Name), "m")
+	require.Equal(t, string(out[3].AncestorRef.Name), "z")
+}
+
+func TestMergePolicyAncestorStatuses_ReplacesOurEntriesInPlace(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "kgateway.dev/kgateway"
+	ancestor := func(controller, name, message string) gwv1.PolicyAncestorStatus {
+		return gwv1.PolicyAncestorStatus{
+			ControllerName: gwv1.GatewayController(controller),
+			AncestorRef:    gwv1.ParentReference{Name: gwv1.ObjectName(name)},
+			Conditions:     []metav1.Condition{{Type: "Attached", Message: message}},
+		}
+	}
+
+	existing := []gwv1.PolicyAncestorStatus{
+		ancestor(our, "z", "old"),
+		ancestor(other, "a", "theirs"),
+		ancestor(our, "m", "old"),
+		ancestor(our, "stale", "old"),
+	}
+	desired := []gwv1.PolicyAncestorStatus{
+		ancestor(our, "new", "new"),
+		ancestor(our, "m", "new"),
+		ancestor(our, "z", "new"),
+	}
+
+	out := mergePolicyAncestorStatuses(our, existing, desired)
+	require.Equal(t, []gwv1.PolicyAncestorStatus{
+		ancestor(our, "z", "new"),
+		ancestor(other, "a", "theirs"),
+		ancestor(our, "m", "new"),
+		ancestor(our, "new", "new"),
+	}, out)
+}
+
+// Two controllers sharing a policy must settle on one order, otherwise each write triggers the other.
+func TestMergePolicyAncestorStatuses_TwoControllersConverge(t *testing.T) {
+	a := "agentgateway.dev/a"
+	b := "agentgateway.dev/b"
+	entry := func(controller string) gwv1.PolicyAncestorStatus {
+		return gwv1.PolicyAncestorStatus{
+			ControllerName: gwv1.GatewayController(controller),
+			AncestorRef:    gwv1.ParentReference{Name: "gw"},
+		}
+	}
+
+	live := mergePolicyAncestorStatuses(a, nil, []gwv1.PolicyAncestorStatus{entry(a)})
+	live = mergePolicyAncestorStatuses(b, live, []gwv1.PolicyAncestorStatus{entry(b)})
+	require.Equal(t, []gwv1.PolicyAncestorStatus{entry(a), entry(b)}, live)
+
+	for range 3 {
+		require.Equal(t, live, mergePolicyAncestorStatuses(a, live, []gwv1.PolicyAncestorStatus{entry(a)}))
+		require.Equal(t, live, mergePolicyAncestorStatuses(b, live, []gwv1.PolicyAncestorStatus{entry(b)}))
+	}
+}
+
+func TestMergeRouteParentStatuses_ReplacesOurEntriesInPlace(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "kgateway.dev/kgateway"
+	parent := func(controller, name string) gwv1.RouteParentStatus {
+		return gwv1.RouteParentStatus{
+			ControllerName: gwv1.GatewayController(controller),
+			ParentRef:      gwv1.ParentReference{Name: gwv1.ObjectName(name)},
+		}
+	}
+
+	out := mergeRouteParentStatuses(our,
+		[]gwv1.RouteParentStatus{parent(our, "z"), parent(other, "a"), parent(our, "stale")},
+		[]gwv1.RouteParentStatus{parent(our, "z"), parent(our, "m")},
+	)
+	require.Equal(t, []gwv1.RouteParentStatus{parent(our, "z"), parent(other, "a"), parent(our, "m")}, out)
+}
+
+func TestMergeRouteParentStatuses_SortsOurEntriesOnly(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "kgateway.dev/kgateway"
+
+	existing := []gwv1.RouteParentStatus{
+		{ControllerName: gwv1.GatewayController(other), ParentRef: gwv1.ParentReference{Name: "b"}},
+		{ControllerName: gwv1.GatewayController(other), ParentRef: gwv1.ParentReference{Name: "a"}},
+	}
+	desired := []gwv1.RouteParentStatus{
+		{ControllerName: gwv1.GatewayController(our), ParentRef: gwv1.ParentReference{Name: "z"}},
+		{ControllerName: gwv1.GatewayController(our), ParentRef: gwv1.ParentReference{Name: "m"}},
+	}
+
+	out := mergeRouteParentStatuses(our, existing, desired)
+	require.Len(t, out, 4)
+
+	// Other-controller entries preserved (including order).
+	require.Equal(t, string(out[0].ControllerName), other)
+	require.Equal(t, string(out[1].ControllerName), other)
+	require.Equal(t, string(out[0].ParentRef.Name), "b")
+	require.Equal(t, string(out[1].ParentRef.Name), "a")
+
+	// Our entries appended, but sorted deterministically.
+	require.Equal(t, string(out[2].ControllerName), our)
+	require.Equal(t, string(out[3].ControllerName), our)
+	require.Equal(t, string(out[2].ParentRef.Name), "m")
+	require.Equal(t, string(out[3].ParentRef.Name), "z")
+}
+
+func TestMergeInferencePoolParentStatuses_ClearsOurEntries(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	existing := []inf.ParentStatus{
+		{ControllerName: "", ParentRef: inf.ParentReference{Name: "istio"}},
+		{ControllerName: inf.ControllerName(our), ParentRef: inf.ParentReference{Name: "stale"}},
+	}
+
+	out := mergeInferencePoolParentStatuses(our, existing, nil)
+	require.Equal(t, existing[:1], out)
+}
+
+func TestStatusSyncerApplyStatus_MergesInferencePoolParents(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "kgateway.dev/kgateway"
+	current := &inf.InferencePool{
+		Name:            "pool",
+		Namespace:       "default",
+		ResourceVersion: "2",
+		Status: inf.InferencePoolStatus{Parents: []inf.ParentStatus{
+			{
+				ControllerName: "",
+				ParentRef:      inf.ParentReference{Name: "istio"},
+				Conditions:     []metav1.Condition{{Type: "Accepted", Message: "current istio status"}},
+			},
+			{
+				ControllerName: inf.ControllerName(other),
+				ParentRef:      inf.ParentReference{Name: "other"},
+				Conditions:     []metav1.Condition{{Type: "Accepted", Message: "current other status"}},
+			},
+			{ControllerName: inf.ControllerName(our), ParentRef: inf.ParentReference{Name: "stale"}},
+		}},
+	}
+	desired := inf.InferencePoolStatus{Parents: []inf.ParentStatus{
+		{
+			ControllerName: "",
+			ParentRef:      inf.ParentReference{Name: "istio"},
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale istio status"}},
+		},
+		{
+			ControllerName: inf.ControllerName(other),
+			ParentRef:      inf.ParentReference{Name: "other"},
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale other status"}},
+		},
+		{ControllerName: "deleted.example/controller", ParentRef: inf.ParentReference{Name: "deleted"}},
+		{ControllerName: inf.ControllerName(our), ParentRef: inf.ParentReference{Name: "z"}},
+		{ControllerName: inf.ControllerName(our), ParentRef: inf.ParentReference{Name: "m"}},
+	}}
+	client := &inferencePoolStatusClient{current: current}
+	syncer := StatusSyncer[*inf.InferencePool, inf.InferencePoolStatus]{
+		Name:           "inferencePool",
+		ControllerName: our,
+		Client:         client,
+		Build: func(om metav1.ObjectMeta, status inf.InferencePoolStatus) *inf.InferencePool {
+			return &inf.InferencePool{ObjectMeta: om, Status: status}
+		},
+	}
+	statusAny := any(desired)
+
+	syncer.ApplyStatus(context.Background(), syncstatus.Resource{
+		Name: current.Name, Namespace: current.Namespace,
+	}, &statusAny)
+
+	require.NotNil(t, client.updated)
+	require.Equal(t, current.ResourceVersion, client.updated.ResourceVersion)
+	require.Equal(t, []inf.ParentStatus{
+		current.Status.Parents[0],
+		current.Status.Parents[1],
+		desired.Parents[4],
+		desired.Parents[3],
+	}, client.updated.Status.Parents)
+}
+
+type inferencePoolStatusClient struct {
+	kclient.Client[*inf.InferencePool]
+	current *inf.InferencePool
+	updated *inf.InferencePool
+}
+
+func (c *inferencePoolStatusClient) Get(_, _ string) *inf.InferencePool {
+	return c.current.DeepCopy()
+}
+
+func (c *inferencePoolStatusClient) UpdateStatusNoResponse(pool *inf.InferencePool) error {
+	c.updated = pool.DeepCopy()
+	return nil
+}
+
+func TestMergeXBackendAncestorStatuses_SortsOurEntriesOnly(t *testing.T) {
+	our := "agentgateway.dev/agentgateway"
+	other := "other.example/controller"
+	existing := []gwxv1a1.BackendAncestorStatus{
+		{ControllerName: gwv1.GatewayController(other), AncestorRef: gwv1.ParentReference{Name: "b"}},
+		{ControllerName: gwv1.GatewayController(other), AncestorRef: gwv1.ParentReference{Name: "a"}},
+	}
+	desired := []gwxv1a1.BackendAncestorStatus{
+		{ControllerName: gwv1.GatewayController(our), AncestorRef: gwv1.ParentReference{Name: "z"}},
+		{ControllerName: gwv1.GatewayController(our), AncestorRef: gwv1.ParentReference{Name: "m"}},
+	}
+
+	out := mergeXBackendAncestorStatuses(our, existing, desired)
+	require.Len(t, out, 4)
+	require.Equal(t, "b", string(out[0].AncestorRef.Name))
+	require.Equal(t, "a", string(out[1].AncestorRef.Name))
+	require.Equal(t, "m", string(out[2].AncestorRef.Name))
+	require.Equal(t, "z", string(out[3].AncestorRef.Name))
+}
+
+func TestMergeGatewayAddresses_SortsOutput(t *testing.T) {
+	// When desired is empty, we keep existing but still sort it for stability.
+	existing := []gwv1.GatewayStatusAddress{
+		{Value: "2.2.2.2"}, // Type nil => IPAddress
+		{Value: "1.1.1.1"},
+	}
+	out := mergeGatewayAddresses(existing, nil)
+	require.Len(t, out, 2)
+	require.Equal(t, "1.1.1.1", out[0].Value)
+	require.Equal(t, "2.2.2.2", out[1].Value)
+
+	// When desired is non-empty, it wins, but is sorted.
+	hostname := gwv1.AddressType("Hostname")
+	desired := []gwv1.GatewayStatusAddress{
+		{Type: &hostname, Value: "b.example.com"},
+		{Type: &hostname, Value: "a.example.com"},
+	}
+	out2 := mergeGatewayAddresses(existing, desired)
+	require.Len(t, out2, 2)
+	require.Equal(t, "a.example.com", out2[0].Value)
+	require.Equal(t, "b.example.com", out2[1].Value)
+}
+
+func TestMergeGatewayStatus_ArbitratesAcceptedInvalidParameters(t *testing.T) {
+	tests := []struct {
+		name                     string
+		existing                 gwv1.GatewayStatus
+		desired                  gwv1.GatewayStatus
+		wantAcceptedStatus       metav1.ConditionStatus
+		wantAcceptedReason       string
+		wantProgrammedStatus     metav1.ConditionStatus
+		wantProgrammedReason     string
+		wantProgrammedGeneration int64
+	}{
+		{
+			name: "desired default success does not overwrite live invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 1),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionTrue, gwv1.GatewayReasonAccepted, 1),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 1),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionFalse,
+			wantProgrammedReason:     string(gwv1.GatewayReasonInvalid),
+			wantProgrammedGeneration: 1,
+		},
+		{
+			name: "newer desired default success clears stale invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 1),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionTrue, gwv1.GatewayReasonAccepted, 2),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 2),
+			}},
+			wantAcceptedStatus:       metav1.ConditionTrue,
+			wantAcceptedReason:       string(gwv1.GatewayReasonAccepted),
+			wantProgrammedStatus:     metav1.ConditionTrue,
+			wantProgrammedReason:     string(gwv1.GatewayReasonProgrammed),
+			wantProgrammedGeneration: 2,
+		},
+		{
+			name: "desired missing accepted does not clear live invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 2),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 2),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionFalse,
+			wantProgrammedReason:     string(gwv1.GatewayReasonInvalid),
+			wantProgrammedGeneration: 2,
+		},
+		{
+			name: "desired specific programmed negative is preserved with live invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 3),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionTrue, gwv1.GatewayReasonAccepted, 3),
+				gatewayProgrammedCondition(metav1.ConditionFalse, gwv1.GatewayReasonAddressNotUsable, 3),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionFalse,
+			wantProgrammedReason:     string(gwv1.GatewayReasonAddressNotUsable),
+			wantProgrammedGeneration: 3,
+		},
+		{
+			name: "same generation invalid parameters does not overwrite live success",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionTrue, gwv1.GatewayReasonAccepted, 4),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 4),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 4),
+			}},
+			wantAcceptedStatus:       metav1.ConditionTrue,
+			wantAcceptedReason:       string(gwv1.GatewayReasonAccepted),
+			wantProgrammedStatus:     metav1.ConditionTrue,
+			wantProgrammedReason:     string(gwv1.GatewayReasonProgrammed),
+			wantProgrammedGeneration: 4,
+		},
+		{
+			name: "newer invalid parameters overwrites live success",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionTrue, gwv1.GatewayReasonAccepted, 5),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 6),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 6),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionTrue,
+			wantProgrammedReason:     string(gwv1.GatewayReasonProgrammed),
+			wantProgrammedGeneration: 6,
+		},
+		{
+			name: "same generation invalid parameters overwrites unsupported address",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonUnsupportedAddress, 7),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 7),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 7),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionTrue,
+			wantProgrammedReason:     string(gwv1.GatewayReasonProgrammed),
+			wantProgrammedGeneration: 7,
+		},
+		{
+			name: "same generation unsupported address does not overwrite live invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 8),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonUnsupportedAddress, 8),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 8),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonInvalidParameters),
+			wantProgrammedStatus:     metav1.ConditionFalse,
+			wantProgrammedReason:     string(gwv1.GatewayReasonInvalid),
+			wantProgrammedGeneration: 8,
+		},
+		{
+			name: "newer unsupported address overwrites live invalid parameters",
+			existing: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonInvalidParameters, 9),
+			}},
+			desired: gwv1.GatewayStatus{Conditions: []metav1.Condition{
+				gatewayAcceptedCondition(metav1.ConditionFalse, gwv1.GatewayReasonUnsupportedAddress, 10),
+				gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 10),
+			}},
+			wantAcceptedStatus:       metav1.ConditionFalse,
+			wantAcceptedReason:       string(gwv1.GatewayReasonUnsupportedAddress),
+			wantProgrammedStatus:     metav1.ConditionTrue,
+			wantProgrammedReason:     string(gwv1.GatewayReasonProgrammed),
+			wantProgrammedGeneration: 10,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			merged := mergeGatewayStatus(testCase.existing, testCase.desired)
+			accepted := meta.FindStatusCondition(merged.Conditions, string(gwv1.GatewayConditionAccepted))
+			require.NotNil(t, accepted)
+			require.Equal(t, testCase.wantAcceptedStatus, accepted.Status)
+			require.Equal(t, testCase.wantAcceptedReason, accepted.Reason)
+
+			programmed := meta.FindStatusCondition(merged.Conditions, string(gwv1.GatewayConditionProgrammed))
+			require.NotNil(t, programmed)
+			require.Equal(t, testCase.wantProgrammedStatus, programmed.Status)
+			require.Equal(t, testCase.wantProgrammedReason, programmed.Reason)
+			require.Equal(t, testCase.wantProgrammedGeneration, programmed.ObservedGeneration)
+		})
+	}
+}
+
+func TestMergeGatewayStatus_PreservesDeploymentFailure(t *testing.T) {
+	existing := gwv1.GatewayStatus{Conditions: []metav1.Condition{
+		gatewayProgrammedCondition(metav1.ConditionFalse, reports.GatewayReasonDeploymentFailed, 1),
+	}}
+
+	merged := mergeGatewayStatus(existing, gwv1.GatewayStatus{Conditions: []metav1.Condition{
+		gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 1),
+	}})
+	programmed := meta.FindStatusCondition(merged.Conditions, string(gwv1.GatewayConditionProgrammed))
+	require.NotNil(t, programmed)
+	require.Equal(t, metav1.ConditionFalse, programmed.Status)
+	require.Equal(t, string(reports.GatewayReasonDeploymentFailed), programmed.Reason)
+
+	merged = mergeGatewayStatus(existing, gwv1.GatewayStatus{Conditions: []metav1.Condition{
+		gatewayProgrammedCondition(metav1.ConditionTrue, gwv1.GatewayReasonProgrammed, 2),
+	}})
+	programmed = meta.FindStatusCondition(merged.Conditions, string(gwv1.GatewayConditionProgrammed))
+	require.NotNil(t, programmed)
+	require.Equal(t, metav1.ConditionTrue, programmed.Status)
+	require.Equal(t, int64(2), programmed.ObservedGeneration)
+}
+
+func gatewayAcceptedCondition(status metav1.ConditionStatus, reason gwv1.GatewayConditionReason, generation int64) metav1.Condition {
+	return metav1.Condition{
+		Type:               string(gwv1.GatewayConditionAccepted),
+		Status:             status,
+		ObservedGeneration: generation,
+		Reason:             string(reason),
+		Message:            "accepted message",
+	}
+}
+
+func gatewayProgrammedCondition(status metav1.ConditionStatus, reason gwv1.GatewayConditionReason, generation int64) metav1.Condition {
+	return metav1.Condition{
+		Type:               string(gwv1.GatewayConditionProgrammed),
+		Status:             status,
+		ObservedGeneration: generation,
+		Reason:             string(reason),
+		Message:            "programmed message",
+	}
+}

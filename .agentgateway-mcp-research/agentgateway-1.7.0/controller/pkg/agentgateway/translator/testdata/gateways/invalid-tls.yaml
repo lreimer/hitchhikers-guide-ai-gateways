@@ -1,0 +1,214 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: test-gateway
+  namespace: default
+spec:
+  gatewayClassName: agentgateway
+  allowedListeners:
+    namespaces:
+      from: All
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: api.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: missing
+            kind: Secret
+---
+# An invalid TLS winner still reserves its hostname. A distinct catch-all can
+# coexist, but must not take over the winner's more-specific hostname.
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: fallback
+  namespace: default
+spec:
+  parentRef:
+    name: test-gateway
+  listeners:
+  - name: duplicate
+    port: 443
+    protocol: HTTPS
+    hostname: api.example.com
+    tls:
+      certificateRefs:
+      - name: missing
+  - name: catch-all
+    port: 443
+    protocol: HTTPS
+    tls:
+      certificateRefs:
+      - name: missing
+---
+# Output
+output:
+- gateway:
+    Name: test-gateway
+    Namespace: default
+  resource:
+    bind:
+      key: 443/default/test-gateway
+      port: 443
+      protocol: TLS
+- gateway:
+    Name: test-gateway
+    Namespace: default
+  resource:
+    listener:
+      bindKey: 443/default/test-gateway
+      key: default/fallback.catch-all
+      name:
+        gatewayName: test-gateway
+        gatewayNamespace: default
+        listenerName: catch-all
+        listenerSet:
+          name: fallback
+          namespace: default
+      protocol: HTTPS
+      tls:
+        cert: aW52YWxpZA==
+        privateKey: aW52YWxpZA==
+- gateway:
+    Name: test-gateway
+    Namespace: default
+  resource:
+    listener:
+      bindKey: 443/default/test-gateway
+      hostname: api.example.com
+      key: default/test-gateway.https
+      name:
+        gatewayName: test-gateway
+        gatewayNamespace: default
+        listenerName: https
+      protocol: HTTPS
+      tls:
+        cert: aW52YWxpZA==
+        privateKey: aW52YWxpZA==
+status:
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: ListenerSet
+  metadata:
+    name: fallback
+    namespace: default
+  spec: null
+  status:
+    conditions:
+    - lastTransitionTime: fake
+      message: ""
+      reason: ListenersNotValid
+      status: "False"
+      type: Accepted
+    - lastTransitionTime: fake
+      message: ""
+      reason: ListenersNotValid
+      status: "False"
+      type: Programmed
+    listeners:
+    - attachedRoutes: 0
+      conditions:
+      - lastTransitionTime: fake
+        message: invalid certificate reference //missing., secret not found
+        reason: ListenersNotValid
+        status: "False"
+        type: Accepted
+      - lastTransitionTime: fake
+        message: No errors found
+        reason: NoConflicts
+        status: "False"
+        type: Conflicted
+      - lastTransitionTime: fake
+        message: Bad TLS configuration
+        reason: Invalid
+        status: "False"
+        type: Programmed
+      - lastTransitionTime: fake
+        message: invalid certificate reference //missing., secret not found
+        reason: InvalidCertificateRef
+        status: "False"
+        type: ResolvedRefs
+      name: duplicate
+      supportedKinds:
+      - group: gateway.networking.k8s.io
+        kind: HTTPRoute
+      - group: gateway.networking.k8s.io
+        kind: GRPCRoute
+    - attachedRoutes: 0
+      conditions:
+      - lastTransitionTime: fake
+        message: invalid certificate reference //missing., secret not found
+        reason: ListenersNotValid
+        status: "False"
+        type: Accepted
+      - lastTransitionTime: fake
+        message: No errors found
+        reason: NoConflicts
+        status: "False"
+        type: Conflicted
+      - lastTransitionTime: fake
+        message: Bad TLS configuration
+        reason: Invalid
+        status: "False"
+        type: Programmed
+      - lastTransitionTime: fake
+        message: invalid certificate reference //missing., secret not found
+        reason: InvalidCertificateRef
+        status: "False"
+        type: ResolvedRefs
+      name: catch-all
+      supportedKinds:
+      - group: gateway.networking.k8s.io
+        kind: HTTPRoute
+      - group: gateway.networking.k8s.io
+        kind: GRPCRoute
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    name: test-gateway
+    namespace: default
+  spec: null
+  status:
+    attachedListenerSets: 0
+    conditions:
+    - lastTransitionTime: fake
+      message: 'Some listeners are not accepted: https: Bad TLS configuration'
+      reason: ListenersNotValid
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: fake
+      message: Successfully programmed Gateway
+      reason: Programmed
+      status: "True"
+      type: Programmed
+    listeners:
+    - attachedRoutes: 0
+      conditions:
+      - lastTransitionTime: fake
+        message: No errors found
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: fake
+        message: No errors found
+        reason: NoConflicts
+        status: "False"
+        type: Conflicted
+      - lastTransitionTime: fake
+        message: Bad TLS configuration
+        reason: Invalid
+        status: "False"
+        type: Programmed
+      - lastTransitionTime: fake
+        message: invalid certificate reference /Secret/missing., secret not found
+        reason: InvalidCertificateRef
+        status: "False"
+        type: ResolvedRefs
+      name: https
+      supportedKinds:
+      - group: gateway.networking.k8s.io
+        kind: HTTPRoute
+      - group: gateway.networking.k8s.io
+        kind: GRPCRoute

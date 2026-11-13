@@ -1,0 +1,51 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: route-secure-gw
+  namespace: agentgateway-base
+spec:
+  parentRefs:
+  - name: gateway
+  hostnames:
+  - "securegateways.com"
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 80
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: gw-policy
+  namespace: agentgateway-base
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway
+  traffic:
+    apiKeyAuthentication:
+      mode: Strict
+      configMapSelector:
+        matchLabels:
+          app: gw-apikey-auth
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gw-apikey-auth
+  namespace: agentgateway-base
+  labels:
+    app: gw-apikey-auth
+data:
+  client1: |
+    {
+      "keyHash": "sha256:3605a9e4358da4302f8acea41f0f52cef85d0e3f727c7b020fc7305aec8d56b4",
+      "metadata": {
+        "group": "sales"
+      }
+    }
+  client2: |
+    {
+      "keyHash": "sha256:efe96124b410574ffd343d0c9f342ce51d5aee47046ca355f85a50e23db3c37c"
+    }
