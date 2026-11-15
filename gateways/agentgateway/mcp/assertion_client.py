@@ -170,20 +170,23 @@ def quota_error(error: BaseException) -> bool:
 async def direct_denial(url: str, bearer: str, *, routing_header_file: Path | None = None) -> None:
     attempted = False
     call_returned = False
+    failures: list[BaseException] = []
     try:
         async with connect(url, bearer, routing_header_file=routing_header_file) as (bob, _):
             attempted = True
-            await bob.call_tool(INTERNAL, {"product_id": "star-widget"})
-            call_returned = True
+            try:
+                await bob.call_tool(INTERNAL, {"product_id": "star-widget"})
+            except (McpError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
+                failures.extend(leaves(error))
+            else:
+                call_returned = True
     except (McpError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
-        failures = list(leaves(error))
-        check(
-            attempted and not call_returned and bool(failures)
-            and all(authorization_error(item) for item in failures),
-            "Bob direct call: expected v1.7.0 authorization denial (-32602, unknown resource)",
-        )
-    else:
-        raise AssertionError("Bob direct call was not denied by gateway authorization")
+        failures.extend(leaves(error))
+    check(
+        attempted and not call_returned and bool(failures)
+        and all(authorization_error(item) for item in failures),
+        "Bob direct call: expected v1.7.0 authorization denial (-32602, unknown resource)",
+    )
     print("PASS Bob direct call: authorization denial (-32602, unknown resource)")
 
 

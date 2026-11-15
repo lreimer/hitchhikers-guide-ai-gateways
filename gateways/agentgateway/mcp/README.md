@@ -22,28 +22,30 @@ SDK assertion client / optional MCP Inspector
 | Component | Pinned version |
 | --- | --- |
 | agentgateway controller, proxy, CRD chart | `v1.7.0` (reuse the base installation) |
-| Gateway API | Base demo's compatible standard bundle; local attempt used `1.6.3` |
+| Gateway API | Base demo's compatible standard bundle; validated with `1.6.1` |
 | Backend Python image | `3.12.12-slim-bookworm`, digest pinned in `Dockerfile` |
 | Official MCP Python SDK | `1.28.1` |
-| MCP protocol in direct backend SDK/container checks | `2025-11-25` (gateway negotiation pending) |
+| MCP protocol in direct backend and gateway SDK checks | `2025-11-25` |
 | Python dependencies | Exact versions and hashes in `requirements.txt` |
 | Optional MCP Inspector | `2.15.0` (not runtime-tested here) |
 
-**End-to-end validation is pending.** On 2026-11-13, Kind `0.33.0`
-successfully created a disposable Kubernetes `1.35.0` cluster, but base
-installation failed resolving `cr.agentgateway.dev` while fetching the official
-`agentgateway-crds:v1.7.0` chart. Consequently no claim is made that the gateway
-walkthrough, alternate-namespace rerun, or before/after LLM regressions passed.
-The release-specific schema and assertion expectations must be confirmed by
-the runtime procedure below before calling this demo fully validated.
-The assertion client prints the actual negotiated MCP protocol version; do not
-infer it from the SDK version or assume every transport uses a session ID.
+**End-to-end validation passed on 2026-11-15** on a local Kubernetes
+`v1.36.5+k3s1` cluster with the official agentgateway `v1.7.0` charts and
+Gateway API `v1.6.1`. The MCP install and walkthrough passed in both the default
+and an alternate namespace, including staged-route checks, JWT validation,
+federated tool results, per-user authorization, throttling, quota propagation,
+and recovery. The base LLM demo passed before and after the MCP walkthrough in
+mock mode. No provider credentials or real inference requests were used.
 
-The implementation agent passed focused backend/client/JWT unit checks,
-built the shared image, and exercised both read-only, capability-dropped
-containers using the official SDK. Direct `/mcp` negotiation, `/readyz`,
-deterministic outputs, invalid numeric inputs, and unknown products passed.
-These checks do not prove gateway authentication, federation, or policy behavior.
+The gateway negotiated MCP protocol `2025-11-25`, matching the direct backend
+SDK checks. The SDK logs session-termination warnings for HTTP `202` responses,
+but the bounded assertions and walkthroughs completed successfully. The earlier
+2026-11-13 Kind attempt failed resolving the official chart registry; that
+environmental failure is superseded by this successful runtime validation.
+
+The 51 focused Python tests passed, and the final local CodeQL Python
+security-and-quality scan reported no findings. The optional MCP Inspector
+remains untested.
 
 Installation stages the MCP route without exposing the fixture tools, checks
 authentication through a temporary localhost-only proxy port-forward, and only

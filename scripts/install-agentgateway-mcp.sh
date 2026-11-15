@@ -81,6 +81,9 @@ done
 installation_complete=false
 route_changed=false
 forward_pid=""
+forward_dir=""
+forward_fifo=""
+forward_fd_open=false
 local_port=""
 detach_route() {
   agentgateway_mcp_check_ownership httproute agentgateway-mcp "$namespace" || return 1
@@ -105,6 +108,15 @@ cleanup() {
     kill "$forward_pid" 2>/dev/null || true
     wait "$forward_pid" 2>/dev/null || true
   fi
+  if [[ "$forward_fd_open" == true ]]; then
+    exec 3<&-
+  fi
+  if [[ -n "$forward_fifo" ]]; then
+    rm -f "$forward_fifo"
+  fi
+  if [[ -n "$forward_dir" ]]; then
+    rmdir "$forward_dir" 2>/dev/null || true
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -112,18 +124,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Keep readiness local and avoid on-disk logs or bearer credentials.
-coproc MCP_FORWARD {
-  exec kubectl port-forward -n "$namespace" --address 127.0.0.1 \
-    service/agentgateway-proxy :80 2>&1
-}
-forward_pid="${MCP_FORWARD_PID:-}"
-forward_fd="${MCP_FORWARD[0]:-}"
-if [[ -z "$forward_pid" || -z "$forward_fd" ]]; then
-  printf 'The private MCP readiness port-forward could not be started.\n' >&2
-  exit 1
-fi
+forward_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentgateway-mcp-forward.XXXXXX")"
+forward_fifo="$forward_dir/output"
+mkfifo "$forward_fifo"
+kubectl port-forward -n "$namespace" --address 127.0.0.1 \
+  service/agentgateway-proxy :80 >"$forward_fifo" 2>&1 &
+forward_pid=$!
+exec 3<"$forward_fifo"
+forward_fd_open=true
 for ((attempt = 0; attempt < 30; attempt++)); do
-  if IFS= read -r -t 2 -u "$forward_fd" line; then
+  if IFS= read -r -t 2 -u 3 line; then
     if [[ "$line" =~ ^Forwarding\ from\ 127\.0\.0\.1:([0-9]+) ]]; then
       local_port="${BASH_REMATCH[1]}"
       break
