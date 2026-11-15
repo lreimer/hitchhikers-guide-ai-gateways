@@ -226,6 +226,16 @@ class JwtTests(unittest.TestCase):
 
 
 class ClientCliTests(unittest.TestCase):
+    def test_cli_defaults_to_auth_phase(self):
+        from unittest.mock import AsyncMock
+
+        assertions = AsyncMock()
+        argv = ["assertion_client.py", "--token-directory", "/explicit-external-keys"]
+        with patch.object(sys, "argv", argv), patch.object(assertion_client, "assertions", assertions):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(assertion_client.main(), 0)
+        self.assertEqual(assertions.await_args.args[0].phase, "auth")
+
     def test_rate_phase_accepts_token_dir_alias_and_burst_twelve(self):
         from unittest.mock import AsyncMock
 

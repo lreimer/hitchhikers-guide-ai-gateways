@@ -417,7 +417,7 @@ def main() -> int:
     parser.add_argument("--routing-header-file", type=Path)
     parser.add_argument(
         "--phase", choices=("detached", "staged", "ready", "auth", "rate", "quota", "all"),
-        default="all",
+        default="auth",
     )
     parser.add_argument("--expected-rate-limit")
     parser.add_argument("--rate-capacity", type=int, default=30)

@@ -43,7 +43,7 @@ but the bounded assertions and walkthroughs completed successfully. The earlier
 2026-11-13 Kind attempt failed resolving the official chart registry; that
 environmental failure is superseded by this successful runtime validation.
 
-The 51 focused Python tests passed, and the final local CodeQL Python
+The 52 focused Python tests passed, and the final local CodeQL Python
 security-and-quality scan reported no findings. The optional MCP Inspector
 remains untested.
 
@@ -181,8 +181,9 @@ python gateways/agentgateway/mcp/assertion_client.py \
   --token-directory "$AGENTGATEWAY_MCP_KEY_DIR" --phase auth
 ```
 
-The direct command checks authentication and tool access. Use the Make wrapper
-for the isolated throttling phase and policy restoration.
+The direct client defaults to authentication and tool-access checks. Use the
+Make wrapper for throttling; it temporarily configures the rate policy and
+restores the installed settings.
 
 Use `NAMESPACE=mcp-alternate` consistently for base install, add-on install,
 port-forward, both walkthroughs, and removal. `AGENTGATEWAY_NAMESPACE` remains
