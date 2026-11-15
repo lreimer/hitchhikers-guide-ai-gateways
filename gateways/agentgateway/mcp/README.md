@@ -185,10 +185,11 @@ The direct client defaults to authentication and tool-access checks. Use the
 Make wrapper for throttling; it temporarily configures the rate policy and
 restores the installed settings.
 
-Use `NAMESPACE=mcp-alternate` consistently for base install, add-on install,
-port-forward, both walkthroughs, and removal. `AGENTGATEWAY_NAMESPACE` remains
-supported and takes precedence. Targets select only labeled Services in the
-backend's namespace; no cross-namespace route attachment is introduced.
+Use `AGENTGATEWAY_NAMESPACE=mcp-alternate` consistently for base install, add-on
+install, port-forward, both walkthroughs, and removal. `NAMESPACE` remains
+available as a compatibility alias when `AGENTGATEWAY_NAMESPACE` is unset.
+Targets select only labeled Services in the backend's namespace; no
+cross-namespace route attachment is introduced.
 
 ## Policies, limits, and repeatability
 
