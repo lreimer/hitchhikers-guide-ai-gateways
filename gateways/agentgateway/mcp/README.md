@@ -33,9 +33,21 @@ SDK assertion client / optional MCP Inspector
 The SDK v2 server supports the `2026-07-28` protocol and earlier revisions. The
 in-memory tests exercise the current protocol. The gateway assertion client
 uses the SDK v2 `ClientSession` legacy `initialize` handshake, which negotiates
-`2025-11-25` for compatibility with the pinned agentgateway `v1.7.0` release.
-That network integration is the compatibility gate; results must be recorded
-before claiming the gateway walkthrough works with SDK v2.
+`2025-11-25`, the protocol revision used for the pinned agentgateway `v1.7.0`
+integration.
+
+**Compatibility gate status (2026-11-16): blocked before integration.** The
+SDK v2 backend image built and its hash-locked dependencies installed
+successfully. Installing the pinned base demo failed while fetching the
+`agentgateway-crds` chart because this environment could not resolve
+`cr.agentgateway.dev`. The Gateway API CRDs were installed, but the
+agentgateway CRDs and controller were not; no live request Host, `/mcp`,
+`/readyz`, or authentication, authorization, and rate-limit behavior was
+verified. This is blocked verification, not evidence of compatibility or
+incompatibility. Keep the controller pinned to `v1.7.0` and rerun the
+compatibility gate from a network-enabled environment before claiming the
+end-to-end walkthrough works with SDK v2; do not upgrade the gateway as a
+workaround.
 
 Installation stages the MCP route without exposing the fixture tools, checks
 authentication through a temporary localhost-only proxy port-forward, and only
