@@ -14,97 +14,152 @@ import uuid
 MCP_DIR = Path(__file__).resolve().parents[1] / "gateways" / "agentgateway" / "mcp"
 sys.path.insert(0, str(MCP_DIR))
 
-import httpx
+import httpx2 as httpx
 import jwt
-from mcp import ClientSession, McpError, types
+from mcp import Client, ClientSession, MCPError, types
 from mcp.client.streamable_http import streamable_http_client
-from mcp.server.fastmcp.exceptions import ToolError
 
 import assertion_client
 import calculator
 import catalog
+import common
 import jwt_tool
 
 
 class CalculatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_exact_results(self):
-        for name, arguments, expected in (
-            ("add", {"a": 2, "b": 3}, {"result": 5.0}),
-            ("multiply", {"a": 6, "b": 7}, {"result": 42.0}),
-            ("add", {"a": -2.5, "b": 1}, {"result": -1.5}),
-        ):
-            with self.subTest(name=name, arguments=arguments):
-                _, structured = await calculator.mcp.call_tool(name, arguments)
-                self.assertEqual(structured, expected)
+        async with Client(calculator.mcp) as client:
+            for name, arguments, expected in (
+                ("add", {"a": 2, "b": 3}, {"result": 5.0}),
+                ("multiply", {"a": 6, "b": 7}, {"result": 42.0}),
+                ("add", {"a": -2.5, "b": 1}, {"result": -1.5}),
+            ):
+                with self.subTest(name=name, arguments=arguments):
+                    result = await client.call_tool(name, arguments)
+                    self.assertFalse(result.is_error)
+                    self.assertEqual(result.structured_content, expected)
 
     async def test_rejects_bool_string_nonfinite_and_overflow(self):
-        for value in (True, False, "2", None, float("nan"), float("inf"), -float("inf"), 10**400):
-            for argument in ("a", "b"):
-                with self.subTest(value=repr(value), argument=argument):
-                    args = {"a": 2, "b": 3, argument: value}
-                    with self.assertRaisesRegex(ToolError, "finite number"):
-                        await calculator.mcp.call_tool("add", args)
-        for name in ("add", "multiply"):
-            with self.subTest(name=name), self.assertRaisesRegex(ToolError, "finite number"):
-                await calculator.mcp.call_tool(name, {"a": 1e308, "b": 1e308})
+        async with Client(calculator.mcp) as client:
+            for value in (True, False, "2", None, float("nan"), float("inf"), -float("inf"), 10**400):
+                for argument in ("a", "b"):
+                    with self.subTest(value=repr(value), argument=argument):
+                        args = {"a": 2, "b": 3, argument: value}
+                        result = await client.call_tool("add", args)
+                        self.assertTrue(result.is_error)
+                        self.assertIn("finite number", result.content[0].text)
+            for name in ("add", "multiply"):
+                with self.subTest(name=name):
+                    result = await client.call_tool(name, {"a": 1e308, "b": 1e308})
+                    self.assertTrue(result.is_error)
+                    self.assertIn("finite number", result.content[0].text)
 
     async def test_missing_input_is_not_fabricated(self):
-        with self.assertRaisesRegex(ToolError, "Field required"):
-            await calculator.mcp.call_tool("add", {"a": 2})
+        async with Client(calculator.mcp) as client:
+            result = await client.call_tool("add", {"a": 2})
+        self.assertTrue(result.is_error)
+        self.assertIn("Field required", result.content[0].text)
 
 
 class CatalogTests(unittest.IsolatedAsyncioTestCase):
     async def test_public_result_has_no_internal_note(self):
-        _, result = await catalog.mcp.call_tool("lookup_product", {"product_id": "star-widget"})
-        self.assertEqual(result, assertion_client.PRODUCT)
-        self.assertNotIn("internal_note", result)
+        async with Client(catalog.mcp) as client:
+            result = await client.call_tool("lookup_product", {"product_id": "star-widget"})
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content, assertion_client.PRODUCT)
+        self.assertNotIn("internal_note", result.structured_content)
 
     async def test_synthetic_internal_result(self):
-        _, result = await catalog.mcp.call_tool("lookup_internal_note", {"product_id": "star-widget"})
-        self.assertEqual(result, assertion_client.NOTE)
+        async with Client(catalog.mcp) as client:
+            result = await client.call_tool("lookup_internal_note", {"product_id": "star-widget"})
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content, assertion_client.NOTE)
 
     async def test_unknown_products_are_clear_tool_errors(self):
-        for name in ("lookup_product", "lookup_internal_note"):
-            with self.subTest(name=name), self.assertRaisesRegex(ToolError, "Unknown product: missing"):
-                await catalog.mcp.call_tool(name, {"product_id": "missing"})
+        async with Client(catalog.mcp) as client:
+            for name in ("lookup_product", "lookup_internal_note"):
+                with self.subTest(name=name):
+                    result = await client.call_tool(name, {"product_id": "missing"})
+                    self.assertTrue(result.is_error)
+                    self.assertIn("Unknown product: missing", result.content[0].text)
 
     async def test_second_bundled_product(self):
-        _, result = await catalog.mcp.call_tool("lookup_product", {"product_id": "moon-gadget"})
-        self.assertEqual(result, {"product_id": "moon-gadget", "name": "Moon Gadget", "price": 24.0})
+        async with Client(catalog.mcp) as client:
+            result = await client.call_tool("lookup_product", {"product_id": "moon-gadget"})
+        self.assertFalse(result.is_error)
+        self.assertEqual(
+            result.structured_content,
+            {"product_id": "moon-gadget", "name": "Moon Gadget", "price": 24.0},
+        )
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_in_cluster_hosts_are_scoped_to_service_and_namespace(self):
+        import os
+
+        with patch.dict(os.environ, {"POD_NAMESPACE": "mcp-alternate"}):
+            self.assertEqual(
+                common.allowed_hosts("calculator"),
+                [
+                    "127.0.0.1:*",
+                    "agentgateway-mcp-calculator:8000",
+                    "agentgateway-mcp-calculator.mcp-alternate.svc.cluster.local:8000",
+                ],
+            )
+
+    async def test_status_probe_advertises_streamable_http_responses(self):
+        from starlette.applications import Starlette
+        from starlette.responses import Response
+        from starlette.routing import Route
+
+        async def initialize(request):
+            accept = request.headers.get("accept", "")
+            if "application/json" not in accept or "text/event-stream" not in accept:
+                return Response(status_code=406)
+            return Response(status_code=200)
+
+        app = Starlette(routes=[Route("/mcp", initialize, methods=["POST"])])
+        client_class = httpx.AsyncClient
+
+        def client_factory(**kwargs):
+            return client_class(transport=httpx.ASGITransport(app=app), **kwargs)
+
+        with patch.object(assertion_client.httpx, "AsyncClient", side_effect=client_factory):
+            status = await assertion_client.initialize_status("http://localhost/mcp", None)
+        self.assertEqual(status, 200)
+
     async def test_official_sdk_streamable_http_and_readiness(self):
         for backend, expected in (
             (calculator, {"add", "multiply"}),
             (catalog, {"lookup_product", "lookup_internal_note"}),
         ):
             with self.subTest(backend=backend.__name__):
-                app = backend.mcp.streamable_http_app()
+                app = backend.app(backend.mcp)
                 async with app.router.lifespan_context(app):
                     async with httpx.AsyncClient(
-                        transport=httpx.ASGITransport(app=app), base_url="http://backend"
+                        transport=httpx.ASGITransport(app=app),
+                        base_url="http://localhost:8000",
                     ) as client:
                         response = await client.get("/readyz")
                         self.assertEqual(response.status_code, 200)
                         self.assertEqual(response.json(), {"status": "ready"})
                         async with streamable_http_client(
-                            "http://backend/mcp", http_client=client
-                        ) as (read, write, get_id):
+                            "http://localhost:8000/mcp",
+                            http_client=client,
+                        ) as (read, write):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()
-                                self.assertIsNone(get_id())
                                 tools = (await session.list_tools()).tools
                                 self.assertEqual({tool.name for tool in tools}, expected)
                                 if backend is calculator:
                                     good = await session.call_tool("add", {"a": 2, "b": 3})
                                     self.assertEqual(assertion_client.result_value(good), {"result": 5.0})
                                     bad = await session.call_tool("add", {"a": True, "b": 3})
-                                    self.assertTrue(bad.isError)
+                                    self.assertTrue(bad.is_error)
                                     self.assertIn("finite number", bad.content[0].text)
                                 else:
                                     bad = await session.call_tool("lookup_product", {"product_id": "missing"})
-                                    self.assertTrue(bad.isError)
+                                    self.assertTrue(bad.is_error)
                                     self.assertIn("Unknown product: missing", bad.content[0].text)
 
 
@@ -299,13 +354,13 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
         session = AsyncMock()
         session.call_tool.return_value = types.CallToolResult(
-            isError=False, content=[types.TextContent(type="text", text="synthetic internal note")]
+            is_error=False, content=[types.TextContent(type="text", text="synthetic internal note")]
         )
 
         @asynccontextmanager
         async def connection(url, bearer, **kwargs):
             yield session, "2025-11-25"
-            raise McpError(types.ErrorData(code=-32602, message="unknown resource"))
+            raise MCPError(code=-32602, message="unknown resource")
 
         with patch.object(assertion_client, "connect", connection):
             with self.assertRaisesRegex(AssertionError, "expected v1.7.0 authorization denial"):
@@ -345,14 +400,8 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detachment_rejects_generic_transport_failure(self):
         from argparse import Namespace
-        from contextlib import asynccontextmanager
-
-        @asynccontextmanager
-        async def connection(url, bearer, **kwargs):
-            raise ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
-            yield
-
-        with patch.object(assertion_client, "connect", connection):
+        error = ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
+        with patch.object(assertion_client, "initialize_status", side_effect=error):
             with self.assertRaisesRegex(AssertionError, "unrelated"):
                 await assertion_client.detached_assertions(Namespace(url="http://localhost/mcp"))
 
@@ -372,14 +421,14 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def gate(request, call_next):
             if request.method == "POST":
-                message = types.JSONRPCMessage.model_validate_json(await request.body()).root
-                if isinstance(message, types.JSONRPCRequest) and message.method == "initialize":
-                    initializations.append(message.id)
+                message = json.loads(await request.body())
+                if message.get("method") == "initialize":
+                    initializations.append(message["id"])
                     if len(initializations) == 1:
                         return Response(status_code=503)
             return await call_next(request)
 
-        app = backend.streamable_http_app()
+        app = calculator.app(backend)
         app.add_middleware(BaseHTTPMiddleware, dispatch=gate)
         client_class = httpx.AsyncClient
 
@@ -395,28 +444,20 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
                 await assertion_client.ready_assertions(
                     Namespace(token_directory=MCP_DIR, url="http://localhost/mcp")
                 )
-        self.assertEqual(len(initializations), 2)
+        self.assertEqual(len(initializations), 3)
 
     async def test_ready_generic_transport_failure_is_not_retried(self):
         from argparse import Namespace
-        from contextlib import asynccontextmanager
-
-        attempts = []
-
-        @asynccontextmanager
-        async def connection(url, bearer, **kwargs):
-            attempts.append(bearer)
-            raise ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
-            yield
+        error = ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
 
         with patch.object(assertion_client, "restricted_directory", return_value=MCP_DIR), patch.object(
             assertion_client, "token", return_value="alice"
-        ), patch.object(assertion_client, "connect", connection):
+        ), patch.object(assertion_client, "initialize_status", side_effect=error) as probe:
             with self.assertRaisesRegex(AssertionError, "unrelated"):
                 await assertion_client.ready_assertions(
                     Namespace(token_directory=MCP_DIR, url="http://localhost/mcp")
                 )
-        self.assertEqual(attempts, ["alice"])
+        probe.assert_awaited_once()
 
     async def test_real_sdk_quota_http429_converges_to_expected_header(self):
         from argparse import Namespace
@@ -428,12 +469,12 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def gate(request, call_next):
             if request.method == "POST":
-                message = types.JSONRPCMessage.model_validate_json(await request.body()).root
-                if isinstance(message, types.JSONRPCRequest) and message.method == "initialize":
-                    initializations.append(message.id)
+                message = json.loads(await request.body())
+                if message.get("method") == "initialize":
+                    initializations.append(message["id"])
                     if len(initializations) == 1:
                         error = types.JSONRPCError(
-                            jsonrpc="2.0", id=message.id,
+                            jsonrpc="2.0", id=message["id"],
                             error=types.ErrorData(code=-32003, message="rate limit exceeded"),
                         )
                         return JSONResponse(
@@ -444,7 +485,7 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
             response.headers["x-ratelimit-limit"] = "240"
             return response
 
-        app = calculator.server("quota-convergence-test").streamable_http_app()
+        app = calculator.app(calculator.server("quota-convergence-test"))
         app.add_middleware(BaseHTTPMiddleware, dispatch=gate)
         client_class = httpx.AsyncClient
 
@@ -473,7 +514,7 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
         async def connection(url, bearer, **kwargs):
             attempts.append(bearer)
             if len(attempts) == 1:
-                raise McpError(types.ErrorData(code=-32003, message="rate limit exceeded"))
+                raise MCPError(code=-32003, message="rate limit exceeded")
             kwargs["rate_limit_observations"].append("240")
             yield None, "2025-11-25"
 
@@ -528,7 +569,7 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
             response.headers["x-ratelimit-limit"] = "240"
             return response
 
-        app = calculator.server("quota-header-test").streamable_http_app()
+        app = calculator.app(calculator.server("quota-header-test"))
         app.add_middleware(BaseHTTPMiddleware, dispatch=headers)
         client_class = httpx.AsyncClient
 
@@ -594,7 +635,7 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
             async def call_tool(self, name, arguments):
                 text = "Unknown product: missing" if "product_id" in arguments else "finite number"
                 return types.CallToolResult(
-                    isError=True, content=[types.TextContent(type="text", text=text)]
+                    is_error=True, content=[types.TextContent(type="text", text=text)]
                 )
 
         alice, bob = Session("alice"), Session("bob")
@@ -632,20 +673,19 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
         async def denied(request, call_next):
             observed.append(request.headers.get("X-Agentgateway-MCP-Provisioning"))
             if request.method == "POST":
-                message = types.JSONRPCMessage.model_validate_json(await request.body()).root
+                message = json.loads(await request.body())
                 if (
-                    isinstance(message, types.JSONRPCRequest)
-                    and message.method == "tools/call"
-                    and message.params["name"] == assertion_client.INTERNAL
+                    message.get("method") == "tools/call"
+                    and message["params"]["name"] == assertion_client.INTERNAL
                 ):
                     error = types.JSONRPCError(
-                        jsonrpc="2.0", id=message.id,
+                        jsonrpc="2.0", id=message["id"],
                         error=types.ErrorData(code=-32602, message="unknown resource"),
                     )
                     return JSONResponse(error.model_dump(), status_code=400)
             return await call_next(request)
 
-        app = calculator.server("authorization-http-test").streamable_http_app()
+        app = calculator.app(calculator.server("authorization-http-test"))
         app.add_middleware(BaseHTTPMiddleware, dispatch=denied)
         client_class = httpx.AsyncClient
 
@@ -689,11 +729,11 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_specific_rate_error_only(self):
         limited = types.CallToolResult(
-            isError=True, content=[types.TextContent(type="text", text="rate limit exceeded (retry after 1s)")]
+            is_error=True, content=[types.TextContent(type="text", text="rate limit exceeded (retry after 1s)")]
         )
         self.assertTrue(assertion_client.throttled(limited))
         unrelated = types.CallToolResult(
-            isError=True, content=[types.TextContent(type="text", text="upstream error")]
+            is_error=True, content=[types.TextContent(type="text", text="upstream error")]
         )
         with self.assertRaisesRegex(AssertionError, "Unexpected tool error"):
             assertion_client.throttled(unrelated)
@@ -701,20 +741,12 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_specific_jsonrpc_rate_error_only(self):
         class Session:
             async def call_tool(self, *args):
-                raise McpError(types.ErrorData(code=-32003, message="rate limit exceeded"))
+                raise MCPError(code=-32003, message="rate limit exceeded")
 
         self.assertTrue(await assertion_client.rate_call(Session()))
 
     async def test_authentication_requires_exact_401(self):
-        from contextlib import asynccontextmanager
-
-        @asynccontextmanager
-        async def failure(url, bearer, **kwargs):
-            response = httpx.Response(401, request=httpx.Request("POST", url))
-            raise httpx.HTTPStatusError("unauthorized", request=response.request, response=response)
-            yield
-
-        with patch.object(assertion_client, "connect", failure), redirect_stdout(io.StringIO()):
+        with patch.object(assertion_client, "initialize_status", return_value=401), redirect_stdout(io.StringIO()):
             await assertion_client.rejected("http://localhost/mcp", None, "missing")
 
     async def test_phases_keep_authorization_and_rate_checks_isolated(self):
@@ -747,7 +779,9 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(assertion_client, "restricted_directory", return_value=MCP_DIR):
             with patch.object(assertion_client, "token", return_value="local-test-value"):
-                with patch.object(assertion_client, "connect", connection):
+                with patch.object(assertion_client, "connect", connection), patch.object(
+                    assertion_client, "initialize_status", return_value=200
+                ):
                     with redirect_stdout(io.StringIO()):
                         await assertion_client.assertions(
                             Namespace(phase="ready", token_directory=MCP_DIR, url="http://localhost/mcp")
@@ -755,14 +789,8 @@ class AssertionClientTests(unittest.IsolatedAsyncioTestCase):
         session.list_tools.assert_awaited_once()
 
     async def test_unrelated_transport_failure_is_not_authentication_denial(self):
-        from contextlib import asynccontextmanager
-
-        @asynccontextmanager
-        async def broken(url, bearer, **kwargs):
-            raise ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
-            yield
-
-        with patch.object(assertion_client, "connect", broken):
+        error = ExceptionGroup("transport", [httpx.ConnectError("unreachable")])
+        with patch.object(assertion_client, "initialize_status", side_effect=error):
             with self.assertRaisesRegex(AssertionError, "unrelated failure"):
                 await assertion_client.rejected("http://localhost/mcp", None, "missing")
 

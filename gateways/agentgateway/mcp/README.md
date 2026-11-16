@@ -24,53 +24,59 @@ SDK assertion client / optional MCP Inspector
 | agentgateway controller, proxy, CRD chart | `v1.7.0` (reuse the base installation) |
 | Gateway API | Base demo's compatible standard bundle; validated with `1.6.1` |
 | Backend Python image | `3.12.12-slim-bookworm`, digest pinned in `Dockerfile` |
-| Official MCP Python SDK | `1.28.1` |
-| MCP protocol in direct backend and gateway SDK checks | `2025-11-25` |
-| Python dependencies | Exact versions and hashes in `requirements.txt` |
+| Official MCP Python SDK | `2.3.0` |
+| MCP protocol in direct SDK checks | SDK v2 in-memory client and legacy HTTP handshake |
+| Python dependencies | `pyproject.toml` and `uv.lock`; hash export in `requirements.txt` |
 | Optional MCP Inspector | `2.15.0` (not runtime-tested here) |
 
-**End-to-end validation passed on 2026-11-15** on a local Kubernetes
-`v1.36.5+k3s1` cluster with the official agentgateway `v1.7.0` charts and
-Gateway API `v1.6.1`. The MCP install and walkthrough passed in both the default
-and an alternate namespace, including staged-route checks, JWT validation,
-federated tool results, per-user authorization, throttling, quota propagation,
-and recovery. The base LLM demo passed before and after the MCP walkthrough in
-mock mode. No provider credentials or real inference requests were used.
-
-The gateway negotiated MCP protocol `2025-11-25`, matching the direct backend
-SDK checks. The SDK logs session-termination warnings for HTTP `202` responses,
-but the bounded assertions and walkthroughs completed successfully. The earlier
-2026-11-13 Kind attempt failed resolving the official chart registry; that
-environmental failure is superseded by this successful runtime validation.
-
-The 52 focused Python tests passed, and the final local CodeQL Python
-security-and-quality scan reported no findings. The optional MCP Inspector
-remains untested.
+The previous end-to-end pass on 2026-11-15 used SDK `1.28.1`. The SDK v2
+acceptance run on 2026-11-16 passed against agentgateway `v1.7.0` with MCP SDK
+`2.3.0` and protocol `2025-11-25`, in the default and an alternate namespace.
+It verified readiness, JWT rejection, tool discovery/calls, authorization, MCP
+rate limits and recovery, and the base LLM walkthrough in mock mode; no
+provider inference calls were made. The optional MCP Inspector remains
+untested.
 
 Installation stages the MCP route without exposing the fixture tools, checks
 authentication through a temporary localhost-only proxy port-forward, and only
 then enables the real backend. It requires the external key directory and an
 SDK-enabled Python (`AGENTGATEWAY_MCP_PYTHON`, default `python3`); only the public
-JWKS enters Kubernetes. Reinstallation briefly detaches only the MCP route.
+JWKS enters Kubernetes. The v1.7.0 proxy preserves the incoming Host for
+service-selected MCP targets; the local port-forward sends
+`127.0.0.1:<port>`. In-cluster backends therefore allow loopback with any port
+for this localhost-only flow, plus their service DNS names in the pod
+namespace. Do not expose this proxy publicly. Reinstallation briefly detaches
+only the MCP route.
 
 ## Local build and setup
 
-Prerequisites are the base demo's tools and credentials, Docker, Kind, and
-Python 3.12 with `venv`/`pip`. Backend and assertion-client dependencies share
-one hash-locked requirements file. From the repository root:
+Prerequisites are the base demo's tools and credentials, Docker, Kind, Python
+3.12, and `uv`. The SDK project and complete dependency graph are managed by
+`pyproject.toml` and `uv.lock`. From the repository root:
 
 ```sh
 kind create cluster --name agentgateway-mcp --image kindest/node:v1.35.0 --wait 120s
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
 kind load docker-image agentgateway-mcp:demo --name agentgateway-mcp
-python3 -m venv /tmp/agentgateway-mcp-venv
-. /tmp/agentgateway-mcp-venv/bin/activate
-python -m pip install --require-hashes -r gateways/agentgateway/mcp/requirements.txt
+uv sync --project gateways/agentgateway/mcp --locked
+export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
 ```
 
-`requirements.in` declares the direct dependencies; the checked-in hash lock
-was generated with `uv 0.13.8`. Dependency changes require regenerating the lock,
-checking advisories, and rerunning the focused SDK checks.
+`requirements.txt` is a hash-locked export from the uv lockfile for the
+container's `pip --require-hashes` installation. To update dependencies, edit
+`pyproject.toml`, regenerate `uv.lock`, export its pinned requirements, then
+generate hashes:
+
+```sh
+uv lock --project gateways/agentgateway/mcp
+uv export --project gateways/agentgateway/mcp --locked --no-dev --no-emit-project \
+  --format requirements-txt --output-file /tmp/agentgateway-mcp-export.txt
+uv pip compile /tmp/agentgateway-mcp-export.txt --generate-hashes \
+  --output-file gateways/agentgateway/mcp/requirements.txt --python-version 3.12
+```
+
+Dependency changes require checking advisories and rerunning the focused SDK
+checks.
 
 Deployments use `imagePullPolicy: Never`: load the image onto every cluster
 node first. Override `AGENTGATEWAY_MCP_IMAGE` only with another locally loaded
@@ -155,7 +161,7 @@ the exact expected set, and Bob's direct call by the known internal-tool name
 must independently fail. A transport error, arbitrary JSON-RPC error, fabricated
 result, or HTTP success alone is not evidence of intended enforcement.
 
-The bounded SDK client checks:
+The bounded assertion client checks:
 
 1. Missing, invalid-signature, and expired JWTs yield HTTP 401.
 2. Alice discovers all four tools and receives exact fixed results.
@@ -164,6 +170,10 @@ The bounded SDK client checks:
 4. Bob discovers only permitted tools and successfully calls permitted tools.
 5. Bob's direct internal-note call yields the expected authorization error.
 6. Alice's request bucket throttles, Bob remains usable, and Alice recovers.
+
+Exact HTTP status checks send a minimal legacy initialize request directly;
+SDK v2's HTTP transport can otherwise surface non-JSON-RPC statuses as MCP
+errors. Discovery and tool calls still use the SDK v2 client session.
 
 Expected gateway errors are asserted in `assertion_client.py`, including
 authorization HTTP 400 with `-32602` / `unknown resource` and rate limiting `-32003` /
@@ -234,14 +244,25 @@ make agentgateway-mcp-uninstall
 make agentgateway-demo
 ```
 
-Record actual gateway/protocol versions, full endpoint, exposed tool names,
-MCP error semantics, recovery, and LLM checks before/after install/removal.
+The 2026-11-16 acceptance run used
+`http://127.0.0.1:8080/mcp`. Alice discovered
+`calculator_add`, `calculator_multiply`, `catalog_lookup_product`, and
+`catalog_lookup_internal_note`; Bob discovered the same tools except the
+internal-note tool. Missing, invalid-signature, and expired JWTs returned HTTP
+401; Bob's direct internal-tool call returned the expected authorization
+error (`-32602`, `unknown resource`). Invalid tool inputs returned tool-level
+errors. Alice hit the configured rate limit, recovered after refill, and Bob
+remained usable. The base LLM mock walkthrough passed before MCP installation,
+while MCP was installed, and after MCP removal in both namespaces. No provider
+inference calls were made.
+
 Do not run these LLM checks in OpenAI mode unintentionally: that mode incurs
 inference charges. Static checks retain the repository's existing coverage:
 
 ```sh
 make validate
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 uv run --project gateways/agentgateway/mcp --locked \
+  python -m unittest discover -s tests -v
 ```
 
 ## Optional Inspector
