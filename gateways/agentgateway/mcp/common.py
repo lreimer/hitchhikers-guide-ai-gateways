@@ -26,7 +26,12 @@ def allowed_hosts(name: str) -> list[str]:
         ]
     service = f"agentgateway-mcp-{name}"
     return [
+        "127.0.0.1",
         "127.0.0.1:*",
+        "localhost",
+        "localhost:*",
+        "[::1]",
+        "[::1]:*",
         f"{service}:8000",
         f"{service}.{namespace}.svc.cluster.local:8000",
     ]
