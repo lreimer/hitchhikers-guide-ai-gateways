@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import timedelta
 import json
 import os
 from pathlib import Path
@@ -12,8 +11,8 @@ import stat
 import sys
 from urllib.parse import urlsplit
 
-import httpx
-from mcp import ClientSession, McpError, types
+import httpx2 as httpx
+from mcp import ClientSession, MCPError, types
 from mcp.client.streamable_http import streamable_http_client
 
 from jwt_tool import restricted_directory
@@ -26,6 +25,7 @@ TOOLS = {
     "catalog_lookup_internal_note",
 }
 INTERNAL = "catalog_lookup_internal_note"
+LEGACY_PROTOCOL = "2025-11-25"
 PRODUCT = {"product_id": "star-widget", "name": "Star Widget", "price": 12.5}
 NOTE = {
     "product_id": "star-widget",
@@ -69,6 +69,31 @@ def routing_headers(path: Path | None) -> dict[str, str]:
     return {"X-Agentgateway-MCP-Provisioning": nonce}
 
 
+async def initialize_status(
+    url: str, bearer: str | None, *, routing_header_file: Path | None = None,
+) -> int:
+    headers = {"Accept": "application/json, text/event-stream"}
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
+    headers.update(routing_headers(routing_header_file))
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": LEGACY_PROTOCOL,
+            "capabilities": {},
+            "clientInfo": {"name": "agentgateway-mcp-assertions", "version": "0.1.0"},
+        },
+    }
+    async with httpx.AsyncClient(
+        headers=headers, timeout=10, follow_redirects=False, trust_env=False,
+    ) as client:
+        response = await client.post(url, json=payload)
+        await response.aread()
+        return response.status_code
+
+
 @asynccontextmanager
 async def connect(
     url: str, bearer: str | None, *, routing_header_file: Path | None = None,
@@ -90,20 +115,20 @@ async def connect(
             rate_limit_observations is not None and response.status_code == 200
             and response.request.method == "POST"
         ):
-            request = types.JSONRPCMessage.model_validate_json(response.request.content).root
-            if isinstance(request, types.JSONRPCRequest) and request.method == "initialize":
+            request = json.loads(response.request.content)
+            if isinstance(request, dict) and request.get("method") == "initialize":
                 rate_limit_observations.append(response.headers.get("x-ratelimit-limit"))
 
     async with httpx.AsyncClient(
         headers=headers, timeout=10, follow_redirects=False, trust_env=False,
         event_hooks={"response": [retain_error_body]},
     ) as client:
-        async with streamable_http_client(url, http_client=client) as (read, write, _):
+        async with streamable_http_client(url, http_client=client) as (read, write):
             async with ClientSession(
-                read, write, read_timeout_seconds=timedelta(seconds=10)
+                read, write, read_timeout_seconds=10
             ) as session:
                 initialized = await session.initialize()
-                yield session, initialized.protocolVersion
+                yield session, initialized.protocol_version
 
 
 def leaves(error: BaseException):
@@ -123,31 +148,22 @@ async def rejected(
     expected_status: int = 401, quiet: bool = False,
 ) -> None:
     try:
-        async with connect(url, bearer, routing_header_file=routing_header_file):
-            raise AssertionError(f"{label}: unexpectedly authenticated")
-    except BaseExceptionGroup as error:
-        failures = list(leaves(error))
-        check(
-            bool(failures) and all(isinstance(failure, httpx.HTTPStatusError) for failure in failures),
-            f"{label}: expected HTTP {expected_status}, got an unrelated failure",
+        status = await initialize_status(
+            url, bearer, routing_header_file=routing_header_file
         )
-        statuses = [failure.response.status_code for failure in failures]
-        if any(status != expected_status for status in statuses):
-            raise StatusMismatch(f"{label}: expected HTTP {expected_status}, got {statuses}")
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code != expected_status:
-            raise StatusMismatch(f"{label}: expected HTTP {expected_status}, got {error.response.status_code}")
+    except (httpx.HTTPError, BaseExceptionGroup) as error:
+        raise AssertionError(f"{label}: expected HTTP {expected_status}, got an unrelated failure") from error
+    if status != expected_status:
+        raise StatusMismatch(f"{label}: expected HTTP {expected_status}, got {status}")
     if not quiet:
         print(f"PASS {label}: HTTP {expected_status}")
 
 
 def authorization_error(error: BaseException) -> bool:
-    if isinstance(error, McpError):
+    if isinstance(error, MCPError):
         data = error.error
     elif isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 400:
-        message = types.JSONRPCMessage.model_validate_json(error.response.content).root
-        if not isinstance(message, types.JSONRPCError):
-            return False
+        message = types.JSONRPCError.model_validate_json(error.response.content)
         data = message.error
     else:
         return False
@@ -155,12 +171,10 @@ def authorization_error(error: BaseException) -> bool:
 
 
 def quota_error(error: BaseException) -> bool:
-    if isinstance(error, McpError):
+    if isinstance(error, MCPError):
         data = error.error
     elif isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429:
-        message = types.JSONRPCMessage.model_validate_json(error.response.content).root
-        if not isinstance(message, types.JSONRPCError):
-            return False
+        message = types.JSONRPCError.model_validate_json(error.response.content)
         data = message.error
     else:
         return False
@@ -176,11 +190,11 @@ async def direct_denial(url: str, bearer: str, *, routing_header_file: Path | No
             attempted = True
             try:
                 await bob.call_tool(INTERNAL, {"product_id": "star-widget"})
-            except (McpError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
+            except (MCPError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
                 failures.extend(leaves(error))
             else:
                 call_returned = True
-    except (McpError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
+    except (MCPError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
         failures.extend(leaves(error))
     check(
         attempted and not call_returned and bool(failures)
@@ -191,9 +205,9 @@ async def direct_denial(url: str, bearer: str, *, routing_header_file: Path | No
 
 
 def result_value(result) -> dict:
-    check(not result.isError, "Unexpected tool-level error")
-    if result.structuredContent is not None:
-        return result.structuredContent
+    check(not result.is_error, "Unexpected tool-level error")
+    if result.structured_content is not None:
+        return result.structured_content
     check(len(result.content) == 1, "Expected exactly one JSON result block")
     check(result.content[0].type == "text", "Expected a text JSON result block")
     return json.loads(result.content[0].text)
@@ -206,7 +220,7 @@ async def exact(session, name: str, arguments: dict, expected: dict) -> None:
 
 
 def throttled(result) -> bool:
-    if not result.isError:
+    if not result.is_error:
         return False
     text = " ".join(
         block.text for block in result.content if block.type == "text"
@@ -221,10 +235,10 @@ def throttled(result) -> bool:
 async def rate_call(session):
     try:
         result = await session.call_tool("calculator_add", {"a": 2, "b": 3})
-    except McpError as error:
+    except MCPError as error:
         check(
-            error.error.code == -32003
-            and error.error.message == "rate limit exceeded",
+            error.code == -32003
+            and error.message == "rate limit exceeded",
             "Unexpected JSON-RPC error while checking rate limits",
         )
         return True
@@ -261,7 +275,7 @@ async def authentication_assertions(args) -> None:
         ):
             result = await alice.call_tool(name, arguments)
             text = " ".join(block.text for block in result.content if block.type == "text")
-            check(result.isError and fragment in text, f"{name}: expected specific input/tool error")
+            check(result.is_error and fragment in text, f"{name}: expected specific input/tool error")
             print(f"PASS {name}: expected input/tool error ({fragment})")
 
     if args.phase == "all":
@@ -338,7 +352,7 @@ async def quota_assertions(args) -> None:
                 rate_limit_observations=observations,
             ):
                 check(len(observations) == 1, "Quota readiness: missing authenticated initialization evidence")
-        except (McpError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
+        except (MCPError, httpx.HTTPStatusError, BaseExceptionGroup) as error:
             failures = list(leaves(error))
             check(
                 bool(failures) and all(quota_error(item) for item in failures),
@@ -358,12 +372,24 @@ async def ready_assertions(args) -> None:
     bearer = token(directory, "alice")
     for attempt in range(30):
         try:
+            status = await initialize_status(
+                args.url, bearer, routing_header_file=getattr(args, "routing_header_file", None)
+            )
+        except (httpx.HTTPError, BaseExceptionGroup) as error:
+            raise AssertionError("MCP readiness encountered an unrelated transport failure") from error
+        if status == 503:
+            if attempt < 29:
+                await asyncio.sleep(1)
+                continue
+            raise AssertionError("MCP backend did not become ready within bounded HTTP 503 polling")
+        check(status == 200, f"MCP readiness: expected HTTP 200 or 503, got {status}")
+        try:
             async with connect(
                 args.url, bearer, routing_header_file=getattr(args, "routing_header_file", None)
             ) as (session, protocol):
                 names = {tool.name for tool in (await session.list_tools()).tools}
                 check(names == TOOLS, "Readiness: expected all four federated tools")
-        except (httpx.HTTPStatusError, BaseExceptionGroup) as error:
+        except (httpx.HTTPError, BaseExceptionGroup) as error:
             failures = list(leaves(error))
             check(
                 bool(failures) and all(

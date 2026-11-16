@@ -22,8 +22,8 @@ if [[ -z "$key_directory" ]]; then
   printf 'Set AGENTGATEWAY_MCP_KEY_DIR to an external private directory for signing credentials and bounded SDK readiness checks.\n' >&2
   exit 1
 fi
-if ! "$python" -c 'import mcp, jwt, cryptography' >/dev/null 2>&1; then
-  printf 'Install gateways/agentgateway/mcp/requirements.txt in a virtual environment and set AGENTGATEWAY_MCP_PYTHON to its Python executable.\n' >&2
+if ! "$python" -c 'from mcp import Client; from mcp.server import MCPServer; import httpx2, jwt, cryptography' >/dev/null 2>&1; then
+  printf 'Run "uv sync --project gateways/agentgateway/mcp --locked" and set AGENTGATEWAY_MCP_PYTHON to gateways/agentgateway/mcp/.venv/bin/python.\n' >&2
   exit 1
 fi
 if [[ -z "$image" || "$image" == *[[:space:]]* ]]; then

@@ -3,9 +3,11 @@
 import math
 from typing import Annotated
 
-from pydantic import BeforeValidator
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel, BeforeValidator
 
-from common import server
+from common import app, run, server
 
 
 def finite_number(value: object) -> float:
@@ -20,21 +22,33 @@ def finite_number(value: object) -> float:
     return number
 
 
+def finite_result(value: float) -> float:
+    if not math.isfinite(value):
+        raise ToolError("Expected a finite number")
+    return value
+
+
 Number = Annotated[float, BeforeValidator(finite_number)]
-mcp = server("calculator")
+
+
+class Calculation(BaseModel):
+    result: float
+
+
+mcp: MCPServer = server("calculator")
 
 
 @mcp.tool()
-def add(a: Number, b: Number) -> dict[str, float]:
+def add(a: Number, b: Number) -> Calculation:
     """Add two finite numbers."""
-    return {"result": finite_number(a + b)}
+    return Calculation(result=finite_result(a + b))
 
 
 @mcp.tool()
-def multiply(a: Number, b: Number) -> dict[str, float]:
+def multiply(a: Number, b: Number) -> Calculation:
     """Multiply two finite numbers."""
-    return {"result": finite_number(a * b)}
+    return Calculation(result=finite_result(a * b))
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    run(mcp)
