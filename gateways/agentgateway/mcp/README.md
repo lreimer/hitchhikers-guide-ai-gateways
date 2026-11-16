@@ -59,6 +59,7 @@ kind create cluster --name agentgateway-mcp --image kindest/node:v1.35.0 --wait 
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
 kind load docker-image agentgateway-mcp:demo --name agentgateway-mcp
 uv sync --project gateways/agentgateway/mcp --locked
+. "$PWD/gateways/agentgateway/mcp/.venv/bin/activate"
 export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
 ```
 
