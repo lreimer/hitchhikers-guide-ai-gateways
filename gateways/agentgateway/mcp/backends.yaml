@@ -27,6 +27,11 @@ spec:
           image: agentgateway-mcp:demo
           imagePullPolicy: Never
           command: ["python", "/app/calculator.py"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: mcp
               containerPort: 8000
@@ -102,6 +107,11 @@ spec:
           image: agentgateway-mcp:demo
           imagePullPolicy: Never
           command: ["python", "/app/catalog.py"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: mcp
               containerPort: 8000

@@ -10,20 +10,19 @@ source "$script_dir/agentgateway-mcp-common.sh"
 
 namespace="${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}"
 image="${AGENTGATEWAY_MCP_IMAGE:-agentgateway-mcp:demo}"
-python="${AGENTGATEWAY_MCP_PYTHON:-python3}"
 key_directory="${AGENTGATEWAY_MCP_KEY_DIR:-}"
 jwks_file="${AGENTGATEWAY_MCP_JWKS_FILE:-}"
 if [[ -z "$jwks_file" && -n "${AGENTGATEWAY_MCP_KEY_DIR:-}" ]]; then
   jwks_file="$AGENTGATEWAY_MCP_KEY_DIR/jwks.json"
 fi
 agentgateway_mcp_prerequisites "$namespace"
-agentgateway_require_commands "$python"
+agentgateway_mcp_require_python
 if [[ -z "$key_directory" ]]; then
   printf 'Set AGENTGATEWAY_MCP_KEY_DIR to an external private directory for signing credentials and bounded SDK readiness checks.\n' >&2
   exit 1
 fi
-if ! "$python" -c 'import mcp, jwt, cryptography' >/dev/null 2>&1; then
-  printf 'Install gateways/agentgateway/mcp/requirements.txt in a virtual environment and set AGENTGATEWAY_MCP_PYTHON to its Python executable.\n' >&2
+if ! agentgateway_mcp_python -c 'import mcp, jwt, cryptography' >/dev/null 2>&1; then
+  printf 'Run uv sync --locked --project gateways/agentgateway/mcp, or set AGENTGATEWAY_MCP_PYTHON to an SDK-enabled Python executable.\n' >&2
   exit 1
 fi
 if [[ -z "$image" || "$image" == *[[:space:]]* ]]; then
@@ -32,7 +31,7 @@ if [[ -z "$image" || "$image" == *[[:space:]]* ]]; then
 fi
 policy_template="$(kubectl create --dry-run=client -n "$namespace" \
   -f "$root_dir/gateways/agentgateway/mcp/policy.yaml" -o json)"
-"$python" "$root_dir/gateways/agentgateway/mcp/jwt_tool.py" generate \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/jwt_tool.py" generate \
   --directory "$key_directory" --lifetime 900 \
   --issuer "$(jq -r '.spec.traffic.jwtAuthentication.providers[0].issuer' <<<"$policy_template")" \
   --audience "$(jq -r '.spec.traffic.jwtAuthentication.providers[0].audiences[0]' <<<"$policy_template")"
@@ -89,7 +88,7 @@ detach_route() {
   agentgateway_mcp_check_ownership httproute agentgateway-mcp "$namespace" || return 1
   kubectl delete httproute agentgateway-mcp -n "$namespace" \
     --ignore-not-found --timeout=30s >&2 || return 1
-  "$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+  agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
     --url "http://127.0.0.1:$local_port/mcp" --token-directory "$key_directory" \
     --phase detached --timeout-seconds 120 || return 1
 }
@@ -164,7 +163,7 @@ kubectl apply -n "$namespace" -f - <<<"$staged_route"
 generation="$(kubectl get agentgatewaypolicy agentgateway-mcp -n "$namespace" -o jsonpath='{.metadata.generation}')"
 agentgateway_mcp_wait_policy "$namespace" "$generation"
 agentgateway_mcp_wait_route "$namespace"
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "http://127.0.0.1:$local_port/mcp" --token-directory "$key_directory" \
   --phase staged --timeout-seconds 120
 
@@ -173,10 +172,10 @@ kubectl apply -n "$namespace" -f - <<<"$backends"
 kubectl apply -n "$namespace" -f - <<<"$backend"
 kubectl apply -n "$namespace" -f - <<<"$route"
 agentgateway_mcp_wait_ready "$namespace"
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "http://127.0.0.1:$local_port/mcp" --token-directory "$key_directory" \
   --phase ready --timeout-seconds 120
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "http://127.0.0.1:$local_port/mcp" --token-directory "$key_directory" \
   --phase auth --timeout-seconds 120
 installation_complete=true

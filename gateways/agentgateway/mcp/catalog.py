@@ -1,6 +1,9 @@
 """Bundled fictional catalog, containing no real confidential information."""
 
-from common import server
+from pydantic import BaseModel
+from mcp.server.mcpserver.exceptions import ToolError
+
+from common import server, transport_security
 
 
 PRODUCTS = {
@@ -18,29 +21,44 @@ PRODUCTS = {
 mcp = server("catalog")
 
 
+class ProductResult(BaseModel):
+    product_id: str
+    name: str
+    price: float
+
+
+class InternalNoteResult(BaseModel):
+    product_id: str
+    note: str
+
+
 def product(product_id: str) -> dict[str, str | float]:
     try:
         return PRODUCTS[product_id]
     except KeyError as exc:
-        raise ValueError(f"Unknown product: {product_id}") from exc
+        raise ToolError(f"Unknown product: {product_id}") from exc
 
 
 @mcp.tool()
-def lookup_product(product_id: str) -> dict[str, str | float]:
+def lookup_product(product_id: str) -> ProductResult:
     """Return public information about a fictional product."""
     entry = product(product_id)
-    return {
-        "product_id": product_id,
-        "name": entry["name"],
-        "price": entry["price"],
-    }
+    return ProductResult(product_id=product_id, name=entry["name"], price=entry["price"])
 
 
 @mcp.tool()
-def lookup_internal_note(product_id: str) -> dict[str, str]:
+def lookup_internal_note(product_id: str) -> InternalNoteResult:
     """Return a synthetic internal note; the gateway controls access."""
-    return {"product_id": product_id, "note": product(product_id)["internal_note"]}
+    return InternalNoteResult(product_id=product_id, note=product(product_id)["internal_note"])
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=8000,
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        transport_security=transport_security("agentgateway-mcp-catalog"),
+    )

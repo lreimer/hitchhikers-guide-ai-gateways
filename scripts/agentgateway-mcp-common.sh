@@ -13,6 +13,22 @@ agentgateway_mcp_resources=(
   "service agentgateway-mcp-staging"
 )
 
+agentgateway_mcp_require_python() {
+  if [[ -n "${AGENTGATEWAY_MCP_PYTHON:-}" ]]; then
+    agentgateway_require_commands "$AGENTGATEWAY_MCP_PYTHON"
+  else
+    agentgateway_require_commands uv
+  fi
+}
+
+agentgateway_mcp_python() {
+  if [[ -n "${AGENTGATEWAY_MCP_PYTHON:-}" ]]; then
+    "$AGENTGATEWAY_MCP_PYTHON" "$@"
+  else
+    uv run --locked --project "$root_dir/gateways/agentgateway/mcp" python "$@"
+  fi
+}
+
 agentgateway_mcp_check_ownership() {
   local kind="$1" name="$2" namespace="$3" resource
   resource="$(kubectl get "$kind" "$name" -n "$namespace" --ignore-not-found -o json)"

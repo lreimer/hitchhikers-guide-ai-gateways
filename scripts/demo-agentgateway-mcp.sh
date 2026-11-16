@@ -11,16 +11,16 @@ source "$script_dir/agentgateway-mcp-common.sh"
 namespace="${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}"
 url="${AGENTGATEWAY_URL:-http://127.0.0.1:8080}"
 url="${url%/}/mcp"
-python="${AGENTGATEWAY_MCP_PYTHON:-python3}"
 key_directory="${AGENTGATEWAY_MCP_KEY_DIR:-}"
 agentgateway_mcp_prerequisites "$namespace"
-agentgateway_require_commands "$python" openssl
+agentgateway_mcp_require_python
+agentgateway_require_commands openssl
 if [[ -z "$key_directory" ]]; then
   printf 'Set AGENTGATEWAY_MCP_KEY_DIR to the external, private signing directory used during installation.\n' >&2
   exit 1
 fi
-if ! "$python" -c 'import mcp, jwt, cryptography' >/dev/null 2>&1; then
-  printf 'MCP Python dependencies are missing. Install gateways/agentgateway/mcp/requirements.txt in a virtual environment and set AGENTGATEWAY_MCP_PYTHON to its Python executable.\n' >&2
+if ! agentgateway_mcp_python -c 'import mcp, jwt, cryptography' >/dev/null 2>&1; then
+  printf 'MCP Python dependencies are missing. Run uv sync --locked --project gateways/agentgateway/mcp, or set AGENTGATEWAY_MCP_PYTHON to an SDK-enabled Python executable.\n' >&2
   exit 1
 fi
 for resource in "${agentgateway_mcp_resources[@]}"; do
@@ -31,7 +31,7 @@ agentgateway_mcp_wait_ready "$namespace"
 original="$(kubectl get agentgatewaypolicy agentgateway-mcp -n "$namespace" -o json)"
 issuer="$(jq -r '.spec.traffic.jwtAuthentication.providers[0].issuer' <<<"$original")"
 audience="$(jq -r '.spec.traffic.jwtAuthentication.providers[0].audiences[0]' <<<"$original")"
-"$python" "$root_dir/gateways/agentgateway/mcp/jwt_tool.py" generate \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/jwt_tool.py" generate \
   --directory "$key_directory" --issuer "$issuer" --audience "$audience" --lifetime 900
 if ! jq -e --argjson expected "$(jq \
   '.spec.traffic.jwtAuthentication.providers[0].jwks.inline | fromjson' <<<"$original")" \
@@ -61,7 +61,7 @@ apply_spec() {
 }
 restore_policy() {
   apply_spec "$original_spec" || return 1
-  "$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+  agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
     --url "$url" --token-directory "$key_directory" --phase quota \
     --expected-rate-limit "$restored_limit" --timeout-seconds 120 || return 1
   policy_changed=false
@@ -87,10 +87,10 @@ auth_spec="$(jq -c 'del(.traffic.rateLimit)' <<<"$original_spec")"
 if [[ "$auth_spec" != "$current_spec" ]]; then
   apply_spec "$auth_spec"
 fi
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase quota \
   --expected-rate-limit absent --timeout-seconds 120
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase auth
 
 # The only quota is installed in a separate assertion phase on the SAME policy.
@@ -99,10 +99,10 @@ phase="$(openssl rand -hex 12)"
 rate_spec="$(jq -c --arg key "jwt.sub + \"-mcp-$phase\"" '
   .traffic.rateLimit = {local:[{requests:1,unit:"Seconds",burst:29,key:$key}]}' <<<"$auth_spec")"
 apply_spec "$rate_spec"
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase quota \
   --expected-rate-limit 30 --timeout-seconds 120
-"$python" "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
+agentgateway_mcp_python "$root_dir/gateways/agentgateway/mcp/assertion_client.py" \
   --url "$url" --token-directory "$key_directory" --phase rate \
   --rate-capacity 30 --rate-window-seconds 30
 restore_policy
