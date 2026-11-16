@@ -11,6 +11,49 @@ SOURCE = 'source scripts/agentgateway-common.sh\nsleep() { :; }\n'
 
 
 class AgentgatewayReadinessTests(unittest.TestCase):
+    def test_routes_are_prepared_before_starting_proxy(self):
+        script = (ROOT / "scripts/install-agentgateway.sh").read_text()
+        gateway = script.index('-f "$root_dir/gateways/agentgateway/gateway.yaml"')
+        for route in ("route.yaml", "readiness-route.yaml"):
+            self.assertLess(
+                script.index(f'-f "$root_dir/gateways/agentgateway/{route}"'),
+                gateway,
+            )
+        self.assertLess(script.index('agentgateway_write_policy "$namespace"'), gateway)
+
+    def test_llm_policy_targets_only_llm_and_readiness_routes(self):
+        result = self.run_shell("""
+kubectl() { cat; }
+agentgateway_write_policy test gpt-4o-mini install-abcd
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kind: Gateway\n", result.stdout)
+        self.assertEqual(result.stdout.count("kind: HTTPRoute"), 2)
+        self.assertIn("name: agentgateway-llm", result.stdout)
+        self.assertIn("name: agentgateway-readiness", result.stdout)
+        self.assertNotIn("name: agentgateway-mcp", result.stdout)
+        self.assertIn(
+            "      name: agentgateway-llm\n"
+            "    - group: gateway.networking.k8s.io\n"
+            "      kind: HTTPRoute\n"
+            "      name: agentgateway-readiness\n",
+            result.stdout,
+        )
+
+    def test_namespace_alias_and_explicit_namespace_override(self):
+        for arguments, expected in [
+            (["NAMESPACE=mcp-alternate"], "mcp-alternate"),
+            (["NAMESPACE=mcp-alternate", "AGENTGATEWAY_NAMESPACE=explicit"], "explicit"),
+        ]:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["make", "--dry-run", "agentgateway-port-forward", *arguments],
+                    cwd=ROOT, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'-n "{expected}"', result.stdout)
+                self.assertIn("--address 127.0.0.1", result.stdout)
+
     def run_shell(self, script):
         return subprocess.run(
             ["bash", "-c", SOURCE + script],

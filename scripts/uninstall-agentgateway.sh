@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/agentgateway-common.sh
 source "$script_dir/agentgateway-common.sh"
 
-namespace="${AGENTGATEWAY_NAMESPACE:-agentgateway-demo}"
+namespace="${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}"
 agentgateway_require_commands kubectl helm jq
 agentgateway_validate_namespace "$namespace"
 

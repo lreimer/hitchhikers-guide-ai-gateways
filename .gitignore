@@ -1,1 +1,9 @@
 __pycache__/
+<<<<<<< HEAD
+*.py[cod]
+.venv/
+.agentgateway-demo-*/
+.agentgateway-install-*/
+.agentgateway-mcp-research/
+=======
+>>>>>>> origin/main

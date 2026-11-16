@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-mcp-staging
+  labels:
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+spec:
+  type: ClusterIP
+  # No Deployment has this label: the staged route cannot reach an MCP server.
+  selector:
+    agentgateway.dev/mcp-staging: unavailable
+    app.kubernetes.io/managed-by: agentgateway-mcp-demo
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
