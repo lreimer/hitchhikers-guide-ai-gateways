@@ -1,6 +1,10 @@
 image:
   tag: "v2.4.0"
 
+vectorStore:
+  enabled: true
+  type: chromem
+
 env:
   - name: BIFROST_SETUP_TOKEN
     valueFrom:

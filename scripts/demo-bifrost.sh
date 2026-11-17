@@ -42,6 +42,7 @@ for prompt in \
   curl --fail-with-body --silent --show-error \
     --header "@$curl_header" \
     --header 'Content-Type: application/json' \
+    --header 'x-bf-cache-key: bifrost-demo' \
     --data "$payload" \
     "$url/v1/chat/completions" |
     jq "${jq_options[@]}" .

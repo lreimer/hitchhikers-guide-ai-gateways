@@ -29,6 +29,7 @@ curl() {
   if [[ -n "$TEST_REQUESTS" ]]; then
     while (( $# )); do
       if [[ "$1" == --data ]]; then printf '%s\\n' "$2" >> "$TEST_REQUESTS"; fi
+      if [[ "$1" == --header ]]; then printf '%s\\n' "$2" >> "$TEST_REQUESTS.headers"; fi
       shift
     done
   fi
@@ -78,7 +79,7 @@ source scripts/demo-bifrost.sh
         self.assertEqual(response["usage"]["total_tokens"], 42)
         self.assertEqual(output.count('"message":'), 2)
 
-    def test_sends_two_similar_prompts_with_the_same_model(self):
+    def test_sends_two_similar_prompts_with_the_same_model_and_cache_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             calls = Path(directory) / "requests"
             status, output = self.run_demo(calls_path=calls)
@@ -87,6 +88,8 @@ source scripts/demo-bifrost.sh
             self.assertEqual(len(requests), 2)
             self.assertEqual(requests[0]["model"], requests[1]["model"])
             self.assertTrue(requests[0]["model"].startswith("openai/"))
+            headers = Path(str(calls) + ".headers").read_text().splitlines()
+            self.assertEqual(headers.count("x-bf-cache-key: bifrost-demo"), 2)
             prompts = [request["messages"][0]["content"] for request in requests]
             self.assertEqual(prompts, [
                 "What is an AI gateway?",

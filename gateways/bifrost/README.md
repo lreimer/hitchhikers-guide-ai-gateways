@@ -45,7 +45,8 @@ Set `NO_COLOR=1` to disable colours. HTTP error responses are also formatted,
 and failed requests still return a nonzero exit status.
 
 The demo sends two requests sequentially: "What is an AI gateway?" followed by
-"What is an AI gateway, exactly?". Both use the same model and virtual key.
+"What is an AI gateway, exactly?". Both use the same model, virtual key, and
+`x-bf-cache-key: bifrost-demo` header to enable caching within the same scope.
 Compare cache status in the dashboard request logs and provider usage to see
 whether the second request was served from semantic cache. A hit depends on the
 configured similarity threshold and the first response being cached; it is not
@@ -54,10 +55,17 @@ guaranteed. Responses include token usage.
 ## Configuration
 
 [`values.yaml`](values.yaml) is passed to the official chart. It enables
-governance with mandatory virtual keys and the semantic-cache plugin. The
+governance with mandatory virtual keys, the semantic-cache plugin, and the
+embedded Chromem vector store. Chromem needs no additional service; its cache
+is in memory and is lost when the Bifrost process restarts. The
 governance budgets, rate limits, and virtual keys are created interactively in
 the dashboard so the demo does not commit credentials or reusable virtual
 keys.
+
+For an existing installation, rerun `make bifrost-install` with
+`OPENAI_API_KEY` exported to apply the vector-store configuration, then wait
+for `kubectl rollout status statefulset/bifrost -n bifrost-demo`. Restart
+port-forwarding if needed before running `make bifrost-demo`.
 
 Provider, encryption, and dashboard setup credentials are provisioned as
 Kubernetes Secrets by
