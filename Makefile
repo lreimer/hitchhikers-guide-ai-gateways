@@ -42,7 +42,7 @@ validate:
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
 	@python3 -c 'import ast, pathlib; [ast.parse(p.read_text(encoding="utf-8"), filename=str(p)) for p in pathlib.Path("gateways/agentgateway/mcp").glob("*.py")]'
-	@ruby -e 'require "yaml"; Dir.glob("agents/kagent/*.yaml").each { |path| YAML.parse_stream(File.read(path)) }'
+	@uv run --with pyyaml python -c 'import pathlib, yaml; [list(yaml.parse(p.read_text(encoding="utf-8"))) for p in pathlib.Path("agents/kagent").glob("*.yaml")]'
 
 bifrost-install:
 	@BIFROST_NAMESPACE="$(BIFROST_NAMESPACE)" ./scripts/install-bifrost.sh
