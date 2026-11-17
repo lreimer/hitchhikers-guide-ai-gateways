@@ -1,5 +1,7 @@
 """Bundled fictional catalog, containing no real confidential information."""
 
+import logging
+
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
@@ -33,6 +35,7 @@ class InternalNote(BaseModel):
 
 
 mcp: MCPServer = server("catalog")
+logger = logging.getLogger(__name__)
 
 
 def product(product_id: str) -> dict[str, str | float]:
@@ -44,14 +47,24 @@ def product(product_id: str) -> dict[str, str | float]:
 
 @mcp.tool()
 def lookup_product(product_id: str) -> Product:
-    """Return public information about a fictional product."""
+    """Return public information about a fictional product.
+
+    Use the exact catalog ID: star-widget for Star Widget, or moon-gadget for
+    Moon Gadget. Display names, plurals, and underscore-separated IDs do not match.
+    """
+    logger.info("tool_call=catalog.lookup_product")
     entry = product(product_id)
     return Product(product_id=product_id, name=entry["name"], price=entry["price"])
 
 
 @mcp.tool()
 def lookup_internal_note(product_id: str) -> InternalNote:
-    """Return a synthetic internal note; the gateway controls access."""
+    """Return a synthetic internal note; the gateway controls access.
+
+    Use the exact catalog ID: star-widget for Star Widget, or moon-gadget for
+    Moon Gadget. Display names, plurals, and underscore-separated IDs do not match.
+    """
+    logger.info("tool_call=catalog.lookup_internal_note")
     return InternalNote(product_id=product_id, note=product(product_id)["internal_note"])
 
 

@@ -44,20 +44,54 @@ SDK-enabled Python (`AGENTGATEWAY_MCP_PYTHON`, default `python3`); only the publ
 JWKS enters Kubernetes. The v1.7.0 proxy preserves the incoming Host for
 service-selected MCP targets; the local port-forward sends
 `127.0.0.1:<port>`. In-cluster backends therefore allow loopback with any port
-for this localhost-only flow, plus their service DNS names in the pod
-namespace. Do not expose this proxy publicly. Reinstallation briefly detaches
-only the MCP route.
+for this localhost-only flow, plus their service DNS names and the exact
+`agentgateway-proxy.<namespace>.svc.cluster.local` host (with or without port
+80) for in-cluster clients such as kagent. Other namespaces' gateway hosts
+are not allowed. Do not expose this proxy publicly. Reinstallation briefly
+detaches only the MCP route.
 
 ## Local build and setup
 
-Prerequisites are the base demo's tools and credentials, Docker, Kind, Python
-3.12, and `uv`. The SDK project and complete dependency graph are managed by
-`pyproject.toml` and `uv.lock`. From the repository root:
+Use a local Kubernetes cluster: Rancher Desktop by default, or Kind. The
+cluster must support the base demo's Kubernetes version requirements; adding
+kagent also requires its Kubernetes 1.37+ certificate prerequisites.
+Prerequisites are the base demo's tools and credentials, Docker, Python 3.12,
+and `uv`. The SDK project and complete dependency graph are managed by
+`pyproject.toml` and `uv.lock`.
+
+For Rancher Desktop, enable its Docker (Moby) engine and ensure `docker`
+targets that engine so Kubernetes can use the locally built image. From the
+repository root:
 
 ```sh
-kind create cluster --name agentgateway-mcp --image kindest/node:v1.35.0 --wait 120s
+kubectl config use-context rancher-desktop
+export KAGENT_CONTEXT=rancher-desktop
+kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}{"\n"}'
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
-kind load docker-image agentgateway-mcp:demo --name agentgateway-mcp
+docker image inspect agentgateway-mcp:demo >/dev/null
+```
+
+For Kind, first create a compatible cluster. The
+[Kind setup for the kagent demo](../../../agents/kagent/README.md#kind-alternative)
+provides a published Kubernetes 1.37.0 image and certificate configuration.
+That setup is based on upstream documentation and has not been run end to end
+for this demo. For the cluster named `ai-gateway-demo`:
+
+```sh
+export KIND_EXPERIMENTAL_PROVIDER=docker
+kubectl config use-context kind-ai-gateway-demo
+export KAGENT_CONTEXT=kind-ai-gateway-demo
+docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
+kind load docker-image agentgateway-mcp:demo --name ai-gateway-demo
+```
+
+Load the image on every relevant node. `KAGENT_CONTEXT` is used by the kagent
+scripts; gateway and MCP operations use the current kubectl context. Neither
+workflow automatically provisions or deletes a cluster through Make targets.
+
+After either image preparation path, set up the Python environment:
+
+```sh
 uv sync --project gateways/agentgateway/mcp --locked
 . "$PWD/gateways/agentgateway/mcp/.venv/bin/activate"
 export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
@@ -257,6 +291,10 @@ remained usable. The base LLM mock walkthrough passed before MCP installation,
 while MCP was installed, and after MCP removal in both namespaces. No provider
 inference calls were made.
 
+The 2026-11-17 [kagent evaluation](../../../agents/kagent/README.md#live-evaluation)
+also verified in-cluster MCP discovery and provider-backed tool execution on
+Rancher Desktop, including the preserved gateway Host and single-line tool logs.
+
 Do not run these LLM checks in OpenAI mode unintentionally: that mode incurs
 inference charges. Static checks retain the repository's existing coverage:
 
@@ -287,8 +325,6 @@ make agentgateway-mcp-uninstall
 rm -f "$AGENTGATEWAY_MCP_KEY_DIR"/{private.pem,jwks.json,alice.jwt,bob.jwt,invalid.jwt,expired.jwt}
 rmdir "$AGENTGATEWAY_MCP_KEY_DIR"
 unset AGENTGATEWAY_MCP_KEY_DIR
-# After all other demonstrations finish:
-kind delete cluster --name agentgateway-mcp
 ```
 
 Add-on uninstall checks ownership before deleting its fixed resource set.
@@ -304,8 +340,8 @@ Public deployment requires additional authentication/TLS and network controls.
 
 - Missing or incompatible prerequisites: install/repair the pinned base demo
   rather than adding another controller or adopting someone else's resources.
-- Pods not ready: verify the image is loaded into the correct Kind cluster,
-  then inspect Deployment events and `/readyz` probes.
+- Pods not ready: verify the image is available on every relevant node of the
+  selected local cluster, then inspect Deployment events and `/readyz` probes.
 - Rejected policy/backend/route: inspect `kubectl describe` in the selected
   namespace; the installer performs server-side schema validation first.
 - HTTP 401: renew tokens, confirm issuer/audience and public JWKS, and verify

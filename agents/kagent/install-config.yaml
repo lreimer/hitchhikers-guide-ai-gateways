@@ -1,0 +1,4 @@
+install:
+  kagent:
+    valuesFiles:
+      - install-values.yaml

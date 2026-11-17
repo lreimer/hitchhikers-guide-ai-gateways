@@ -1,0 +1,44 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata:
+  name: product-quote-assistant
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  description: Creates quotes using the public fictional product catalog and calculator.
+  modelConfig:
+    name: default-model-config
+  systemPrompt: |-
+    You are the Product Quote Assistant. Use the public product catalog for product names and prices, and use the calculator tools for arithmetic. Never guess a product, price, or internal fact. If the catalog does not contain a requested product, say that it is unknown and do not estimate.
+  tools:
+    - mcp:
+        server:
+          kind: RemoteMCPServer
+          name: product-catalog-bob
+        tools:
+          - catalog_lookup_product
+          - calculator_add
+          - calculator_multiply
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata:
+  name: internal-product-support-assistant
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  description: Answers product support questions using public catalog details and synthetic internal notes.
+  modelConfig:
+    name: default-model-config
+  systemPrompt: |-
+    You are the Internal Product Support Assistant. Use the public product catalog for product facts and the internal-note tool only for support-only details. Treat the internal notes as synthetic demo data. Never invent product facts; if the catalog does not contain a requested product, say that it is unknown. Do not claim that either demo role represents an authenticated end user.
+  tools:
+    - mcp:
+        server:
+          kind: RemoteMCPServer
+          name: product-support-alice
+        tools:
+          - catalog_lookup_product
+          - catalog_lookup_internal_note
+          - calculator_add
+          - calculator_multiply

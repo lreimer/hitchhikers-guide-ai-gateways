@@ -4,8 +4,10 @@ AGENTGATEWAY_NAMESPACE ?= $(if $(NAMESPACE),$(NAMESPACE),agentgateway-demo)
 ENVOY_AI_GATEWAY_NAMESPACE ?= envoy-ai-gateway-demo
 ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 ENVOY_AI_GATEWAY_SYSTEM_NAMESPACE ?= envoy-ai-gateway-system
+KAGENT_NAMESPACE ?= kagent
+KAGENT_CONTEXT ?= rancher-desktop
 
-.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall
+.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall kagent-install kagent-port-forward kagent-demo kagent-uninstall
 .PHONY: agentgateway-mcp-install agentgateway-mcp-demo agentgateway-mcp-uninstall
 
 help:
@@ -29,13 +31,18 @@ help:
 	  'envoy-ai-gateway-port-forward Forward the generated Gateway to localhost:8080' \
 	  'envoy-ai-gateway-demo         Run the authenticated token-limit walkthrough' \
 	  'envoy-ai-gateway-uninstall    Remove demo resources and Helm releases' \
-	  'validate              Check shell/Python syntax and KrakenD JSON'
+	  'kagent-install        Install the declarative kagent demo agents' \
+	  'kagent-port-forward   Forward the kagent UI to localhost:8081' \
+	  'kagent-demo           Run the explicitly opted-in live agent evaluation' \
+	  'kagent-uninstall      Remove the kagent demo and its owned runtime' \
+	  'validate              Check shell/Python syntax, gateway JSON, and kagent YAML'
 
 validate:
 	@for script in scripts/*.sh; do bash -n "$$script" || exit $$?; done
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
 	@python3 -c 'import ast, pathlib; [ast.parse(p.read_text(encoding="utf-8"), filename=str(p)) for p in pathlib.Path("gateways/agentgateway/mcp").glob("*.py")]'
+	@uv run --with pyyaml python -c 'import pathlib, yaml; [list(yaml.parse(p.read_text(encoding="utf-8"))) for p in pathlib.Path("agents/kagent").glob("*.yaml")]'
 
 bifrost-install:
 	@BIFROST_NAMESPACE="$(BIFROST_NAMESPACE)" ./scripts/install-bifrost.sh
@@ -102,3 +109,19 @@ agentgateway-mcp-demo:
 
 agentgateway-mcp-uninstall:
 	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/uninstall-agentgateway-mcp.sh
+
+kagent-install:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-kagent.sh
+
+kagent-port-forward:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  ./scripts/port-forward-kagent.sh
+
+kagent-demo:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/demo-kagent.sh
+
+kagent-uninstall:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  ./scripts/uninstall-kagent.sh
