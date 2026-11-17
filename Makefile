@@ -5,6 +5,7 @@ ENVOY_AI_GATEWAY_NAMESPACE ?= envoy-ai-gateway-demo
 ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 ENVOY_AI_GATEWAY_SYSTEM_NAMESPACE ?= envoy-ai-gateway-system
 KAGENT_NAMESPACE ?= kagent
+KAGENT_CONTEXT ?= rancher-desktop
 
 .PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall kagent-install kagent-port-forward kagent-demo kagent-uninstall
 .PHONY: agentgateway-mcp-install agentgateway-mcp-demo agentgateway-mcp-uninstall
@@ -110,15 +111,17 @@ agentgateway-mcp-uninstall:
 	@AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/uninstall-agentgateway-mcp.sh
 
 kagent-install:
-	@KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
 	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-kagent.sh
 
 kagent-port-forward:
-	@KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" ./scripts/port-forward-kagent.sh
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  ./scripts/port-forward-kagent.sh
 
 kagent-demo:
-	@KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
 	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/demo-kagent.sh
 
 kagent-uninstall:
-	@KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" ./scripts/uninstall-kagent.sh
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  ./scripts/uninstall-kagent.sh

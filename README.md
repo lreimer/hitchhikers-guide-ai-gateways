@@ -48,8 +48,9 @@ because the implementation sandbox could not resolve the official chart registry
 
 The [kagent demo](agents/kagent/README.md) adds two declarative agents on the
 existing agentgateway LLM and MCP routes. It requires the separately installed
-agentgateway MCP add-on, uses Rancher Desktop rather than Kind, and opts in
-explicitly before making live provider-backed agent calls.
+agentgateway MCP add-on and a compatible local Kubernetes cluster. Rancher
+Desktop is the default; Kind is an alternative. Live provider-backed agent
+calls require explicit opt-in.
 
 ### KrakenD Community Edition
 

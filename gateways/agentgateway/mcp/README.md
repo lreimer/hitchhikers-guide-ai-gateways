@@ -50,27 +50,50 @@ only the MCP route.
 
 ## Local build and setup
 
-Use Rancher Desktop with its Kubernetes context selected; this walkthrough does
-not use Kind. The cluster must support the base demo's Kubernetes version
-requirements. Prerequisites are the base demo's tools and credentials, Docker,
-Python 3.12, and `uv`. The SDK project and complete dependency graph are managed
-by `pyproject.toml` and `uv.lock`. From the repository root:
+Use a local Kubernetes cluster: Rancher Desktop by default, or Kind. The
+cluster must support the base demo's Kubernetes version requirements; adding
+kagent also requires its Kubernetes 1.37+ certificate prerequisites.
+Prerequisites are the base demo's tools and credentials, Docker, Python 3.12,
+and `uv`. The SDK project and complete dependency graph are managed by
+`pyproject.toml` and `uv.lock`.
+
+For Rancher Desktop, enable its Docker (Moby) engine and ensure `docker`
+targets that engine so Kubernetes can use the locally built image. From the
+repository root:
 
 ```sh
 kubectl config use-context rancher-desktop
+export KAGENT_CONTEXT=rancher-desktop
 kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}{"\n"}'
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
 docker image inspect agentgateway-mcp:demo >/dev/null
+```
+
+For Kind, first create a compatible cluster. The
+[Kind setup for the kagent demo](../../../agents/kagent/README.md#kind-alternative)
+provides a published Kubernetes 1.37.0 image and certificate configuration.
+That setup is based on upstream documentation and has not been run end to end
+for this demo. For the cluster named `ai-gateway-demo`:
+
+```sh
+export KIND_EXPERIMENTAL_PROVIDER=docker
+kubectl config use-context kind-ai-gateway-demo
+export KAGENT_CONTEXT=kind-ai-gateway-demo
+docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
+kind load docker-image agentgateway-mcp:demo --name ai-gateway-demo
+```
+
+Load the image on every relevant node. `KAGENT_CONTEXT` is used by the kagent
+scripts; gateway and MCP operations use the current kubectl context. Neither
+workflow automatically provisions or deletes a cluster through Make targets.
+
+After either image preparation path, set up the Python environment:
+
+```sh
 uv sync --project gateways/agentgateway/mcp --locked
 . "$PWD/gateways/agentgateway/mcp/.venv/bin/activate"
 export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
 ```
-
-The Rancher Desktop cluster used for this walkthrough reports a Docker
-container runtime, so the Kubernetes node can use the image built by Rancher
-Desktop's Docker engine directly. Do not run these commands against another
-context; `imagePullPolicy: Never` requires the image to be available to the
-selected cluster.
 
 `requirements.txt` is a hash-locked export from the uv lockfile for the
 container's `pip --require-hashes` installation. To update dependencies, edit
@@ -311,8 +334,8 @@ Public deployment requires additional authentication/TLS and network controls.
 
 - Missing or incompatible prerequisites: install/repair the pinned base demo
   rather than adding another controller or adopting someone else's resources.
-- Pods not ready: verify the image is loaded into the selected Rancher Desktop
-  cluster, then inspect Deployment events and `/readyz` probes.
+- Pods not ready: verify the image is available on every relevant node of the
+  selected local cluster, then inspect Deployment events and `/readyz` probes.
 - Rejected policy/backend/route: inspect `kubectl describe` in the selected
   namespace; the installer performs server-side schema validation first.
 - HTTP 401: renew tokens, confirm issuer/audience and public JWKS, and verify

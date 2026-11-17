@@ -44,11 +44,11 @@ fi
 
 record="$(kubectl get configmap kagent-demo-ownership -n "$namespace" -o json)"
 if [[ "$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$record")" != "kagent-demo" ||
-  "$(jq -r '.data.context' <<<"$record")" != rancher-desktop ||
   "$(jq -r '.data["kagent-version"]' <<<"$record")" != 1.0.1 ]]; then
   printf 'The pinned kagent ownership record is missing or invalid.\n' >&2
   exit 1
 fi
+kagent_demo_verify_recorded_context "$record"
 gateway_namespace="$(jq -r '.data["gateway-namespace"]' <<<"$record")"
 agentgateway_validate_namespace "$gateway_namespace"
 if [[ "$gateway_namespace" != "${AGENTGATEWAY_NAMESPACE:-${NAMESPACE:-agentgateway-demo}}" ]]; then

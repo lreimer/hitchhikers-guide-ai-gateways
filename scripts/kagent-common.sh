@@ -23,11 +23,11 @@ kagent_demo_require_commands() {
 }
 
 kagent_demo_require_context() {
-  local context version major minor
+  local context version major minor expected_context="${KAGENT_CONTEXT:-rancher-desktop}"
   context="$(kubectl config current-context)"
-  if [[ "$context" != rancher-desktop ]]; then
-    printf 'This demo requires the rancher-desktop kubectl context; current context is %s. Kind is not supported.\n' \
-      "$context" >&2
+  if [[ "$context" != "$expected_context" ]]; then
+    printf 'Expected kubectl context %s; current context is %s. Select the intended local cluster and set KAGENT_CONTEXT consistently; scripts do not switch contexts.\n' \
+      "$expected_context" "$context" >&2
     return 1
   fi
 
@@ -39,8 +39,19 @@ kagent_demo_require_context() {
   minor="${minor%%.*}"
   if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ ]] ||
     (( major != 1 || minor < 37 )); then
-    printf 'kagent v1.0.1 requires Kubernetes 1.37 or later; Rancher Desktop reports %s.\n' \
-      "$version" >&2
+    printf 'kagent v1.0.1 requires Kubernetes 1.37 or later; context %s reports %s.\n' \
+      "$context" "$version" >&2
+    return 1
+  fi
+}
+
+kagent_demo_verify_recorded_context() {
+  local record="$1" context recorded_context
+  context="$(kubectl config current-context)"
+  recorded_context="$(jq -r '.data.context // ""' <<<"$record")"
+  if [[ "$recorded_context" != "$context" ]]; then
+    printf 'The kagent ownership record context (%s) does not match the current context (%s); refusing to continue.\n' \
+      "$recorded_context" "$context" >&2
     return 1
   fi
 }
@@ -200,9 +211,11 @@ kagent_demo_capture_crds() {
 kagent_demo_write_owner_record() {
   local namespace="$1" gateway_namespace="$2" releases="$3" crds="$4"
   local inventory_file="$5" custom_resources_file="$6"
+  local context
+  context="$(kubectl config current-context)"
   kubectl create configmap kagent-demo-ownership \
     -n "$namespace" \
-    --from-literal=context=rancher-desktop \
+    --from-literal=context="$context" \
     --from-literal=gateway-namespace="$gateway_namespace" \
     --from-literal=kagent-version=1.0.1 \
     --from-literal=releases="$releases" \

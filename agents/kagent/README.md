@@ -18,15 +18,22 @@ short-lived JWTs from Kubernetes Secrets.
 
 ## Runtime and cluster requirements
 
-- Rancher Desktop Kubernetes, selected as the `rancher-desktop` kubectl context
-- Kubernetes 1.37 or later; the local Rancher Desktop cluster used for this
-  implementation reports server version `v1.37.2+k3s1`
+- A local Kubernetes cluster: Rancher Desktop by default, or Kind
+- Kubernetes 1.37 or later, with the certificate APIs and feature gates
+  required by the pinned kagent/Substrate runtime
 - Helm 3.12+ or Helm 4.x, `kubectl`, the kagent CLI v1.0.1, `jq`, `openssl`,
   Python 3.12, and `uv`
 - An installed agentgateway v1.7.0 demo and its MCP add-on in the same
   `AGENTGATEWAY_NAMESPACE`
-- Docker Engine enabled in Rancher Desktop so the existing MCP image can be
-  built locally without Kind
+- Docker for building the MCP image; Rancher Desktop uses its Docker Engine,
+  while Kind requires loading the image into its nodes
+
+The kagent scripts expect the `rancher-desktop` context by default. To use
+another local cluster, select its context explicitly and export
+`KAGENT_CONTEXT` with the same name for installation, port-forwarding,
+evaluation, and cleanup. Scripts refuse context mismatches and never switch
+contexts automatically. The base gateway and MCP scripts use the current
+kubectl context, so keep all demo operations on the same cluster.
 
 kagent 1.0 also installs Agent Substrate v1.0.0, its PodCertificate
 controller, and a development PostgreSQL database. The CLI provisions the
@@ -41,13 +48,67 @@ The pinned kagent chart supplies its release-compatible, digest-pinned native
 runtime image. The kagent CLI installs the matching kagent v1.0.1 charts and
 Agent Substrate v1.0.0 charts.
 
-## Prepare the existing gateway and MCP add-on
+## Prepare a local cluster
 
-Select Rancher Desktop and prepare the local MCP image and SDK environment:
+Choose one of the following local workflows. Neither requires publishing an
+image or a registry account. The MCP Deployments retain
+`imagePullPolicy: Never`, so the selected image must exist on every node where
+they can run.
+
+### Rancher Desktop (default)
+
+Enable Kubernetes and the Docker (Moby) container engine in Rancher Desktop.
+Ensure the `docker` command targets that engine, not another Docker daemon:
 
 ```sh
 kubectl config use-context rancher-desktop
+export KAGENT_CONTEXT=rancher-desktop
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
+docker image inspect agentgateway-mcp:demo >/dev/null
+```
+
+The local environment inspected during development reports Kubernetes
+`v1.37.2+k3s1` and a Docker node runtime. An end-to-end kagent installation and
+live evaluation have not yet been verified.
+
+### Kind (alternative)
+
+Install Kind v0.33.0 and Docker. The
+[Kind v0.33.0 release](https://github.com/kubernetes-sigs/kind/releases/tag/v0.33.0)
+publishes the Kubernetes 1.37.0 node image pinned below. The supplied
+[Kind configuration](kind-config.yaml) enables the certificate feature gates
+and beta API used by the
+[pinned kagent configuration](https://github.com/kagent-dev/kagent/blob/v1.0.1/scripts/kind/kind-config.yaml).
+The proxy ARP/NDP preparation follows
+[Substrate v1.0.0's local setup](https://github.com/kagent-dev/substrate/blob/v1.0.0/hack/create-kind-cluster.sh).
+This alternative is documented from upstream sources but has not been run
+end to end for this demo.
+
+Run these commands only when choosing Kind instead of Rancher Desktop:
+
+```sh
+export KIND_EXPERIMENTAL_PROVIDER=docker
+kind create cluster --name ai-gateway-demo \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 \
+  --config agents/kagent/kind-config.yaml --wait 120s
+kubectl config use-context kind-ai-gateway-demo
+export KAGENT_CONTEXT=kind-ai-gateway-demo
+docker exec ai-gateway-demo-control-plane sysctl net.ipv4.conf.all.proxy_arp=1
+docker exec ai-gateway-demo-control-plane sysctl -e net.ipv6.conf.all.proxy_ndp=1
+docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
+kind load docker-image agentgateway-mcp:demo --name ai-gateway-demo
+```
+
+For an existing Kind cluster, ensure it meets the same Kubernetes and
+certificate requirements before using it. Adjust the cluster/context names
+and prepare every node if using a multi-node cluster. A default cluster from
+an older Kind release may not meet the runtime requirements.
+
+## Prepare the existing gateway and MCP add-on
+
+After selecting the cluster and preparing its image, set up the SDK environment:
+
+```sh
 uv sync --project gateways/agentgateway/mcp --locked
 . "$PWD/gateways/agentgateway/mcp/.venv/bin/activate"
 export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
@@ -73,10 +134,9 @@ make kagent-install
 `kagent-install` requires `AGENTGATEWAY_BOB_KEY`, `AGENTGATEWAY_MCP_KEY_DIR`,
 and an existing compatible gateway/MCP installation. It requires the pinned
 kagent CLI v1.0.1 and Helm 3.12+ or Helm 4.x. It waits for both agents to
-become Ready.
-To use a non-default agent namespace, set `KAGENT_NAMESPACE`; to use a
-non-default gateway namespace, consistently set `AGENTGATEWAY_NAMESPACE` for
-all gateway, MCP, and kagent targets.
+become Ready. To use a non-default agent namespace, set `KAGENT_NAMESPACE`;
+to use a non-default gateway namespace, consistently set
+`AGENTGATEWAY_NAMESPACE` for all gateway, MCP, and kagent targets.
 
 The installer passes the Bob *gateway client key* to kagent's installer as its
 required OpenAI-compatible API key. The generated ModelConfig points to the
@@ -137,12 +197,15 @@ make agentgateway-uninstall
 ```
 
 The kagent uninstaller requires the demo's ownership record, verifies pinned
-Helm release identities and the namespace inventory, and refuses to remove
-shared CRDs or runtime namespaces when unrelated resources exist. It removes
-only the runtime's dedicated `ate-system` and
+Helm release identities, the installation context, and the namespace inventory,
+and refuses to remove shared CRDs or runtime namespaces when unrelated
+resources exist. It removes only the runtime's dedicated `ate-system` and
 `podcertificate-controller-system` namespaces and keeps the kagent namespace.
 The agentgateway and MCP targets remain independent; remove them only when no
 other demo uses them.
+
+Keep the same `KAGENT_CONTEXT` setting used during installation. Cleanup
+targets never delete the local cluster itself.
 
 ## Release references
 

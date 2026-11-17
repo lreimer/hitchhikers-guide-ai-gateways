@@ -19,11 +19,11 @@ if [[ -z "$record" ]] ||
     "$namespace" >&2
   exit 1
 fi
-if [[ "$(jq -r '.data.context' <<<"$record")" != rancher-desktop ||
-  "$(jq -r '.data["kagent-version"]' <<<"$record")" != 1.0.1 ]]; then
-  printf 'The kagent ownership record does not match this Rancher Desktop v1.0.1 installation.\n' >&2
+if [[ "$(jq -r '.data["kagent-version"]' <<<"$record")" != 1.0.1 ]]; then
+  printf 'The kagent ownership record does not match the pinned v1.0.1 installation.\n' >&2
   exit 1
 fi
+kagent_demo_verify_recorded_context "$record"
 
 releases="$(jq -r '.data.releases' <<<"$record")"
 crds="$(jq -r '.data.crds' <<<"$record")"

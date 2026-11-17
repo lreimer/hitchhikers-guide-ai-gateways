@@ -139,5 +139,5 @@ kubectl wait --for=condition=Ready --timeout=10m \
   "agents.api.kagent.dev/product-quote-assistant" \
   "agents.api.kagent.dev/internal-product-support-assistant" \
   -n "$namespace"
-printf 'PASS kagent v1.0.1 and declarative agents installed in %s against Rancher Desktop. Agentgateway backend mode: %s.\n' \
-  "$namespace" "$backend_mode"
+printf 'PASS kagent v1.0.1 and declarative agents installed in namespace %s on context %s. Agentgateway backend mode: %s.\n' \
+  "$namespace" "$(kubectl config current-context)" "$backend_mode"
