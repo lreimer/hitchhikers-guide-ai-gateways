@@ -14,5 +14,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v10.3.3
+
     - name: Run validate
       run: make validate
