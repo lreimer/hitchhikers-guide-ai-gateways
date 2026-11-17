@@ -421,7 +421,11 @@ kagent_demo_verify_inventory() {
   fi
   actual="$(kagent_demo_capture_inventory "$namespace")" || return 1
   expected="$(jq -c 'sort_by(.namespace,.resource,.name)' <<<"$expected")" || return 1
-  if [[ "$actual" != "$expected" ]]; then
+  # Issued certificate requests are garbage-collected; never accept additions.
+  if ! jq -en --argjson actual "$actual" --argjson expected "$expected" '
+    ($actual - $expected | length) == 0 and
+    all(($expected - $actual)[];
+      .resource == "podcertificaterequests.certificates.k8s.io")' >/dev/null; then
     printf 'Resources in the kagent runtime namespaces changed since installation; refusing cleanup.\n' >&2
     printf 'Review new, removed, or replaced resources in %s, ate-system, and podcertificate-controller-system.\n' \
       "$namespace" >&2

@@ -35,6 +35,8 @@ def allowed_hosts(name: str) -> list[str]:
         "[::1]:*",
         f"{service}:8000",
         f"{service}.{namespace}.svc.cluster.local:8000",
+        f"agentgateway-proxy.{namespace}.svc.cluster.local",
+        f"agentgateway-proxy.{namespace}.svc.cluster.local:80",
     ]
 
 
@@ -68,7 +70,8 @@ def app(mcp: MCPServer) -> Starlette:
 
 
 def run(mcp: MCPServer) -> None:
-    logging.basicConfig(level=logging.INFO)
+    # Replace the SDK's wrapping console handler with machine-readable records.
+    logging.basicConfig(level=logging.INFO, force=True)
     uvicorn.run(app(mcp), host="0.0.0.0", port=8000, log_config=None)
 
 

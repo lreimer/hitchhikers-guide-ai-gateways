@@ -44,9 +44,11 @@ SDK-enabled Python (`AGENTGATEWAY_MCP_PYTHON`, default `python3`); only the publ
 JWKS enters Kubernetes. The v1.7.0 proxy preserves the incoming Host for
 service-selected MCP targets; the local port-forward sends
 `127.0.0.1:<port>`. In-cluster backends therefore allow loopback with any port
-for this localhost-only flow, plus their service DNS names in the pod
-namespace. Do not expose this proxy publicly. Reinstallation briefly detaches
-only the MCP route.
+for this localhost-only flow, plus their service DNS names and the exact
+`agentgateway-proxy.<namespace>.svc.cluster.local` host (with or without port
+80) for in-cluster clients such as kagent. Other namespaces' gateway hosts
+are not allowed. Do not expose this proxy publicly. Reinstallation briefly
+detaches only the MCP route.
 
 ## Local build and setup
 
@@ -288,6 +290,10 @@ errors. Alice hit the configured rate limit, recovered after refill, and Bob
 remained usable. The base LLM mock walkthrough passed before MCP installation,
 while MCP was installed, and after MCP removal in both namespaces. No provider
 inference calls were made.
+
+The 2026-11-17 [kagent evaluation](../../../agents/kagent/README.md#live-evaluation)
+also verified in-cluster MCP discovery and provider-backed tool execution on
+Rancher Desktop, including the preserved gateway Host and single-line tool logs.
 
 Do not run these LLM checks in OpenAI mode unintentionally: that mode incurs
 inference charges. Static checks retain the repository's existing coverage:

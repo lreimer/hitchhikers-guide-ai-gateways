@@ -76,8 +76,9 @@ docker image inspect agentgateway-mcp:demo >/dev/null
 ```
 
 The local environment inspected during development reports Kubernetes
-`v1.37.2+k3s1` and a Docker node runtime. An end-to-end kagent installation and
-live evaluation have not yet been verified.
+`v1.37.2+k3s1` and a Docker node runtime. Installation, ownership-verified repeat
+installation, both MCP discoveries, and the provider-backed `gpt-4o-mini`
+evaluation have been verified on this setup using Helm 4.3.1.
 
 ### Kind (alternative)
 
@@ -141,8 +142,9 @@ make kagent-install
 
 `kagent-install` requires `AGENTGATEWAY_BOB_KEY`, `AGENTGATEWAY_MCP_KEY_DIR`,
 and an existing compatible gateway/MCP installation. It requires the pinned
-kagent CLI v1.0.1 and Helm 3.12+ or Helm 4.x. It waits for both agents to
-become Ready. To use a non-default agent namespace, set `KAGENT_NAMESPACE`;
+kagent CLI v1.0.1 and Helm 3.12+ or Helm 4.x. It waits for both MCP servers to
+become Accepted and both agents to become Ready. To use a non-default agent
+namespace, set `KAGENT_NAMESPACE`;
 to use a non-default gateway namespace, consistently set
 `AGENTGATEWAY_NAMESPACE` for all gateway, MCP, and kagent targets.
 
@@ -158,7 +160,9 @@ The installer creates an ownership record before runtime provisioning and
 checkpoints completed steps, namespace UIDs, Helm release identities and
 statuses, CRDs, and resource inventories. Repeating a successful installation
 verifies those records, reuses the runtime, and refreshes the demo credentials
-and manifests.
+and manifests. Garbage-collected PodCertificateRequests may disappear from
+the recorded inventory; additions, replacements, and other removals still
+require manual review.
 
 If provisioning, Secret creation, manifest application, or readiness fails,
 the exit handler records the partial state. Run `make kagent-uninstall` with
@@ -186,6 +190,10 @@ AGENTGATEWAY_MODE=openai OPENAI_API_KEY=... make agentgateway-install
 KAGENT_LIVE_EVAL=true make kagent-demo
 ```
 
+The gateway retains its 10,000-token/hour allowance per LLM identity.
+Repeated evaluations and diagnostic calls consume that allowance and can
+return HTTP 429; allow quota to replenish before retrying.
+
 The bounded evaluation:
 
 - Checks Bob's tool discovery and direct internal-note denial independently of
@@ -200,6 +208,20 @@ The bounded evaluation:
   boundary after authentication checks excludes their tool calls.
 - Renews the JWTs before the run and deletes the temporary kagent Sessions
   afterward.
+
+The provider-backed evaluation passed on Rancher Desktop on 2026-11-17:
+
+| Scenario | Verified outcome |
+| --- | --- |
+| Bob quote | $12.50 unit price and $37.50 total for three Star Widgets |
+| Alice support | Synthetic violet-batch note retrieved |
+| Unknown product | Reported absent rather than estimating |
+| Bob internal note | Private note not disclosed; direct tool call denied |
+| Tool-call evidence | Catalog lookup, internal-note lookup, and multiplication logged |
+
+Tool descriptions supply exact catalog IDs rather than relying on the model
+to guess identifiers from product names. MCP container logs use unwrapped
+single-line records so the tool-name assertions can match complete names.
 
 The evaluation starts temporary loopback-only forwards on ports `18083`
 (kagent API) and `18080` (MCP assertions). Set `KAGENT_API_LOCAL_PORT` or

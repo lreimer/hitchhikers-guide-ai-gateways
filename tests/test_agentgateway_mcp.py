@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -94,6 +95,27 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ToolCallLogTests(unittest.TestCase):
+    def test_server_startup_preserves_single_line_tool_records(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from unittest.mock import patch\n"
+                "import catalog, common\n"
+                "with patch('common.uvicorn.run', side_effect=lambda *a, **k: "
+                "catalog.lookup_internal_note('star-widget')):\n"
+                "    common.run(catalog.mcp)\n",
+            ],
+            cwd=MCP_DIR,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn(
+            "INFO:catalog:tool_call=catalog.lookup_internal_note",
+            result.stderr.splitlines(),
+        )
+
     def test_tool_call_logs_exclude_arguments(self):
         with self.assertLogs("calculator", level="INFO") as calculator_logs:
             calculator.multiply(6, 7)
@@ -126,8 +148,43 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     "[::1]:*",
                     "agentgateway-mcp-calculator:8000",
                     "agentgateway-mcp-calculator.mcp-alternate.svc.cluster.local:8000",
+                    "agentgateway-proxy.mcp-alternate.svc.cluster.local",
+                    "agentgateway-proxy.mcp-alternate.svc.cluster.local:80",
                 ],
             )
+
+    async def test_preserved_gateway_host_is_scoped_to_pod_namespace(self):
+        import os
+
+        for backend in (calculator, catalog):
+            with self.subTest(backend=backend.__name__):
+                with patch.dict(os.environ, {"POD_NAMESPACE": "mcp-alternate"}):
+                    app = backend.app(backend.mcp)
+                async with app.router.lifespan_context(app):
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app),
+                        base_url="http://localhost:8000",
+                    ) as client:
+                        for host, expected in (
+                            ("agentgateway-proxy.mcp-alternate.svc.cluster.local", 200),
+                            ("agentgateway-proxy.mcp-alternate.svc.cluster.local:80", 200),
+                            ("agentgateway-proxy.other.svc.cluster.local", 421),
+                            ("unrelated.example.invalid", 421),
+                        ):
+                            with self.subTest(host=host):
+                                response = await client.post(
+                                    "/mcp",
+                                    headers={"host": host, "accept": "application/json, text/event-stream"},
+                                    json={
+                                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                        "params": {
+                                            "protocolVersion": "2025-11-25",
+                                            "capabilities": {},
+                                            "clientInfo": {"name": "host-regression", "version": "1"},
+                                        },
+                                    },
+                                )
+                                self.assertEqual(response.status_code, expected, response.text)
 
     async def test_status_probe_advertises_streamable_http_responses(self):
         from starlette.applications import Starlette

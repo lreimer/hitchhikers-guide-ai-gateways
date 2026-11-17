@@ -364,6 +364,33 @@ kagent_demo_verify_inventory custom "$captured"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Resources in the kagent runtime namespaces changed", result.stderr)
 
+    def test_only_garbage_collected_certificate_requests_may_disappear(self):
+        config = {
+            "resource": "configmaps", "namespace": "custom",
+            "name": "runtime-config", "uid": "config-uid",
+        }
+        request = {
+            "resource": "podcertificaterequests.certificates.k8s.io",
+            "namespace": "custom", "name": "issued-request", "uid": "request-uid",
+        }
+        for scenario, actual, accepted in (
+            ("garbage collection", [config], True),
+            ("removed config", [], False),
+            ("replaced request", [config, {**request, "uid": "replacement"}], False),
+            ("new request", [config, request, {
+                **request, "name": "unrelated", "uid": "new-uid",
+            }], False),
+        ):
+            with self.subTest(scenario=scenario):
+                result = self.run_shell("""
+kagent_demo_capture_inventory() { printf '%s' "$TEST_ACTUAL"; }
+kagent_demo_verify_inventory custom "$TEST_EXPECTED"
+""", extra_env={
+                    "TEST_EXPECTED": json.dumps([config, request]),
+                    "TEST_ACTUAL": json.dumps(actual),
+                })
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
 
 class KagentInstallRecoveryTests(unittest.TestCase):
     def run_install_steps(self, failure="", reuse=False):

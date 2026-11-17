@@ -176,6 +176,10 @@ completed_step=agents
 kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing "$completed_step"
 
 kubectl rollout status deployment/kagent-controller -n "$namespace" --timeout=5m
+kubectl wait --for=condition=Accepted --timeout=2m \
+  "remotemcpservers.api.kagent.dev/product-catalog-bob" \
+  "remotemcpservers.api.kagent.dev/product-support-alice" \
+  -n "$namespace"
 kubectl wait --for=condition=Ready --timeout=10m \
   "agents.api.kagent.dev/product-quote-assistant" \
   "agents.api.kagent.dev/internal-product-support-assistant" \

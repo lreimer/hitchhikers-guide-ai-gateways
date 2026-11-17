@@ -41,8 +41,8 @@ key setup, OpenAI mode, quota caveats, and cleanup.
 The [MCP add-on](gateways/agentgateway/mcp/README.md) extends that installation
 with a local SDK-backed calculator and fictional product catalog, without
 provider keys or inference calls. Its MCP coverage is separate from the
-LLM-focused feature comparison. Gateway end-to-end validation remains pending
-because the implementation sandbox could not resolve the official chart registry.
+LLM-focused feature comparison. The combined gateway/MCP flow is exercised
+by the kagent live evaluation below.
 
 ### kagent demo agents
 
@@ -50,7 +50,8 @@ The [kagent demo](agents/kagent/README.md) adds two declarative agents on the
 existing agentgateway LLM and MCP routes. It requires the separately installed
 agentgateway MCP add-on and a compatible local Kubernetes cluster. Rancher
 Desktop is the default; Kind is an alternative. Live provider-backed agent
-calls require explicit opt-in.
+calls require explicit opt-in. Deployment and the provider-backed evaluation
+have been verified on Rancher Desktop; the Kind path remains unverified.
 
 ### KrakenD Community Edition
 
