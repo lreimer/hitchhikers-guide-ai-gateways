@@ -7,7 +7,7 @@ inference provider and semantic-cache embedding provider.
 
 - A Kubernetes cluster and a working `kubectl` context
 - Helm 3
-- `openssl` and `curl`
+- `openssl`, `curl`, and `jq`
 - An OpenAI API key in `OPENAI_API_KEY`
 
 ## Install and try it
@@ -40,9 +40,16 @@ export BIFROST_VIRTUAL_KEY=...
 make bifrost-demo
 ```
 
-The response includes token usage. To explore semantic caching, send the same
-question again with slightly different wording and compare request logs and
-provider usage in the dashboard.
+Responses are pretty-printed JSON, with colours when writing to a terminal.
+Set `NO_COLOR=1` to disable colours. HTTP error responses are also formatted,
+and failed requests still return a nonzero exit status.
+
+The demo sends two requests sequentially: "What is an AI gateway?" followed by
+"What is an AI gateway, exactly?". Both use the same model and virtual key.
+Compare cache status in the dashboard request logs and provider usage to see
+whether the second request was served from semantic cache. A hit depends on the
+configured similarity threshold and the first response being cached; it is not
+guaranteed. Responses include token usage.
 
 ## Configuration
 

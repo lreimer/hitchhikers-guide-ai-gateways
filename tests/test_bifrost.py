@@ -1,4 +1,7 @@
+import errno
+import json
 import os
+import pty
 import subprocess
 import tempfile
 import unittest
@@ -6,6 +9,107 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class BifrostDemoTests(unittest.TestCase):
+    def run_demo(self, *, terminal=False, status=0, no_color=False, calls_path=""):
+        env = {
+            **os.environ,
+            "BIFROST_VIRTUAL_KEY": "test-key",
+            "TEST_CURL_STATUS": str(status),
+            "TEST_REQUESTS": str(calls_path),
+            "TERM": "xterm",
+        }
+        env.pop("NO_COLOR", None)
+        if no_color:
+            env["NO_COLOR"] = "1"
+        script = """
+curl() {
+  if [[ "$*" == *"/health"* ]]; then return 0; fi
+  if [[ -n "$TEST_REQUESTS" ]]; then
+    while (( $# )); do
+      if [[ "$1" == --data ]]; then printf '%s\\n' "$2" >> "$TEST_REQUESTS"; fi
+      shift
+    done
+  fi
+  printf '%s' '{"message":"demo response","usage":{"total_tokens":42}}'
+  return "$TEST_CURL_STATUS"
+}
+source scripts/demo-bifrost.sh
+"""
+        if not terminal:
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=ROOT, env=env,
+                text=True, capture_output=True,
+            )
+            return result.returncode, result.stdout
+        master, slave = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                ["bash", "-c", script], cwd=ROOT, env=env,
+                stdout=slave, stderr=subprocess.STDOUT,
+            )
+            os.close(slave)
+            slave = None
+            chunks = []
+            while True:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return process.wait(), b"".join(chunks).decode()
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_redirected_response_is_pretty_json_without_colours(self):
+        status, output = self.run_demo()
+        self.assertEqual(status, 0)
+        self.assertNotIn("\x1b[", output)
+        payload = output[output.index("{"):]
+        self.assertIn('\n  "message":', payload)
+        response, _ = json.JSONDecoder().raw_decode(payload)
+        self.assertEqual(response["usage"]["total_tokens"], 42)
+        self.assertEqual(output.count('"message":'), 2)
+
+    def test_sends_two_similar_prompts_with_the_same_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = Path(directory) / "requests"
+            status, output = self.run_demo(calls_path=calls)
+            self.assertEqual(status, 0)
+            requests = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0]["model"], requests[1]["model"])
+            self.assertTrue(requests[0]["model"].startswith("openai/"))
+            prompts = [request["messages"][0]["content"] for request in requests]
+            self.assertEqual(prompts, [
+                "What is an AI gateway?",
+                "What is an AI gateway, exactly?",
+            ])
+            for prompt in prompts:
+                self.assertIn(f"Prompt: {prompt}", output)
+
+    def test_terminal_response_is_coloured(self):
+        status, output = self.run_demo(terminal=True)
+        self.assertEqual(status, 0)
+        self.assertIn("\x1b[", output)
+
+    def test_no_color_disables_terminal_colours(self):
+        status, output = self.run_demo(terminal=True, no_color=True)
+        self.assertEqual(status, 0)
+        self.assertNotIn("\x1b[", output)
+
+    def test_http_failure_preserves_curl_status_and_formats_body(self):
+        status, output = self.run_demo(status=22)
+        self.assertEqual(status, 22)
+        self.assertIn('\n  "message":', output)
+        self.assertNotIn("What is an AI gateway, exactly?", output)
 
 
 class BifrostInstallerTests(unittest.TestCase):
