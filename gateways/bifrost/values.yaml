@@ -1,6 +1,13 @@
 image:
   tag: "v2.4.0"
 
+env:
+  - name: BIFROST_SETUP_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: "bifrost-setup-token"
+        key: "setup-token"
+
 bifrost:
   encryptionKeySecret:
     name: "bifrost-encryption-key"
