@@ -1,0 +1,25 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: product-quote-assistant
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  template:
+    ref:
+      name: product-quote-assistant
+  harnessRef:
+    name: kagent-demo-harness
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: internal-product-support-assistant
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  template:
+    ref:
+      name: internal-product-support-assistant
+  harnessRef:
+    name: kagent-demo-harness

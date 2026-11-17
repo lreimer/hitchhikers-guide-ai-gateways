@@ -1,8 +1,9 @@
 """Shared configuration for the SDK's Streamable HTTP servers."""
 
+import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import os
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -67,7 +68,8 @@ def app(mcp: MCPServer) -> Starlette:
 
 
 def run(mcp: MCPServer) -> None:
-    uvicorn.run(app(mcp), host="0.0.0.0", port=8000)
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app(mcp), host="0.0.0.0", port=8000, log_config=None)
 
 
 def server(name: str) -> MCPServer:

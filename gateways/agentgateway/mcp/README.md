@@ -50,18 +50,27 @@ only the MCP route.
 
 ## Local build and setup
 
-Prerequisites are the base demo's tools and credentials, Docker, Kind, Python
-3.12, and `uv`. The SDK project and complete dependency graph are managed by
-`pyproject.toml` and `uv.lock`. From the repository root:
+Use Rancher Desktop with its Kubernetes context selected; this walkthrough does
+not use Kind. The cluster must support the base demo's Kubernetes version
+requirements. Prerequisites are the base demo's tools and credentials, Docker,
+Python 3.12, and `uv`. The SDK project and complete dependency graph are managed
+by `pyproject.toml` and `uv.lock`. From the repository root:
 
 ```sh
-kind create cluster --name agentgateway-mcp --image kindest/node:v1.35.0 --wait 120s
+kubectl config use-context rancher-desktop
+kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}{"\n"}'
 docker build -t agentgateway-mcp:demo gateways/agentgateway/mcp
-kind load docker-image agentgateway-mcp:demo --name agentgateway-mcp
+docker image inspect agentgateway-mcp:demo >/dev/null
 uv sync --project gateways/agentgateway/mcp --locked
 . "$PWD/gateways/agentgateway/mcp/.venv/bin/activate"
 export AGENTGATEWAY_MCP_PYTHON="$PWD/gateways/agentgateway/mcp/.venv/bin/python"
 ```
+
+The Rancher Desktop cluster used for this walkthrough reports a Docker
+container runtime, so the Kubernetes node can use the image built by Rancher
+Desktop's Docker engine directly. Do not run these commands against another
+context; `imagePullPolicy: Never` requires the image to be available to the
+selected cluster.
 
 `requirements.txt` is a hash-locked export from the uv lockfile for the
 container's `pip --require-hashes` installation. To update dependencies, edit
@@ -287,8 +296,6 @@ make agentgateway-mcp-uninstall
 rm -f "$AGENTGATEWAY_MCP_KEY_DIR"/{private.pem,jwks.json,alice.jwt,bob.jwt,invalid.jwt,expired.jwt}
 rmdir "$AGENTGATEWAY_MCP_KEY_DIR"
 unset AGENTGATEWAY_MCP_KEY_DIR
-# After all other demonstrations finish:
-kind delete cluster --name agentgateway-mcp
 ```
 
 Add-on uninstall checks ownership before deleting its fixed resource set.
@@ -304,8 +311,8 @@ Public deployment requires additional authentication/TLS and network controls.
 
 - Missing or incompatible prerequisites: install/repair the pinned base demo
   rather than adding another controller or adopting someone else's resources.
-- Pods not ready: verify the image is loaded into the correct Kind cluster,
-  then inspect Deployment events and `/readyz` probes.
+- Pods not ready: verify the image is loaded into the selected Rancher Desktop
+  cluster, then inspect Deployment events and `/readyz` probes.
 - Rejected policy/backend/route: inspect `kubectl describe` in the selected
   namespace; the installer performs server-side schema validation first.
 - HTTP 401: renew tokens, confirm issuer/audience and public JWKS, and verify

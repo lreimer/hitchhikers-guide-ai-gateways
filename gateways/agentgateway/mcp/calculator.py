@@ -1,5 +1,6 @@
 """Deterministic calculator fixture; authorization is enforced by the gateway."""
 
+import logging
 import math
 from typing import Annotated
 
@@ -36,17 +37,20 @@ class Calculation(BaseModel):
 
 
 mcp: MCPServer = server("calculator")
+logger = logging.getLogger(__name__)
 
 
 @mcp.tool()
 def add(a: Number, b: Number) -> Calculation:
     """Add two finite numbers."""
+    logger.info("tool_call=calculator.add")
     return Calculation(result=finite_result(a + b))
 
 
 @mcp.tool()
 def multiply(a: Number, b: Number) -> Calculation:
     """Multiply two finite numbers."""
+    logger.info("tool_call=calculator.multiply")
     return Calculation(result=finite_result(a * b))
 
 

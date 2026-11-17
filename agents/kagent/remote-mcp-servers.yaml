@@ -1,0 +1,35 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata:
+  name: product-catalog-bob
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  description: Public product catalog and calculator tools through agentgateway as the fixed Bob demo role.
+  protocol: STREAMABLE_HTTP
+  url: "http://agentgateway-proxy.__AGENTGATEWAY_NAMESPACE__.svc.cluster.local/mcp"
+  headersFrom:
+    - name: Authorization
+      valueFrom:
+        type: Secret
+        name: kagent-mcp-bob
+        key: authorization
+  timeout: 30s
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata:
+  name: product-support-alice
+  labels:
+    app.kubernetes.io/managed-by: kagent-demo
+spec:
+  description: Public catalog, calculator, and synthetic internal-note tools through agentgateway as the fixed Alice demo role.
+  protocol: STREAMABLE_HTTP
+  url: "http://agentgateway-proxy.__AGENTGATEWAY_NAMESPACE__.svc.cluster.local/mcp"
+  headersFrom:
+    - name: Authorization
+      valueFrom:
+        type: Secret
+        name: kagent-mcp-alice
+        key: authorization
+  timeout: 30s

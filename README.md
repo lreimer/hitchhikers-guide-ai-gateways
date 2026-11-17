@@ -13,6 +13,7 @@ scripted walkthrough.
 | [Agent Router (formerly Envoy AI Gateway)](gateways/envoy-ai-gateway/README.md) | [Kubernetes demo](gateways/envoy-ai-gateway/README.md) | API-key authentication, model virtualization, token-based limits and recovery |
 | [agentgateway](gateways/agentgateway/README.md) | [Governed LLM access demo](gateways/agentgateway/README.md) | Client API keys, model authorization, request throttling, per-client token budgets, token usage |
 | [agentgateway MCP add-on](gateways/agentgateway/mcp/README.md) | [MCP federation and tool authorization](gateways/agentgateway/mcp/README.md) | Two SDK-backed servers, JWT identities, tool discovery/call authorization, per-user local request limits |
+| [kagent demo agents](agents/kagent/README.md) | [Product quote and internal support](agents/kagent/README.md) | Declarative agents, gateway-routed model/tool calls, Bob/Alice tool authorization |
 
 Agent Router and agentgateway are covered in the
 [feature comparison](docs/feature-matrix.md); additional runnable demos can be
@@ -42,6 +43,13 @@ with a local SDK-backed calculator and fictional product catalog, without
 provider keys or inference calls. Its MCP coverage is separate from the
 LLM-focused feature comparison. Gateway end-to-end validation remains pending
 because the implementation sandbox could not resolve the official chart registry.
+
+### kagent demo agents
+
+The [kagent demo](agents/kagent/README.md) adds two declarative agents on the
+existing agentgateway LLM and MCP routes. It requires the separately installed
+agentgateway MCP add-on, uses Rancher Desktop rather than Kind, and opts in
+explicitly before making live provider-backed agent calls.
 
 ### KrakenD Community Edition
 

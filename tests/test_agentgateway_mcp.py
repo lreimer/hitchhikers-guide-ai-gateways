@@ -93,6 +93,23 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ToolCallLogTests(unittest.TestCase):
+    def test_tool_call_logs_exclude_arguments(self):
+        with self.assertLogs("calculator", level="INFO") as calculator_logs:
+            calculator.multiply(6, 7)
+        self.assertEqual(
+            calculator_logs.output,
+            ["INFO:calculator:tool_call=calculator.multiply"],
+        )
+
+        with self.assertLogs("catalog", level="INFO") as catalog_logs:
+            catalog.lookup_internal_note("star-widget")
+        self.assertEqual(
+            catalog_logs.output,
+            ["INFO:catalog:tool_call=catalog.lookup_internal_note"],
+        )
+
+
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_in_cluster_hosts_are_scoped_to_service_and_namespace(self):
         import os
@@ -101,7 +118,12 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 common.allowed_hosts("calculator"),
                 [
+                    "127.0.0.1",
                     "127.0.0.1:*",
+                    "localhost",
+                    "localhost:*",
+                    "[::1]",
+                    "[::1]:*",
                     "agentgateway-mcp-calculator:8000",
                     "agentgateway-mcp-calculator.mcp-alternate.svc.cluster.local:8000",
                 ],

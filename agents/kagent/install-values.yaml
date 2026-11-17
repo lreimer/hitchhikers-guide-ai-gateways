@@ -1,0 +1,14 @@
+ui:
+  route:
+    enabled: false
+kagent-tools:
+  enabled: false
+harnesses:
+  enabled: false
+providers:
+  default: openAI
+  openAI:
+    model: "__MODEL__"
+    config:
+      baseUrl: "http://agentgateway-proxy.__AGENTGATEWAY_NAMESPACE__.svc.cluster.local/v1"
+      apiFormat: chatCompletions
