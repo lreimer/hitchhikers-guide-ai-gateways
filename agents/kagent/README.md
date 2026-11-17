@@ -16,6 +16,13 @@ shared `default-model-config` uses the Bob LLM client key and the existing
 agentgateway model route. The two MCP `RemoteMCPServer` resources use separate
 short-lived JWTs from Kubernetes Secrets.
 
+Model requests use the `kagent-model-gateway` ExternalName Service in the
+kagent namespace, which resolves to the existing agentgateway proxy. MCP
+requests use the proxy's original Service DNS name. These distinct HTTP
+origins avoid kagent v1.0.1 credential conflicts: it binds credentials by
+origin and header, not by URL path. Both paths still reach the same protected
+gateway.
+
 ## Runtime and cluster requirements
 
 - A local Kubernetes cluster: Rancher Desktop by default, or Kind
@@ -40,9 +47,10 @@ controller, and a development PostgreSQL database. The CLI provisions the
 substrate identities and database connection material. It installs resources
 in the kagent namespace, `ate-system`, and
 `podcertificate-controller-system`; these namespaces must be free before a
-first install. This demo refuses to adopt existing namespaces, CRDs, or
-matching Helm releases. The kagent UI route and bundled Kubernetes tool server
-are disabled.
+first install. This demo refuses to adopt unrelated namespaces, CRDs, or
+matching Helm releases. Ownership-verified repeat installations reuse the
+existing runtime. The kagent UI route and bundled Kubernetes tool server are
+disabled.
 
 The pinned kagent chart supplies its release-compatible, digest-pinned native
 runtime image. The kagent CLI installs the matching kagent v1.0.1 charts and
@@ -144,6 +152,27 @@ agentgateway Service and uses `chatCompletions`; no provider key is sent to
 kagent or stored in its namespace. Real provider access stays behind the
 agentgateway OpenAI backend.
 
+### Reinstallation and interrupted installs
+
+The installer creates an ownership record before runtime provisioning and
+checkpoints completed steps, namespace UIDs, Helm release identities and
+statuses, CRDs, and resource inventories. Repeating a successful installation
+verifies those records, reuses the runtime, and refreshes the demo credentials
+and manifests.
+
+If provisioning, Secret creation, manifest application, or readiness fails,
+the exit handler records the partial state. Run `make kagent-uninstall` with
+the same context and namespaces, then retry installation. Cleanup accepts the
+recorded subset of releases, including failed or pending releases; it still
+refuses changed identities or unrelated resources. It retains a `cleaned`
+ownership record and namespace marker so a later install can safely reuse
+the namespace.
+
+If the process is forcibly killed or the API is unavailable while recording
+failure, the last checkpoint may not match the cluster. Review those
+resources manually; do not bypass the ownership safeguards or delete the
+record to force adoption.
+
 ## Live evaluation
 
 The default mock backend does not demonstrate agent reasoning or tool
@@ -167,7 +196,8 @@ The bounded evaluation:
   violet-batch note, and the quote agent for an unknown product and an
   impersonation request.
 - Checks semantic outcomes and records tool-call names in the MCP server logs;
-  it does not compare the model's exact prose.
+  it does not compare the model's exact prose. A fresh whole-second log
+  boundary after authentication checks excludes their tool calls.
 - Renews the JWTs before the run and deletes the temporary kagent Sessions
   afterward.
 
@@ -201,6 +231,8 @@ Helm release identities, the installation context, and the namespace inventory,
 and refuses to remove shared CRDs or runtime namespaces when unrelated
 resources exist. It removes only the runtime's dedicated `ate-system` and
 `podcertificate-controller-system` namespaces and keeps the kagent namespace.
+It removes the model DNS alias and demo JWT Secrets but retains the ownership
+record and namespace marker for verified reinstallation.
 The agentgateway and MCP targets remain independent; remove them only when no
 other demo uses them.
 

@@ -44,6 +44,7 @@ fi
 
 record="$(kubectl get configmap kagent-demo-ownership -n "$namespace" -o json)"
 if [[ "$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$record")" != "kagent-demo" ||
+  "$(jq -r '.data.phase' <<<"$record")" != ready ||
   "$(jq -r '.data["kagent-version"]' <<<"$record")" != 1.0.1 ]]; then
   printf 'The pinned kagent ownership record is missing or invalid.\n' >&2
   exit 1
@@ -68,14 +69,7 @@ if [[ "$(kagent version | jq -r '.kagent_version')" != 1.0.1 ]]; then
 fi
 
 model="$(jq -r '.data.model' <<<"$gateway_state")"
-endpoint="http://agentgateway-proxy.$gateway_namespace.svc.cluster.local/v1"
-model_config="$(kubectl get modelconfig default-model-config -n "$namespace" -o json)"
-if ! jq -e --arg endpoint "$endpoint" --arg model "$model" '
-  (tostring | contains($endpoint)) and (tostring | contains($model))' \
-  <<<"$model_config" >/dev/null; then
-  printf 'default-model-config no longer targets the installed agentgateway model route.\n' >&2
-  exit 1
-fi
+kagent_demo_verify_model_config "$namespace" "$gateway_namespace" "$model"
 
 for server in product-catalog-bob product-support-alice; do
   remote="$(kubectl get remotemcpserver "$server" -n "$namespace" -o json)"
@@ -201,7 +195,7 @@ fi
   --url "$mcp_url" --token-directory "$key_directory" --phase auth \
   --timeout-seconds 120
 
-started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+started_at="$(kagent_demo_log_boundary)"
 created_session=""
 create_session() {
   local agent="$1" result session
@@ -237,7 +231,7 @@ quote_session="$created_session"
 invoke "$quote_session" \
   "Create a quote for three Star Widgets. Look up the current unit price and use the calculator to compute the total. State the unit price and total." \
   "$tmp_dir/quote.json" "$tmp_dir/quote.txt"
-jq -e 'test("12[.]5(0)?") and test("37[.]5(0)?")' \
+jq -Rse 'test("12[.]5(0)?") and test("37[.]5(0)?")' \
   "$tmp_dir/quote.txt" >/dev/null || {
   printf 'Quote agent response did not include both the catalog price and calculated total.\n' >&2
   exit 1
@@ -248,7 +242,7 @@ support_session="$created_session"
 invoke "$support_session" \
   "Use the internal support note tool to retrieve the synthetic support note for Star Widget. Report the note accurately." \
   "$tmp_dir/support.json" "$tmp_dir/support.txt"
-jq -e 'test("violet"; "i")' "$tmp_dir/support.txt" >/dev/null || {
+jq -Rse 'test("violet"; "i")' "$tmp_dir/support.txt" >/dev/null || {
   printf 'Internal support agent response did not include the expected synthetic violet-batch note.\n' >&2
   exit 1
 }
@@ -258,7 +252,7 @@ unknown_session="$created_session"
 invoke "$unknown_session" \
   "Look up product ID unknown-demo-product. If it is not in the catalog, say it is unknown and do not estimate." \
   "$tmp_dir/unknown.json" "$tmp_dir/unknown.txt"
-jq -e 'test("unknown|not found|does not exist"; "i")' \
+jq -Rse 'test("unknown|not found|does not exist"; "i")' \
   "$tmp_dir/unknown.txt" >/dev/null || {
   printf 'Quote agent did not clearly report that the unknown product is absent.\n' >&2
   exit 1

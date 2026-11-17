@@ -13,32 +13,35 @@ kagent_demo_validate_namespace "$namespace"
 
 record="$(kubectl get configmap kagent-demo-ownership -n "$namespace" \
   --ignore-not-found -o json)"
-if [[ -z "$record" ]] ||
-  [[ "$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$record")" != "kagent-demo" ]]; then
+if [[ -z "$record" ]]; then
   printf 'No kagent-demo ownership record found in %s; refusing to remove runtime resources.\n' \
     "$namespace" >&2
   exit 1
 fi
-if [[ "$(jq -r '.data["kagent-version"]' <<<"$record")" != 1.0.1 ]]; then
-  printf 'The kagent ownership record does not match the pinned v1.0.1 installation.\n' >&2
-  exit 1
+kagent_demo_verify_installation "$namespace" "$record"
+if [[ "$(jq -r '.data.phase' <<<"$record")" == cleaned ]]; then
+  printf 'PASS kagent runtime already removed; retained namespace ownership verified.\n'
+  exit 0
 fi
-kagent_demo_verify_recorded_context "$record"
-
-releases="$(jq -r '.data.releases' <<<"$record")"
-crds="$(jq -r '.data.crds' <<<"$record")"
-inventory="$(jq -r '.data.inventory // empty' <<<"$record")"
-custom_resources="$(jq -r '.data["custom-resources"] // empty' <<<"$record")"
-kagent_demo_verify_recorded_releases "$namespace" "$releases"
-kagent_demo_verify_recorded_crds "$crds"
-kagent_demo_verify_inventory "$namespace" "$inventory"
-kagent_demo_check_pod_ownership "$namespace"
-kagent_demo_verify_custom_resources "$custom_resources"
 
 if [[ "$(kagent version | jq -r '.kagent_version')" != "1.0.1" ]]; then
   printf 'Use the pinned kagent CLI v1.0.1 to uninstall this runtime.\n' >&2
   exit 1
 fi
+gateway_namespace="$(jq -r '.data["gateway-namespace"]' <<<"$record")"
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "$status" -ne 0 ]]; then
+    if ! kagent_demo_checkpoint "$namespace" "$gateway_namespace" cleanup-failed cleanup; then
+      printf 'Could not checkpoint interrupted cleanup; review ownership before retrying.\n' >&2
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 kagent uninstall --namespace "$namespace" --delete-worker-pools
 
 for namespace_to_remove in ate-system podcertificate-controller-system; do
@@ -60,6 +63,8 @@ for secret in kagent-mcp-bob kagent-mcp-alice; do
   kagent_demo_owner_check secret "$secret" "$namespace"
   kubectl delete secret "$secret" -n "$namespace" --ignore-not-found
 done
-kubectl delete configmap kagent-demo-ownership -n "$namespace"
+kagent_demo_owner_check service kagent-model-gateway "$namespace"
+kubectl delete service kagent-model-gateway -n "$namespace" --ignore-not-found
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" cleaned runtime-removed
 printf 'PASS removed the owned kagent v1.0.1 and Substrate v1.0.0 runtime. The %s namespace remains.\n' \
   "$namespace"

@@ -41,7 +41,25 @@ fi
 
 agentgateway_mcp_prerequisites "$gateway_namespace"
 kagent_demo_verify_mcp_policy "$root_dir" "$gateway_namespace"
-kagent_demo_check_fresh_install "$namespace"
+reuse_runtime=false
+record="$(kubectl get configmap kagent-demo-ownership -n "$namespace" --ignore-not-found -o json)"
+if [[ -n "$record" ]]; then
+  kagent_demo_verify_installation "$namespace" "$record"
+  if [[ "$(jq -r '.data["gateway-namespace"]' <<<"$record")" != "$gateway_namespace" ]]; then
+    printf 'The recorded gateway namespace differs; use the original AGENTGATEWAY_NAMESPACE.\n' >&2
+    exit 1
+  fi
+  case "$(jq -r '.data.phase' <<<"$record")" in
+    ready) reuse_runtime=true ;;
+    cleaned) ;;
+    *)
+      printf 'An incomplete installation is recorded. Run make kagent-uninstall with the same context and namespace, then retry installation.\n' >&2
+      exit 1
+      ;;
+  esac
+else
+  kagent_demo_check_fresh_install "$namespace"
+fi
 
 gateway_state="$(kubectl get configmap agentgateway-demo-state -n "$gateway_namespace" -o json)"
 if [[ "$(jq -r '.data["agentgateway-version"]' <<<"$gateway_state")" != "v1.7.0" ]]; then
@@ -78,17 +96,24 @@ fi
 
 for resource in \
   "secret kagent-mcp-bob $namespace" \
-  "secret kagent-mcp-alice $namespace"; do
+  "secret kagent-mcp-alice $namespace" \
+  "service kagent-model-gateway $namespace"; do
   read -r kind name resource_namespace <<<"$resource"
   kagent_demo_owner_check "$kind" "$name" "$resource_namespace"
 done
 
 install_dir="$(mktemp -d "${TMPDIR:-/tmp}/kagent-demo-install.XXXXXX")"
+checkpoint_enabled=false
+completed_step=preflight
 cleanup() {
   local status=$?
   trap - EXIT
-  rm -f "$install_dir/install-config.yaml" "$install_dir/install-values.yaml" \
-    "$install_dir/inventory.json" "$install_dir/custom-resources.json"
+  if [[ "$checkpoint_enabled" == true && "$status" -ne 0 ]]; then
+    if ! kagent_demo_checkpoint "$namespace" "$gateway_namespace" failed "$completed_step"; then
+      printf 'Could not checkpoint the partial installation; ownership checks will require manual review before cleanup.\n' >&2
+    fi
+  fi
+  rm -f "$install_dir/install-config.yaml" "$install_dir/install-values.yaml"
   rmdir "$install_dir" 2>/dev/null || true
   exit "$status"
 }
@@ -98,17 +123,35 @@ trap 'exit 143' TERM
 
 sed \
   -e "s/__MODEL__/$model/g" \
+  -e "s/__KAGENT_NAMESPACE__/$namespace/g" \
   -e "s/__AGENTGATEWAY_NAMESPACE__/$gateway_namespace/g" \
   "$root_dir/agents/kagent/install-values.yaml" > "$install_dir/install-values.yaml"
 printf 'install:\n  kagent:\n    valuesFiles:\n      - %s\n' \
   "$install_dir/install-values.yaml" > "$install_dir/install-config.yaml"
 
-OPENAI_API_KEY="$AGENTGATEWAY_BOB_KEY" \
-  kagent install --config "$install_dir/install-config.yaml" \
-  --provider OpenAI --namespace "$namespace"
+kagent_demo_prepare_namespace "$namespace"
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing namespace
+checkpoint_enabled=true
+completed_step=namespace
+for runtime_namespace in ate-system podcertificate-controller-system; do
+  kagent_demo_prepare_namespace "$runtime_namespace"
+done
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing namespaces
+completed_step=namespaces
 
-releases="$(kagent_demo_capture_releases "$namespace")"
-crds="$(kagent_demo_capture_crds)"
+if [[ "$reuse_runtime" != true ]]; then
+  OPENAI_API_KEY="$AGENTGATEWAY_BOB_KEY" \
+    kagent install --config "$install_dir/install-config.yaml" \
+    --provider OpenAI --namespace "$namespace"
+fi
+
+kagent_demo_capture_releases "$namespace" >/dev/null
+completed_step=runtime
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing "$completed_step"
+
+sed "s/__AGENTGATEWAY_NAMESPACE__/$gateway_namespace/g" \
+  "$root_dir/agents/kagent/model-gateway.yaml" |
+  kubectl apply --namespace "$namespace" -f -
 
 for identity in bob alice; do
   printf 'Bearer %s' "$(cat "$key_directory/$identity.jwt")" |
@@ -118,6 +161,8 @@ for identity in bob alice; do
     kubectl label --local -f - "$kagent_demo_managed_by" --overwrite -o yaml |
     kubectl apply -f -
 done
+completed_step=credentials
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing "$completed_step"
 
 for manifest in \
   "$root_dir/agents/kagent/harness.yaml" \
@@ -127,17 +172,15 @@ for manifest in \
   sed "s/__AGENTGATEWAY_NAMESPACE__/$gateway_namespace/g" "$manifest" |
     kubectl apply --namespace "$namespace" -f -
 done
+completed_step=agents
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" installing "$completed_step"
 
 kubectl rollout status deployment/kagent-controller -n "$namespace" --timeout=5m
-inventory="$(kagent_demo_capture_inventory "$namespace")"
-custom_resources="$(kagent_demo_capture_custom_resources)"
-printf '%s' "$inventory" > "$install_dir/inventory.json"
-printf '%s' "$custom_resources" > "$install_dir/custom-resources.json"
-kagent_demo_write_owner_record "$namespace" "$gateway_namespace" "$releases" "$crds" \
-  "$install_dir/inventory.json" "$install_dir/custom-resources.json"
 kubectl wait --for=condition=Ready --timeout=10m \
   "agents.api.kagent.dev/product-quote-assistant" \
   "agents.api.kagent.dev/internal-product-support-assistant" \
   -n "$namespace"
+kagent_demo_checkpoint "$namespace" "$gateway_namespace" ready agents-ready
+checkpoint_enabled=false
 printf 'PASS kagent v1.0.1 and declarative agents installed in namespace %s on context %s. Agentgateway backend mode: %s.\n' \
   "$namespace" "$(kubectl config current-context)" "$backend_mode"

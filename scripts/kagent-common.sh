@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 
 kagent_demo_managed_by="app.kubernetes.io/managed-by=kagent-demo"
-kagent_demo_releases=(
-  "kagent-crds kagent"
-  "kagent kagent"
-  "substrate-crds ate-system"
-  "substrate ate-system"
-  "substrate-atelet ate-system"
-  "substrate-podcert podcertificate-controller-system"
-)
+kagent_demo_namespace_label="demo.kagent.dev/owned=true"
 kagent_demo_api_groups=("api.kagent.dev" "ate.dev")
+
+kagent_demo_release_namespaces() {
+  printf '%s\n' \
+    "kagent-crds $1" "kagent $1" \
+    "substrate-crds ate-system" "substrate ate-system" \
+    "substrate-atelet ate-system" \
+    "substrate-podcert podcertificate-controller-system"
+}
 
 kagent_demo_require_commands() {
   local command_name
@@ -124,6 +125,39 @@ kagent_demo_verify_mcp_policy() {
   fi
 }
 
+kagent_demo_verify_model_config() {
+  local namespace="$1" gateway_namespace="$2" model="$3" config service
+  config="$(kubectl get modelconfig default-model-config -n "$namespace" -o json)"
+  service="$(kubectl get service kagent-model-gateway -n "$namespace" -o json)"
+  if ! jq -e --arg endpoint \
+    "http://kagent-model-gateway.$namespace.svc.cluster.local/v1" --arg model "$model" '
+      .spec.provider == "OpenAI" and .spec.model == $model and
+      .spec.openAI.baseUrl == $endpoint and
+      .spec.openAI.apiFormat == "chatCompletions"' <<<"$config" >/dev/null ||
+    ! jq -e --arg target "agentgateway-proxy.$gateway_namespace.svc.cluster.local" '
+      .metadata.labels["app.kubernetes.io/managed-by"] == "kagent-demo" and
+      .spec.type == "ExternalName" and .spec.externalName == $target and
+      any(.spec.ports[]?; .port == 80)' <<<"$service" >/dev/null; then
+    printf 'default-model-config or its DNS alias no longer targets the installed agentgateway model route.\n' >&2
+    return 1
+  fi
+}
+
+kagent_demo_log_boundary() {
+  local previous current attempt
+  previous="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    sleep 0.1
+    current="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [[ "$current" != "$previous" ]]; then
+      printf '%s' "$current"
+      return 0
+    fi
+  done
+  printf 'Timed out waiting for a new second to exclude MCP authentication calls from agent logs.\n' >&2
+  return 1
+}
+
 kagent_demo_check_fresh_install() {
   local namespace="$1" name release_namespace release_json crd_json groups
   for name in "$namespace" ate-system podcertificate-controller-system; do
@@ -134,9 +168,8 @@ kagent_demo_check_fresh_install() {
     fi
   done
 
-  release_json="$(helm list --all-namespaces --output json)"
-  for release in "${kagent_demo_releases[@]}"; do
-    read -r name release_namespace <<<"$release"
+  release_json="$(helm list --all-namespaces --deployed --failed --pending --uninstalling --output json)"
+  while read -r name release_namespace; do
     if jq -e --arg name "$name" --arg namespace "$release_namespace" \
       'any(.[]; .name == $name and .namespace == $namespace)' \
       <<<"$release_json" >/dev/null; then
@@ -144,7 +177,7 @@ kagent_demo_check_fresh_install() {
         "$name" "$release_namespace" >&2
       return 1
     fi
-  done
+  done < <(kagent_demo_release_namespaces "$namespace")
 
   crd_json="$(kubectl get crds -o json)"
   groups="$(printf '%s\n' "${kagent_demo_api_groups[@]}" | jq -R . | jq -s .)"
@@ -157,42 +190,42 @@ kagent_demo_check_fresh_install() {
 }
 
 kagent_demo_capture_releases() {
-  local namespace="$1" release release_namespace name revision chart uid rows="[]"
-  for release in "${kagent_demo_releases[@]}"; do
-    read -r name release_namespace <<<"$release"
-    local entry
-    entry="$(helm list --namespace "$release_namespace" --output json |
-      jq -c --arg name "$name" '[.[] | select(.name == $name and .status == "deployed")] |
-        if length == 1 then .[0] else empty end')"
+  local namespace="$1" mode="${2:-complete}" release_namespace name revision chart uid
+  local rows="[]" entry expected_version
+  while read -r name release_namespace; do
+    entry="$(helm list --namespace "$release_namespace" \
+      --deployed --failed --pending --uninstalling --output json |
+      jq -c --arg name "$name" '[.[] | select(.name == $name)] |
+        if length == 1 then .[0] else empty end')" || return 1
     if [[ -z "$entry" ]]; then
-      printf 'Could not record exactly one deployed Helm release %s in %s.\n' \
+      if [[ "$mode" == partial ]]; then continue; fi
+      printf 'Could not record Helm release %s in %s.\n' \
         "$name" "$release_namespace" >&2
       return 1
     fi
     revision="$(jq -r '.revision' <<<"$entry")"
     chart="$(jq -r '.chart' <<<"$entry")"
+    expected_version=1.0.0
+    if [[ "$name" == kagent || "$name" == kagent-crds ]]; then expected_version=1.0.1; fi
+    if [[ "$chart" != "$name-$expected_version" ]] ||
+      [[ "$mode" != partial && "$(jq -r '.status' <<<"$entry")" != deployed ]]; then
+      printf 'Helm release %s in %s has an unexpected chart or status.\n' \
+        "$name" "$release_namespace" >&2
+      return 1
+    fi
     uid="$(kubectl get secret "sh.helm.release.v1.$name.v$revision" \
-      -n "$release_namespace" -o json | jq -r '.metadata.uid')"
+      -n "$release_namespace" -o json | jq -r '.metadata.uid')" || return 1
+    if [[ -z "$uid" || "$uid" == null ]]; then
+      printf 'Helm release %s has no release Secret UID.\n' "$name" >&2
+      return 1
+    fi
     rows="$(jq -c --arg name "$name" --arg namespace "$release_namespace" \
-      --arg chart "$chart" --arg uid "$uid" '. + [{name:$name,namespace:$namespace,chart:$chart,uid:$uid}]' \
+      --arg chart "$chart" --arg uid "$uid" --arg revision "$revision" \
+      --arg status "$(jq -r '.status' <<<"$entry")" \
+      '. + [{name:$name,namespace:$namespace,chart:$chart,uid:$uid,revision:$revision,status:$status}]' \
       <<<"$rows")"
-  done
-
-  jq -e --arg namespace "$namespace" '
-    length == 6 and
-    all(.[];
-      .uid | type == "string" and length > 0) and
-    any(.[]; .name == "kagent" and .namespace == $namespace and .chart == "kagent-1.0.1") and
-    any(.[]; .name == "kagent-crds" and .namespace == $namespace and .chart == "kagent-crds-1.0.1") and
-    any(.[]; .name == "substrate" and .namespace == "ate-system" and .chart == "substrate-1.0.0") and
-    any(.[]; .name == "substrate-crds" and .namespace == "ate-system" and .chart == "substrate-crds-1.0.0") and
-    any(.[]; .name == "substrate-atelet" and .namespace == "ate-system" and .chart == "substrate-atelet-1.0.0") and
-    any(.[]; .name == "substrate-podcert" and .namespace == "podcertificate-controller-system" and .chart == "substrate-podcert-1.0.0")' \
-    <<<"$rows" >/dev/null || {
-    printf 'Installed Helm releases do not match the pinned kagent v1.0.1/Substrate v1.0.0 set.\n' >&2
-    return 1
-  }
-  printf '%s' "$rows"
+  done < <(kagent_demo_release_namespaces "$namespace")
+  jq -c 'sort_by(.namespace,.name)' <<<"$rows"
 }
 
 kagent_demo_capture_crds() {
@@ -200,17 +233,13 @@ kagent_demo_capture_crds() {
   groups="$(printf '%s\n' "${kagent_demo_api_groups[@]}" | jq -R . | jq -s .)"
   crds="$(kubectl get crds -o json | jq -c --argjson groups "$groups" '
     [.items[] | .spec.group as $group | select($groups | index($group) != null) |
-      {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)')"
-  if [[ "$(jq 'length' <<<"$crds")" -eq 0 ]]; then
-    printf 'No kagent or Substrate CRDs were installed.\n' >&2
-    return 1
-  fi
+      {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)')" || return 1
   printf '%s' "$crds"
 }
 
 kagent_demo_write_owner_record() {
   local namespace="$1" gateway_namespace="$2" releases="$3" crds="$4"
-  local inventory_file="$5" custom_resources_file="$6"
+  local inventory="$5" custom_resources="$6" phase="$7" completed_step="$8" namespaces="$9"
   local context
   context="$(kubectl config current-context)"
   kubectl create configmap kagent-demo-ownership \
@@ -220,29 +249,101 @@ kagent_demo_write_owner_record() {
     --from-literal=kagent-version=1.0.1 \
     --from-literal=releases="$releases" \
     --from-literal=crds="$crds" \
-    --from-file=inventory="$inventory_file" \
-    --from-file=custom-resources="$custom_resources_file" \
+    --from-literal=inventory="$inventory" \
+    --from-literal=custom-resources="$custom_resources" \
+    --from-literal=phase="$phase" \
+    --from-literal=completed-step="$completed_step" \
+    --from-literal=namespaces="$namespaces" \
     --dry-run=client -o yaml |
     kubectl label --local -f - "$kagent_demo_managed_by" --overwrite -o yaml |
     kubectl apply -f -
 }
 
+kagent_demo_capture_namespaces() {
+  local namespace="$1" name object entries="[]"
+  for name in "$namespace" ate-system podcertificate-controller-system; do
+    object="$(kubectl get namespace "$name" --ignore-not-found -o json)" || return 1
+    if [[ -n "$object" ]]; then
+      if ! jq -e '.metadata.labels["demo.kagent.dev/owned"] == "true"' \
+        <<<"$object" >/dev/null; then
+        printf 'Namespace %s is not owned by kagent-demo.\n' "$name" >&2
+        return 1
+      fi
+      entries="$(jq -c --argjson object "$object" \
+        '. + [{name:$object.metadata.name,uid:$object.metadata.uid}]' <<<"$entries")"
+    fi
+  done
+  jq -c 'sort_by(.name)' <<<"$entries"
+}
+
+kagent_demo_prepare_namespace() {
+  local namespace="$1" object
+  object="$(kubectl get namespace "$namespace" --ignore-not-found -o json)"
+  if [[ -n "$object" ]]; then
+    if ! jq -e '.metadata.labels["demo.kagent.dev/owned"] == "true"' \
+      <<<"$object" >/dev/null; then
+      printf 'Refusing to adopt namespace %s.\n' "$namespace" >&2
+      return 1
+    fi
+    return 0
+  fi
+  kubectl create namespace "$namespace" --dry-run=client -o yaml |
+    kubectl label --local -f - "$kagent_demo_namespace_label" --overwrite -o yaml |
+    kubectl create -f -
+}
+
+kagent_demo_checkpoint() {
+  local namespace="$1" gateway_namespace="$2" phase="$3" completed_step="$4"
+  local releases crds inventory custom_resources namespaces
+  releases="$(kagent_demo_capture_releases "$namespace" partial)" || return 1
+  crds="$(kagent_demo_capture_crds)" || return 1
+  inventory="$(kagent_demo_capture_inventory "$namespace")" || return 1
+  custom_resources="$(kagent_demo_capture_custom_resources)" || return 1
+  namespaces="$(kagent_demo_capture_namespaces "$namespace")" || return 1
+  kagent_demo_write_owner_record "$namespace" "$gateway_namespace" "$releases" "$crds" \
+    "$inventory" "$custom_resources" "$phase" "$completed_step" "$namespaces"
+}
+
+kagent_demo_verify_installation() {
+  local namespace="$1" record="$2" namespaces expected
+  if ! jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "kagent-demo" and
+    .data["kagent-version"] == "1.0.1" and
+    (.data.phase | IN("installing", "failed", "ready", "cleaned", "cleanup-failed"))' \
+    <<<"$record" >/dev/null; then
+    printf 'Missing or invalid kagent-demo ownership record; refusing to adopt resources.\n' >&2
+    return 1
+  fi
+  kagent_demo_verify_recorded_context "$record" || return 1
+  namespaces="$(kagent_demo_capture_namespaces "$namespace")" || return 1
+  expected="$(jq -cr '.data.namespaces | fromjson | sort_by(.name)' <<<"$record")" || return 1
+  if [[ "$namespaces" != "$expected" ]]; then
+    printf 'Runtime namespace identities changed; refusing to continue.\n' >&2
+    return 1
+  fi
+  kagent_demo_verify_recorded_releases "$namespace" "$(jq -r '.data.releases' <<<"$record")" || return 1
+  kagent_demo_verify_recorded_crds "$(jq -r '.data.crds' <<<"$record")" || return 1
+  kagent_demo_verify_inventory "$namespace" "$(jq -r '.data.inventory' <<<"$record")" || return 1
+  kagent_demo_check_pod_ownership "$namespace" || return 1
+  kagent_demo_verify_custom_resources "$(jq -r '.data["custom-resources"]' <<<"$record")"
+}
+
 kagent_demo_capture_custom_resources() {
-  local group resource objects entries custom_resources="[]"
+  local group resource resources objects entries custom_resources="[]"
   for group in "${kagent_demo_api_groups[@]}"; do
+    resources="$(kubectl api-resources --api-group="$group" --output=name)" || return 1
     while IFS= read -r resource; do
       [[ -z "$resource" ]] && continue
-      objects="$(kubectl get "$resource" --all-namespaces -o json)"
+      objects="$(kubectl get "$resource" --all-namespaces -o json)" || return 1
       entries="$(jq -c --arg resource "$resource" '
         [.items[] | {
           resource:$resource,
           namespace:(.metadata.namespace // ""),
           name:.metadata.name,
           uid:.metadata.uid
-        }]' <<<"$objects")"
+        }]' <<<"$objects")" || return 1
       custom_resources="$(jq -cn --argjson existing "$custom_resources" \
-        --argjson next "$entries" '$existing + $next')"
-    done < <(kubectl api-resources --api-group="$group" --output=name)
+        --argjson next "$entries" '$existing + $next')" || return 1
+    done <<<"$resources"
   done
   jq -c 'sort_by(.namespace,.resource,.name)' <<<"$custom_resources"
 }
@@ -253,8 +354,8 @@ kagent_demo_verify_custom_resources() {
     printf 'Ownership record has no custom-resource inventory; refusing cleanup.\n' >&2
     return 1
   fi
-  actual="$(kagent_demo_capture_custom_resources)"
-  expected="$(jq -c 'sort_by(.namespace,.resource,.name)' <<<"$expected")"
+  actual="$(kagent_demo_capture_custom_resources)" || return 1
+  expected="$(jq -c 'sort_by(.namespace,.resource,.name)' <<<"$expected")" || return 1
   if [[ "$actual" != "$expected" ]]; then
     printf 'The kagent or Substrate custom-resource set changed since installation; refusing cleanup of shared CRDs.\n' >&2
     return 1
@@ -262,10 +363,17 @@ kagent_demo_verify_custom_resources() {
 }
 
 kagent_demo_capture_inventory() {
-  local namespace="$1" resource objects entries inventory="[]" target_namespace
-  for resource in $(kubectl api-resources --namespaced --verbs=list --output=name); do
-    for target_namespace in "$namespace" ate-system podcertificate-controller-system; do
-      objects="$(kubectl get "$resource" -n "$target_namespace" -o json)"
+  local namespace="$1" resource resources objects entries inventory="[]" target_namespace object
+  local target_namespaces=()
+  for target_namespace in "$namespace" ate-system podcertificate-controller-system; do
+    object="$(kubectl get namespace "$target_namespace" --ignore-not-found -o name)" || return 1
+    if [[ -n "$object" ]]; then target_namespaces+=("$target_namespace"); fi
+  done
+  resources="$(kubectl api-resources --namespaced --verbs=list --output=name)" || return 1
+  while IFS= read -r resource; do
+    [[ -z "$resource" ]] && continue
+    for target_namespace in "${target_namespaces[@]}"; do
+      objects="$(kubectl get "$resource" -n "$target_namespace" -o json)" || return 1
       entries="$(jq -c --arg resource "$resource" --arg namespace "$namespace" '
         [.items[] |
           select(.kind != "Event" and .kind != "Pod" and
@@ -277,18 +385,21 @@ kagent_demo_capture_inventory() {
           namespace:.metadata.namespace,
           name:.metadata.name,
           uid:.metadata.uid
-        }]' <<<"$objects")"
+        }]' <<<"$objects")" || return 1
       inventory="$(jq -cn --argjson existing "$inventory" --argjson next "$entries" \
-        '$existing + $next')"
+        '$existing + $next')" || return 1
     done
-  done
+  done <<<"$resources"
   jq -c 'sort_by(.namespace,.resource,.name)' <<<"$inventory"
 }
 
 kagent_demo_check_pod_ownership() {
   local namespace="$1" target_namespace pods
   for target_namespace in "$namespace" ate-system podcertificate-controller-system; do
-    pods="$(kubectl get pods -n "$target_namespace" -o json)"
+    if [[ -z "$(kubectl get namespace "$target_namespace" --ignore-not-found -o name)" ]]; then
+      continue
+    fi
+    pods="$(kubectl get pods -n "$target_namespace" -o json)" || return 1
     if ! jq -e 'all(.items[];
       any(.metadata.ownerReferences[]?; .controller == true))' \
       <<<"$pods" >/dev/null; then
@@ -308,8 +419,8 @@ kagent_demo_verify_inventory() {
     printf 'Ownership record has no complete namespace inventory; refusing cleanup of a partial installation.\n' >&2
     return 1
   fi
-  actual="$(kagent_demo_capture_inventory "$namespace")"
-  expected="$(jq -c 'sort_by(.namespace,.resource,.name)' <<<"$expected")"
+  actual="$(kagent_demo_capture_inventory "$namespace")" || return 1
+  expected="$(jq -c 'sort_by(.namespace,.resource,.name)' <<<"$expected")" || return 1
   if [[ "$actual" != "$expected" ]]; then
     printf 'Resources in the kagent runtime namespaces changed since installation; refusing cleanup.\n' >&2
     printf 'Review new, removed, or replaced resources in %s, ate-system, and podcertificate-controller-system.\n' \
@@ -319,32 +430,13 @@ kagent_demo_verify_inventory() {
 }
 
 kagent_demo_verify_recorded_releases() {
-  local namespace="$1" expected="$2" release name release_namespace revision secret_uid current expected_release
-  for release in "${kagent_demo_releases[@]}"; do
-    read -r name release_namespace <<<"$release"
-    expected_release="$(jq -c --arg name "$name" --arg namespace "$release_namespace" \
-      '.[] | select(.name == $name and .namespace == $namespace)' <<<"$expected")"
-    if [[ -z "$expected_release" ]]; then
-      printf 'Ownership record is missing Helm release %s in %s.\n' "$name" "$release_namespace" >&2
-      return 1
-    fi
-    current="$(helm list --namespace "$release_namespace" --output json |
-      jq -c --arg name "$name" '[.[] | select(.name == $name)] | if length == 1 then .[0] else empty end')"
-    if [[ -z "$current" || "$(jq -r '.status' <<<"$current")" != deployed ||
-      "$(jq -r '.chart' <<<"$current")" != "$(jq -r '.chart' <<<"$expected_release")" ]]; then
-      printf 'Helm release %s in %s is missing, changed, or not deployed; refusing cleanup.\n' \
-        "$name" "$release_namespace" >&2
-      return 1
-    fi
-    revision="$(jq -r '.revision' <<<"$current")"
-    secret_uid="$(kubectl get secret "sh.helm.release.v1.$name.v$revision" \
-      -n "$release_namespace" -o json | jq -r '.metadata.uid')"
-    if [[ "$secret_uid" != "$(jq -r '.uid' <<<"$expected_release")" ]]; then
-      printf 'Helm release %s in %s has a different release identity; refusing cleanup.\n' \
-        "$name" "$release_namespace" >&2
-      return 1
-    fi
-  done
+  local namespace="$1" expected="$2" actual
+  actual="$(kagent_demo_capture_releases "$namespace" partial)" || return 1
+  expected="$(jq -c 'sort_by(.namespace,.name)' <<<"$expected")" || return 1
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Helm release identities, revisions, or statuses changed; refusing cleanup.\n' >&2
+    return 1
+  fi
 }
 
 kagent_demo_verify_recorded_crds() {
@@ -352,8 +444,8 @@ kagent_demo_verify_recorded_crds() {
   groups="$(printf '%s\n' "${kagent_demo_api_groups[@]}" | jq -R . | jq -s .)"
   actual="$(kubectl get crds -o json | jq -c --argjson groups "$groups" '
     [.items[] | .spec.group as $group | select($groups | index($group) != null) |
-      {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)')"
-  expected="$(jq -c 'sort_by(.name)' <<<"$expected")"
+      {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)')" || return 1
+  expected="$(jq -c 'sort_by(.name)' <<<"$expected")" || return 1
   if [[ "$actual" != "$expected" ]]; then
     printf 'kagent/Substrate CRD set changed since installation; refusing cleanup.\n' >&2
     return 1

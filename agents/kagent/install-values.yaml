@@ -10,5 +10,5 @@ providers:
   openAI:
     model: "__MODEL__"
     config:
-      baseUrl: "http://agentgateway-proxy.__AGENTGATEWAY_NAMESPACE__.svc.cluster.local/v1"
+      baseUrl: "http://kagent-model-gateway.__KAGENT_NAMESPACE__.svc.cluster.local/v1"
       apiFormat: chatCompletions
