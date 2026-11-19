@@ -6,6 +6,9 @@ Chat Completions route. Both agents call the existing `/mcp` route; the
 gateway's Bob/Alice JWT policy, not the prompts, limits access to internal
 notes.
 
+The separate Go ADK BYO compatibility spike and its remaining live gates are
+documented in [BYO compatibility](BYO-compatibility.md).
+
 | Agent | MCP identity | Tools |
 | --- | --- | --- |
 | Product Quote Assistant | Bob | Product lookup, add, multiply |

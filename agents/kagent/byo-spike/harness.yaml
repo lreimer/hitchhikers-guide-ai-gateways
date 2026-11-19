@@ -1,0 +1,16 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: byo-compatibility-probe
+  labels:
+    app.kubernetes.io/managed-by: kagent-byo-compatibility-spike
+spec:
+  byo: {}
+  workload:
+    image: ghcr.io/lreimer/hitchhikers-guide-ai-gateways@sha256:534a937798280039c65a3af7bf8bd57c4a991e0bee0c4dbedf5269cb50773ea0
+    command: ["/usr/local/bin/byo-spike"]
+  substrate:
+    workerPoolRef:
+      name: kagent-default
+    snapshotPolicy:
+      location: s3://ate-snapshots/kagent/

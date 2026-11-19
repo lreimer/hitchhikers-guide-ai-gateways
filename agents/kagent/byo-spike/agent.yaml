@@ -1,0 +1,12 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: byo-compatibility-probe
+  labels:
+    app.kubernetes.io/managed-by: kagent-byo-compatibility-spike
+spec:
+  template:
+    ref:
+      name: byo-compatibility-probe
+  harnessRef:
+    name: byo-compatibility-probe

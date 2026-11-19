@@ -1,0 +1,19 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata:
+  name: byo-compatibility-probe
+  labels:
+    app.kubernetes.io/managed-by: kagent-byo-compatibility-spike
+spec:
+  description: Exercises the pinned kagent BYO model, MCP, A2A, and session path.
+  modelConfig:
+    name: default-model-config
+  systemPrompt: |-
+    You are a runtime compatibility probe. For product questions, use the product catalog tool and report only facts it returns. Preserve relevant details from earlier turns in this session. Never invent product facts or prices.
+  tools:
+    - mcp:
+        server:
+          kind: RemoteMCPServer
+          name: product-catalog-bob
+        tools:
+          - catalog_lookup_product

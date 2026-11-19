@@ -5,3 +5,4 @@ __pycache__/
 .agentgateway-demo-*/
 .agentgateway-install-*/
 .agentgateway-mcp-research/
+/agents/kagent/byo-spike/byo-spike
