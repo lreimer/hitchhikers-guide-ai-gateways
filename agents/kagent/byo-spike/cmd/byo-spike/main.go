@@ -12,8 +12,8 @@ import (
 	"github.com/kagent-dev/kagent/go/adk/pkg/agent"
 	"github.com/kagent-dev/kagent/go/adk/pkg/app"
 	"github.com/kagent-dev/kagent/go/adk/pkg/config"
+	kagentsession "github.com/kagent-dev/kagent/go/adk/pkg/session"
 	"github.com/kagent-dev/kagent/go/pkg/logging"
-	adksession "google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/runner"
 )
 
@@ -42,7 +42,13 @@ func run() error {
 		return fmt.Errorf("create ADK agent: %w", err)
 	}
 
-	sessionService := adksession.InMemoryService()
+	sessionService, err := kagentsession.NewService(agentConfig.GetAgent().GetSessionDbUrl())
+	if err != nil {
+		return fmt.Errorf("open durable session store: %w", err)
+	}
+	if sessionService == nil {
+		return fmt.Errorf("durable session store requires session_db_url")
+	}
 	executor, err := a2a.NewKAgentExecutor(a2a.KAgentExecutorConfig{
 		RunnerConfig: runner.Config{
 			AppName:        name,
