@@ -3,9 +3,12 @@
 ## Result
 
 The kagent v1.0.1 source and installed Harness API agree on the BYO contract.
-The source/API gate passes, but the end-to-end compatibility gate is not yet
-complete: this run did not execute a BYO image in Substrate, call the model or
-MCP server from that image, or verify suspend/resume state.
+The source/API gate passes. A runnable probe now exists under
+`agents/kagent/byo-spike/`; `go test ./...`, an ARM64 container build, and
+server-side dry runs of its Agent, AgentTemplate, and Harness all pass. The
+end-to-end compatibility gate is not yet complete: the image has not been
+published or executed by Substrate, and no BYO gRPC/model/MCP or
+suspend/resume result is claimed.
 
 ## Pins and runtime contract
 
@@ -55,25 +58,40 @@ is not a substitute for this contract check: it configures port 8082 and
 JSON-RPC, while the kagent BYO runtime contract requires the gRPC path on port
 80.
 
-## Local checks and remaining gate
+## Registry access and remaining gate
 
 This run observed Kubernetes v1.37.2, kagent v1.0.1, and a ready Substrate
 v1.0.0 worker pool. The installed model configuration targets the existing
-agentgateway route. However, the existing Bob MCP server reports
-`DiscoveryFailed` with `Unauthorized`. No model call was made: the repository's
-provider-backed evaluation requires an explicit `KAGENT_LIVE_EVAL=true`
-opt-in, which was not set.
+agentgateway route. The explicitly opted-in, provider-backed evaluation of the
+existing declarative agents passed for Bob's quote, Alice's support note,
+unknown-product refusal, Bob's internal-note denial, and MCP tool-call logs.
+It renewed the short-lived MCP credentials; both existing MCP servers now
+report `Accepted=True`. This confirms the existing gateway paths, not the BYO
+workload.
+
+Substrate v1.0.0's `atelet` pulls BYO workload images itself. It pulls
+anonymously unless a node image credential provider is configured; the local
+`atelet` has no such provider configured. Kubernetes image pull secrets for
+worker pods do not supply credentials to this separate image-pull path.
+Consequently, a GHCR image must be public for this local setup, or the node
+credential-provider configuration must be added and verified. GitHub does not
+allow a public GHCR package to be made private again, so this spike does not
+publish it publicly without explicit approval.
 
 The custom image pull through a Substrate-reachable registry, a real A2A gRPC
 request, model and MCP calls from the BYO workload, two-turn behavior, and
 session restoration across suspend/resume remain unverified. In particular,
-the registry reference and image digest for a locally built BYO application
-have not yet been established.
+the published registry reference and image digest for the BYO application have
+not yet been established. The live evaluation also printed three
+`Session termination failed: 202` messages despite exiting successfully. A
+follow-up session listing for the demo's default user returned no sessions, so
+no temporary sessions remain; the messages still need explanation before
+treating the output as a clean lifecycle trace.
 
 **Decision:** Go for the pinned source/API contract; not yet Go for the
-end-to-end integration gate. Keep #15 open until the remaining runtime checks
-are demonstrated. Do not treat a successful `/readyz` request or this schema
-dry run as an A2A success.
+end-to-end integration gate. Keep #15 open until a registry access path is
+approved and the remaining runtime checks are demonstrated. Do not treat a
+successful `/readyz` request or this schema dry run as an A2A success.
 
 ## References
 
