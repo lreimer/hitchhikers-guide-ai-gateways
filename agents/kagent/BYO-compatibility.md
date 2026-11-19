@@ -260,7 +260,8 @@ You did not provide a private session marker or a product in this session.
 All three corrected-image test sessions were deleted. The initial cleanup
 of the continuity session briefly conflicted with an active checkpoint;
 retrying after suspension succeeded, and the final session listing was
-empty. The corrected probe Agent remains deployed for further evaluation.
+empty. The probe resources were subsequently removed with the cleanup
+procedure below so they do not block the base demo's ownership checks.
 `go test ./...`, `go vet ./...`, `go mod verify`, the ARM64 container build,
 and `make validate` passed.
 
@@ -276,6 +277,47 @@ model/MCP integration, conversation restoration after actual suspend/resume,
 and fresh-session isolation were observed. This is a local compatibility
 spike, not production lifecycle certification. No runtime upgrade was
 performed.
+
+## Manual probe cleanup
+
+The spike resources are deliberately outside the base demo's ownership
+inventory. Leaving them deployed makes `make kagent-install` and
+`make kagent-uninstall` refuse to continue, even when no test sessions remain.
+Remove the probe before running either target; do not extend or rewrite the
+base ownership record to adopt these resources.
+
+First delete only the test sessions you created, using their recorded IDs
+with `kg agent session delete "$session" --force` as shown above. If deletion
+conflicts with a pending checkpoint, wait for that lifecycle operation to
+finish and retry. Stop the temporary controller port-forward afterward.
+
+From the repository root, on the same local cluster used for installation:
+
+```sh
+source scripts/kagent-common.sh
+kagent_demo_require_context &&
+  kubectl delete -n kagent --ignore-not-found \
+    --cascade=foreground --wait=true --timeout=120s \
+    -f agents/kagent/byo-spike/agent.yaml \
+    -f agents/kagent/byo-spike/agent-template.yaml \
+    -f agents/kagent/byo-spike/harness.yaml
+```
+
+Foreground deletion waits for these objects and their Kubernetes
+controller-owned dependents to disappear. It does not uninstall the base
+agents, gateway, shared runtime, model configuration, or MCP credentials.
+Verify that asynchronous cleanup has returned the recorded namespace and
+custom-resource inventories to their original state with the same read-only
+checks used by the base install/uninstall scripts:
+
+```sh
+record="$(kubectl get configmap kagent-demo-ownership -n kagent -o json)" &&
+  kagent_demo_verify_installation kagent "$record"
+```
+
+If the check still reports inventory differences, allow controller cleanup
+to finish and rerun it. Investigate any remaining differences rather than
+deleting shared resources or bypassing the ownership checks.
 
 ## References
 
