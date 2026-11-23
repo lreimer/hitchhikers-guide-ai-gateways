@@ -307,20 +307,23 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 		draft.BudgetCents = &budget
 	}
 
+	createdInPatch := make(map[int]struct{})
+	mergedInPatch := make(map[int]struct{})
 	for _, update := range patch.Positions {
 		if update.Quantity != nil && *update.Quantity <= 0 {
 			return byo.Draft{}, fmt.Errorf("%w: quantity must be positive", byo.ErrInvalidQuantity)
 		}
-		index, err := positionIndex(draft, update)
+		index, err := positionIndex(draft, update, createdInPatch, mergedInPatch)
 		if err != nil {
 			return byo.Draft{}, err
 		}
 		if index == len(draft.Positions) {
 			draft.Positions = append(draft.Positions, byo.Position{})
+			createdInPatch[index] = struct{}{}
 		}
 		position := &draft.Positions[index]
 		if update.ProductID != "" && position.ProductID == "" {
-			if existingIndex := productPositionIndex(draft, update.ProductID, index); existingIndex >= 0 {
+			if existingIndex := productPositionIndex(draft, update.ProductID, index, mergedInPatch); existingIndex >= 0 {
 				if update.Quantity != nil {
 					quantity := *update.Quantity
 					draft.Positions[existingIndex].Quantity = &quantity
@@ -328,7 +331,7 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 					quantity := *position.Quantity
 					draft.Positions[existingIndex].Quantity = &quantity
 				}
-				draft.Positions = append(draft.Positions[:index], draft.Positions[index+1:]...)
+				mergedInPatch[index] = struct{}{}
 				continue
 			}
 		}
@@ -340,10 +343,25 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 			position.Quantity = &quantity
 		}
 	}
+	if len(mergedInPatch) > 0 {
+		positions := make([]byo.Position, 0, len(draft.Positions)-len(mergedInPatch))
+		for index, position := range draft.Positions {
+			if _, merged := mergedInPatch[index]; merged {
+				continue
+			}
+			positions = append(positions, position)
+		}
+		draft.Positions = positions
+	}
 	return draft, nil
 }
 
-func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
+func positionIndex(
+	draft byo.Draft,
+	update PositionPatch,
+	createdInPatch map[int]struct{},
+	mergedInPatch map[int]struct{},
+) (int, error) {
 	if update.ProductID == "" && update.Quantity == nil {
 		return 0, errors.New("quote position update must include a product ID or quantity")
 	}
@@ -354,6 +372,9 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 		}
 		if index == len(draft.Positions) && update.ProductID == "" && update.Quantity == nil {
 			return 0, errors.New("a new quote position requires a product ID or quantity")
+		}
+		if _, merged := mergedInPatch[index]; merged {
+			return 0, fmt.Errorf("position %d was already merged by an earlier update", index)
 		}
 		if index < len(draft.Positions) && update.ProductID != "" &&
 			draft.Positions[index].ProductID != "" &&
@@ -367,6 +388,12 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 	if update.ProductID == "" {
 		incompleteIndex := -1
 		for index, position := range draft.Positions {
+			if _, merged := mergedInPatch[index]; merged {
+				continue
+			}
+			if _, created := createdInPatch[index]; created {
+				continue
+			}
 			if position.ProductID != "" {
 				continue
 			}
@@ -380,8 +407,22 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 		}
 		return len(draft.Positions), nil
 	}
+	for index, position := range draft.Positions {
+		if _, merged := mergedInPatch[index]; merged {
+			continue
+		}
+		if position.ProductID == update.ProductID {
+			return index, nil
+		}
+	}
 	incompleteIndex := -1
 	for index, position := range draft.Positions {
+		if _, merged := mergedInPatch[index]; merged {
+			continue
+		}
+		if _, created := createdInPatch[index]; created {
+			continue
+		}
 		if position.ProductID != "" {
 			continue
 		}
@@ -393,16 +434,19 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 	if incompleteIndex >= 0 {
 		return incompleteIndex, nil
 	}
-	for index, position := range draft.Positions {
-		if position.ProductID == update.ProductID {
-			return index, nil
-		}
-	}
 	return len(draft.Positions), nil
 }
 
-func productPositionIndex(draft byo.Draft, productID byo.ProductID, exclude int) int {
+func productPositionIndex(
+	draft byo.Draft,
+	productID byo.ProductID,
+	exclude int,
+	mergedInPatch map[int]struct{},
+) int {
 	for index, position := range draft.Positions {
+		if _, merged := mergedInPatch[index]; merged {
+			continue
+		}
 		if index != exclude && position.ProductID == productID {
 			return index
 		}
