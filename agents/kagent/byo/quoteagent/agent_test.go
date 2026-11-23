@@ -29,8 +29,19 @@ const (
 
 type extractorFunc func(context.Context, string, byo.Draft) (Patch, error)
 
-func (f extractorFunc) Extract(ctx context.Context, input string, draft byo.Draft) (Patch, error) {
+func (f extractorFunc) Extract(ctx context.Context, input string, draft byo.Draft, _ ClarificationContext) (Patch, error) {
 	return f(ctx, input, draft)
+}
+
+type contextExtractorFunc func(context.Context, string, byo.Draft, ClarificationContext) (Patch, error)
+
+func (f contextExtractorFunc) Extract(
+	ctx context.Context,
+	input string,
+	draft byo.Draft,
+	clarification ClarificationContext,
+) (Patch, error) {
+	return f(ctx, input, draft, clarification)
 }
 
 type catalogFake struct {
@@ -119,6 +130,90 @@ func TestQuoteWorkflowRestoresDraftAndCalculatesDeterministically(t *testing.T) 
 	}
 	if catalog.callCount() != 4 {
 		t.Fatalf("catalog calls = %d, want 2 per completed quote", catalog.callCount())
+	}
+}
+
+func TestQuoteWorkflowRestoresPendingClarificationAcrossSessions(t *testing.T) {
+	starQuantity := byo.Quantity(3)
+	moonQuantity := byo.Quantity(2)
+	updatedQuantity := byo.Quantity(4)
+	budget := byo.Cents(8000)
+	placeholderIndex := 2
+	var seenDrafts []byo.Draft
+	var seenClarifications []ClarificationContext
+	extractor := contextExtractorFunc(func(
+		_ context.Context,
+		input string,
+		draft byo.Draft,
+		clarification ClarificationContext,
+	) (Patch, error) {
+		seenDrafts = append(seenDrafts, cloneDraft(draft))
+		seenClarifications = append(seenClarifications, clarification)
+		switch input {
+		case "initial":
+			return Patch{
+				Positions: []PositionPatch{
+					{ProductID: "star-widget", Quantity: &starQuantity},
+					{ProductID: "moon-gadget", Quantity: &moonQuantity},
+				},
+				BudgetCents: &budget,
+			}, nil
+		case "change quantity to four":
+			return Patch{
+				Positions: []PositionPatch{{Quantity: &updatedQuantity}},
+				Question:  "Which product should I change to four?",
+			}, nil
+		case "Moon Gadget":
+			if len(draft.Positions) != 3 || draft.Positions[2].ProductID != "" ||
+				draft.Positions[2].Quantity == nil || *draft.Positions[2].Quantity != 4 {
+				return Patch{}, fmt.Errorf("pending quantity was not retained: %#v", draft)
+			}
+			if clarification.UserRequest != "change quantity to four" ||
+				clarification.Question != "Which product should I change to four?" {
+				return Patch{}, fmt.Errorf("clarification context was not restored: %#v", clarification)
+			}
+			return Patch{Positions: []PositionPatch{{
+				Index:     &placeholderIndex,
+				ProductID: "moon-gadget",
+			}}}, nil
+		default:
+			return Patch{}, fmt.Errorf("unexpected input %q", input)
+		}
+	})
+	catalog := &catalogFake{products: testCatalog()}
+	storagePath := filepath.Join(t.TempDir(), "clarification.db")
+	firstService, err := kagentSession.NewLocalSessionService("sqlite:////" + strings.TrimPrefix(storagePath, "/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRunner := newRunner(t, firstService, extractor, catalog, time.Second)
+	createSession(t, firstService, "clarification-session")
+	runTurn(t, firstRunner, "clarification-session", "initial")
+
+	questionEvents := runTurn(t, firstRunner, "clarification-session", "change quantity to four")
+	if got := finalText(questionEvents); got != "Which product should I change to four?" {
+		t.Fatalf("clarification response = %q", got)
+	}
+	if catalog.callCount() != 2 {
+		t.Fatalf("catalog calls before clarification is resolved = %d, want only the initial quote's 2 calls",
+			catalog.callCount())
+	}
+
+	restoredService, err := kagentSession.NewLocalSessionService("sqlite:////" + strings.TrimPrefix(storagePath, "/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredRunner := newRunner(t, restoredService, extractor, catalog, time.Second)
+	resolvedEvents := runTurn(t, restoredRunner, "clarification-session", "Moon Gadget")
+	response := finalText(resolvedEvents)
+	if !strings.Contains(response, "Total: $133.50") || !strings.Contains(response, "Over budget by $53.50") {
+		t.Fatalf("resolved response = %q; want the pending Moon Gadget quantity applied to the restored quote", response)
+	}
+	if catalog.callCount() != 4 {
+		t.Fatalf("catalog calls after clarification = %d, want 2 more for the completed quote", catalog.callCount())
+	}
+	if len(seenDrafts) != 3 || seenClarifications[2].LatestReply != "" {
+		t.Fatalf("restored drafts/clarifications = %#v / %#v", seenDrafts, seenClarifications)
 	}
 }
 

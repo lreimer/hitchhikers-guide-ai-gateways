@@ -25,13 +25,22 @@ func NewModelExtractor(model model.LLM) (*ModelExtractor, error) {
 	return &ModelExtractor{model: model}, nil
 }
 
-func (e *ModelExtractor) Extract(ctx context.Context, input string, draft byo.Draft) (Patch, error) {
+func (e *ModelExtractor) Extract(ctx context.Context, input string, draft byo.Draft, clarification ClarificationContext) (Patch, error) {
 	if err := ctx.Err(); err != nil {
 		return Patch{}, err
 	}
 	encodedDraft, err := json.Marshal(draft)
 	if err != nil {
 		return Patch{}, fmt.Errorf("encode current quote draft: %w", err)
+	}
+	clarificationPrompt := ""
+	if clarification.Question != "" {
+		clarificationPrompt = fmt.Sprintf(`Pending clarification:
+Original user request: %q
+Your previous question: %q
+Latest user reply: %q
+
+`, clarification.UserRequest, clarification.Question, clarification.LatestReply)
 	}
 	prompt := fmt.Sprintf(`Extract only quote changes from the user's latest message.
 
@@ -43,12 +52,14 @@ Rules:
 - Quantities must be positive whole numbers. A quantity update to an existing product changes only that product.
 - Budget is an integer number of USD cents. Omit it when unchanged.
 - Omit unchanged positions. Use "position_index" only to fill or clarify an existing incomplete position.
-- If any requested detail is missing or ambiguous, do not guess it. Set "question" to a concise ordinary follow-up question; this is dialogue, not an approval request.
+- If a quantity is known but its product is missing, include a position containing only that quantity; the workflow will retain it as an incomplete draft position.
+- If any requested detail is missing or ambiguous, do not guess it. Preserve all known details in the patch and set "question" to a concise ordinary follow-up question; this is dialogue, not an approval request.
 - Never calculate prices, totals, or budget status.
 - Do not use Markdown fences or any text outside the JSON object.
 
+%s
 Current draft: %s
-Latest user message: %q`, encodedDraft, input)
+Latest user message: %q`, clarificationPrompt, encodedDraft, input)
 	request := &model.LLMRequest{
 		Model: e.model.Name(),
 		Contents: []*genai.Content{
@@ -77,6 +88,13 @@ Latest user message: %q`, encodedDraft, input)
 	if raw == "" {
 		return Patch{}, errors.New("quote extraction returned no content")
 	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &object); err != nil {
+		return Patch{}, fmt.Errorf("quote extraction must be a JSON object: %w", err)
+	}
+	if object == nil {
+		return Patch{}, errors.New("quote extraction must be a JSON object")
+	}
 
 	var patch Patch
 	decoder := json.NewDecoder(bytes.NewBufferString(raw))
@@ -90,6 +108,9 @@ Latest user message: %q`, encodedDraft, input)
 			return Patch{}, errors.New("quote extraction returned multiple JSON values")
 		}
 		return Patch{}, fmt.Errorf("decode trailing quote extraction content: %w", err)
+	}
+	if len(patch.Positions) == 0 && patch.BudgetCents == nil && strings.TrimSpace(patch.Question) == "" {
+		return Patch{}, errors.New("quote extraction returned no changes or follow-up question")
 	}
 	return patch, nil
 }

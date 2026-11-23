@@ -44,8 +44,11 @@ func TestModelExtractorUsesPlainJSONAndParsesTypedPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	quantity := byo.Quantity(2)
-	patch, err := extractor.Extract(t.Context(), "change Moon Gadget", byo.Draft{
+	patch, err := extractor.Extract(t.Context(), "Moon Gadget", byo.Draft{
 		Positions: []byo.Position{{ProductID: "moon-gadget", Quantity: &quantity}},
+	}, ClarificationContext{
+		UserRequest: "change quantity to four",
+		Question:    "Which product?",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +59,12 @@ func TestModelExtractorUsesPlainJSONAndParsesTypedPatch(t *testing.T) {
 	}
 	if !strings.Contains(modelDouble.request.Contents[0].Parts[0].Text, `"quantity":2`) {
 		t.Fatalf("model prompt omitted the existing draft: %q", modelDouble.request.Contents[0].Parts[0].Text)
+	}
+	for _, contextText := range []string{"change quantity to four", "Which product?", "Moon Gadget"} {
+		if !strings.Contains(modelDouble.request.Contents[0].Parts[0].Text, contextText) {
+			t.Fatalf("model prompt omitted pending clarification %q: %q",
+				contextText, modelDouble.request.Contents[0].Parts[0].Text)
+		}
 	}
 	if len(patch.Positions) != 1 || patch.Positions[0].ProductID != "moon-gadget" ||
 		patch.Positions[0].Quantity == nil || *patch.Positions[0].Quantity != 1 {
@@ -68,13 +77,15 @@ func TestModelExtractorRejectsMalformedOutputAndFractionalQuantity(t *testing.T)
 		"```json\n{\"positions\":[]}\n```",
 		`{"positions":[{"product_id":"star-widget","quantity":1.5}]}`,
 		`{"positions":[]} {"positions":[]}`,
+		"null",
+		"{}",
 	} {
 		t.Run(response, func(t *testing.T) {
 			extractor, err := NewModelExtractor(&modelFake{response: response})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := extractor.Extract(t.Context(), "quote", byo.Draft{}); err == nil {
+			if _, err := extractor.Extract(t.Context(), "quote", byo.Draft{}, ClarificationContext{}); err == nil {
 				t.Fatal("Extract() succeeded for invalid model output")
 			}
 		})
@@ -88,7 +99,7 @@ func TestModelExtractorPropagatesRateLimitAndSkipsCallsWhenCanceled(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := extractor.Extract(t.Context(), "quote", byo.Draft{}); !errors.Is(err, rateLimit) {
+	if _, err := extractor.Extract(t.Context(), "quote", byo.Draft{}, ClarificationContext{}); !errors.Is(err, rateLimit) {
 		t.Fatalf("Extract() error = %v; want the provider's 429 error", err)
 	}
 	if modelDouble.calls != 1 {
@@ -97,7 +108,7 @@ func TestModelExtractorPropagatesRateLimitAndSkipsCallsWhenCanceled(t *testing.T
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := extractor.Extract(ctx, "quote", byo.Draft{}); !errors.Is(err, context.Canceled) {
+	if _, err := extractor.Extract(ctx, "quote", byo.Draft{}, ClarificationContext{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Extract() error = %v; want context.Canceled", err)
 	}
 	if modelDouble.calls != 1 {

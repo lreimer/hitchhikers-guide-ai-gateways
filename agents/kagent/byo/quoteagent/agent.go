@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	AgentName          = "product_quote_planner"
-	draftStateKey      = "product_quote_draft"
-	defaultCallTimeout = 30 * time.Second
-	maxCatalogLookups  = 8
+	AgentName             = "product_quote_planner"
+	draftStateKey         = "product_quote_draft"
+	clarificationStateKey = "product_quote_clarification"
+	defaultCallTimeout    = 30 * time.Second
+	maxCatalogLookups     = 8
 )
 
 type Patch struct {
@@ -34,8 +35,14 @@ type PositionPatch struct {
 	Quantity  *byo.Quantity `json:"quantity,omitempty"`
 }
 
+type ClarificationContext struct {
+	UserRequest string `json:"user_request,omitempty"`
+	Question    string `json:"question,omitempty"`
+	LatestReply string `json:"latest_reply,omitempty"`
+}
+
 type Extractor interface {
-	Extract(context.Context, string, byo.Draft) (Patch, error)
+	Extract(context.Context, string, byo.Draft, ClarificationContext) (Patch, error)
 }
 
 type Catalog interface {
@@ -109,9 +116,14 @@ func (a *quoteAgent) run(invocation agent.InvocationContext) iter.Seq2[*session.
 			yield(nil, fmt.Errorf("load quote session state: %w", err))
 			return
 		}
+		clarification, err := loadClarification(runContext)
+		if err != nil {
+			yield(nil, fmt.Errorf("load quote clarification state: %w", err))
+			return
+		}
 
 		modelContext, cancelModel := context.WithTimeout(invocation, a.timeout)
-		patch, err := a.extractor.Extract(modelContext, input, draft)
+		patch, err := a.extractor.Extract(modelContext, input, draft, clarification)
 		modelErr := modelContext.Err()
 		cancelModel()
 		if err != nil {
@@ -137,7 +149,12 @@ func (a *quoteAgent) run(invocation agent.InvocationContext) iter.Seq2[*session.
 				yield(nil, fmt.Errorf("save quote session state: %w", err))
 				return
 			}
-			yield(finalEvent(invocation, actions, strings.TrimSpace(patch.Question)), nil)
+			question := strings.TrimSpace(patch.Question)
+			if err := persistClarification(runContext, nextClarification(clarification, input, question)); err != nil {
+				yield(nil, fmt.Errorf("save quote clarification state: %w", err))
+				return
+			}
+			yield(finalEvent(invocation, actions, question), nil)
 			return
 		}
 
@@ -146,7 +163,12 @@ func (a *quoteAgent) run(invocation agent.InvocationContext) iter.Seq2[*session.
 				yield(nil, fmt.Errorf("save quote session state: %w", err))
 				return
 			}
-			yield(finalEvent(invocation, actions, missingQuestion(updated, missing)), nil)
+			question := missingQuestion(updated, missing)
+			if err := persistClarification(runContext, nextClarification(clarification, input, question)); err != nil {
+				yield(nil, fmt.Errorf("save quote clarification state: %w", err))
+				return
+			}
+			yield(finalEvent(invocation, actions, question), nil)
 			return
 		}
 
@@ -198,6 +220,10 @@ func (a *quoteAgent) run(invocation agent.InvocationContext) iter.Seq2[*session.
 			yield(nil, fmt.Errorf("save quote session state: %w", err))
 			return
 		}
+		if err := persistClarification(runContext, ClarificationContext{}); err != nil {
+			yield(nil, fmt.Errorf("clear quote clarification state: %w", err))
+			return
+		}
 		if err := runContext.Err(); err != nil {
 			yield(nil, err)
 			return
@@ -234,6 +260,44 @@ func persistDraft(ctx agent.Context, draft byo.Draft) error {
 	return ctx.State().Set(draftStateKey, string(encoded))
 }
 
+func loadClarification(ctx agent.Context) (ClarificationContext, error) {
+	value, err := ctx.State().Get(clarificationStateKey)
+	if errors.Is(err, session.ErrStateKeyNotExist) {
+		return ClarificationContext{}, nil
+	}
+	if err != nil {
+		return ClarificationContext{}, err
+	}
+	encoded, ok := value.(string)
+	if !ok {
+		return ClarificationContext{}, fmt.Errorf("stored quote clarification has unexpected type %T", value)
+	}
+
+	var clarification ClarificationContext
+	if err := json.Unmarshal([]byte(encoded), &clarification); err != nil {
+		return ClarificationContext{}, fmt.Errorf("decode stored quote clarification: %w", err)
+	}
+	return clarification, nil
+}
+
+func persistClarification(ctx agent.Context, clarification ClarificationContext) error {
+	encoded, err := json.Marshal(clarification)
+	if err != nil {
+		return fmt.Errorf("encode quote clarification: %w", err)
+	}
+	return ctx.State().Set(clarificationStateKey, string(encoded))
+}
+
+func nextClarification(previous ClarificationContext, input, question string) ClarificationContext {
+	if previous.UserRequest == "" {
+		previous.UserRequest = input
+	} else {
+		previous.LatestReply = input
+	}
+	previous.Question = question
+	return previous
+}
+
 func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 	if patch.BudgetCents != nil {
 		if *patch.BudgetCents < 0 {
@@ -255,6 +319,19 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 			draft.Positions = append(draft.Positions, byo.Position{})
 		}
 		position := &draft.Positions[index]
+		if update.ProductID != "" && position.ProductID == "" {
+			if existingIndex := productPositionIndex(draft, update.ProductID, index); existingIndex >= 0 {
+				if update.Quantity != nil {
+					quantity := *update.Quantity
+					draft.Positions[existingIndex].Quantity = &quantity
+				} else if position.Quantity != nil {
+					quantity := *position.Quantity
+					draft.Positions[existingIndex].Quantity = &quantity
+				}
+				draft.Positions = append(draft.Positions[:index], draft.Positions[index+1:]...)
+				continue
+			}
+		}
 		if update.ProductID != "" {
 			position.ProductID = update.ProductID
 		}
@@ -267,13 +344,16 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 }
 
 func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
+	if update.ProductID == "" && update.Quantity == nil {
+		return 0, errors.New("quote position update must include a product ID or quantity")
+	}
 	if update.Index != nil {
 		index := *update.Index
 		if index < 0 || index > len(draft.Positions) {
 			return 0, fmt.Errorf("position index %d is out of range", index)
 		}
-		if index == len(draft.Positions) && update.ProductID == "" {
-			return 0, errors.New("a new quote position requires a product ID")
+		if index == len(draft.Positions) && update.ProductID == "" && update.Quantity == nil {
+			return 0, errors.New("a new quote position requires a product ID or quantity")
 		}
 		if index < len(draft.Positions) && update.ProductID != "" &&
 			draft.Positions[index].ProductID != "" &&
@@ -285,7 +365,33 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 	}
 
 	if update.ProductID == "" {
-		return 0, errors.New("quote position update requires a product ID or position index")
+		incompleteIndex := -1
+		for index, position := range draft.Positions {
+			if position.ProductID != "" {
+				continue
+			}
+			if incompleteIndex >= 0 {
+				return 0, errors.New("multiple incomplete quote positions require explicit position indices")
+			}
+			incompleteIndex = index
+		}
+		if incompleteIndex >= 0 {
+			return incompleteIndex, nil
+		}
+		return len(draft.Positions), nil
+	}
+	incompleteIndex := -1
+	for index, position := range draft.Positions {
+		if position.ProductID != "" {
+			continue
+		}
+		if incompleteIndex >= 0 {
+			return 0, errors.New("multiple incomplete quote positions require explicit position indices")
+		}
+		incompleteIndex = index
+	}
+	if incompleteIndex >= 0 {
+		return incompleteIndex, nil
 	}
 	for index, position := range draft.Positions {
 		if position.ProductID == update.ProductID {
@@ -293,6 +399,15 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 		}
 	}
 	return len(draft.Positions), nil
+}
+
+func productPositionIndex(draft byo.Draft, productID byo.ProductID, exclude int) int {
+	for index, position := range draft.Positions {
+		if index != exclude && position.ProductID == productID {
+			return index
+		}
+	}
+	return -1
 }
 
 func validateCatalogRequests(draft byo.Draft, maxLookups int) error {
