@@ -393,6 +393,125 @@ func TestQuoteWorkflowAsksAboutAmbiguityWithoutCallingCatalog(t *testing.T) {
 	}
 }
 
+func TestApplyPatchDoesNotImplicitlyConsumeSamePatchPlaceholders(t *testing.T) {
+	three := byo.Quantity(3)
+	two := byo.Quantity(2)
+	tests := []struct {
+		name       string
+		patch      Patch
+		wantLen    int
+		wantFirst  byo.Position
+		wantSecond byo.Position
+	}{
+		{
+			name: "quantity placeholder is not consumed by later product update",
+			patch: Patch{
+				Positions: []PositionPatch{
+					{Quantity: &three},
+					{ProductID: "moon-gadget", Quantity: &two},
+				},
+			},
+			wantLen:    2,
+			wantFirst:  byo.Position{Quantity: &three},
+			wantSecond: byo.Position{ProductID: "moon-gadget", Quantity: &two},
+		},
+		{
+			name: "multiple quantity placeholders remain distinct",
+			patch: Patch{
+				Positions: []PositionPatch{
+					{Quantity: &three},
+					{Quantity: &two},
+				},
+			},
+			wantLen:    2,
+			wantFirst:  byo.Position{Quantity: &three},
+			wantSecond: byo.Position{Quantity: &two},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			updated, err := applyPatch(byo.Draft{}, test.patch)
+			if err != nil {
+				t.Fatalf("applyPatch error = %v", err)
+			}
+			if len(updated.Positions) != test.wantLen {
+				t.Fatalf("positions = %#v, want len %d", updated.Positions, test.wantLen)
+			}
+			assertPosition(t, updated.Positions[0], test.wantFirst)
+			assertPosition(t, updated.Positions[1], test.wantSecond)
+		})
+	}
+}
+
+func TestApplyPatchKeepsIndexedUpdatesStableUntilPatchCompletes(t *testing.T) {
+	three := byo.Quantity(3)
+	two := byo.Quantity(2)
+	four := byo.Quantity(4)
+	five := byo.Quantity(5)
+	indexTwo := 2
+	indexThree := 3
+	updated, err := applyPatch(byo.Draft{
+		Positions: []byo.Position{
+			{ProductID: "star-widget", Quantity: &three},
+			{ProductID: "moon-gadget", Quantity: &two},
+			{Quantity: &four},
+			{Quantity: &five},
+		},
+	}, Patch{
+		Positions: []PositionPatch{
+			{Index: &indexTwo, ProductID: "star-widget"},
+			{Index: &indexThree, ProductID: "moon-gadget"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("applyPatch error = %v", err)
+	}
+	if len(updated.Positions) != 2 {
+		t.Fatalf("positions = %#v, want two resolved product positions", updated.Positions)
+	}
+	assertPosition(t, updated.Positions[0], byo.Position{ProductID: "star-widget", Quantity: &four})
+	assertPosition(t, updated.Positions[1], byo.Position{ProductID: "moon-gadget", Quantity: &five})
+}
+
+func TestApplyPatchMatchesProductsBeforeImplicitPlaceholderResolution(t *testing.T) {
+	three := byo.Quantity(3)
+	four := byo.Quantity(4)
+	one := byo.Quantity(1)
+	placeholderIndex := 1
+	updated, err := applyPatch(byo.Draft{
+		Positions: []byo.Position{
+			{ProductID: "star-widget", Quantity: &three},
+			{Quantity: &four},
+		},
+	}, Patch{
+		Positions: []PositionPatch{{ProductID: "star-widget", Quantity: &one}},
+	})
+	if err != nil {
+		t.Fatalf("applyPatch error = %v", err)
+	}
+	if len(updated.Positions) != 2 {
+		t.Fatalf("positions = %#v, want unresolved placeholder retained", updated.Positions)
+	}
+	assertPosition(t, updated.Positions[0], byo.Position{ProductID: "star-widget", Quantity: &one})
+	assertPosition(t, updated.Positions[1], byo.Position{Quantity: &four})
+
+	resolved, err := applyPatch(byo.Draft{
+		Positions: []byo.Position{
+			{ProductID: "star-widget", Quantity: &three},
+			{Quantity: &four},
+		},
+	}, Patch{
+		Positions: []PositionPatch{{Index: &placeholderIndex, ProductID: "star-widget"}},
+	})
+	if err != nil {
+		t.Fatalf("applyPatch error for explicit placeholder resolution = %v", err)
+	}
+	if len(resolved.Positions) != 1 {
+		t.Fatalf("positions = %#v, want merged explicit placeholder", resolved.Positions)
+	}
+	assertPosition(t, resolved.Positions[0], byo.Position{ProductID: "star-widget", Quantity: &four})
+}
+
 func TestQuoteWorkflowPropagatesModelAndCatalogFailures(t *testing.T) {
 	rateLimit := errors.New("HTTP 429: rate limit")
 	quantity := byo.Quantity(1)
@@ -706,4 +825,19 @@ func cloneDraft(draft byo.Draft) byo.Draft {
 		}
 	}
 	return clone
+}
+
+func assertPosition(t *testing.T, got, want byo.Position) {
+	t.Helper()
+	if got.ProductID != want.ProductID {
+		t.Fatalf("product_id = %q, want %q", got.ProductID, want.ProductID)
+	}
+	switch {
+	case got.Quantity == nil && want.Quantity == nil:
+		return
+	case got.Quantity == nil || want.Quantity == nil:
+		t.Fatalf("quantity = %v, want %v", got.Quantity, want.Quantity)
+	case *got.Quantity != *want.Quantity:
+		t.Fatalf("quantity = %d, want %d", *got.Quantity, *want.Quantity)
+	}
 }

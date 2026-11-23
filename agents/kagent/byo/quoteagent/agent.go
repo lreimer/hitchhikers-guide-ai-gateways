@@ -312,7 +312,7 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 		if update.Quantity != nil && *update.Quantity <= 0 {
 			return byo.Draft{}, fmt.Errorf("%w: quantity must be positive", byo.ErrInvalidQuantity)
 		}
-		index, err := positionIndex(draft, update)
+		index, err := positionIndex(draft, update, mergeTargets)
 		if err != nil {
 			return byo.Draft{}, err
 		}
@@ -321,7 +321,7 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 		}
 		position := &draft.Positions[index]
 		if update.ProductID != "" && position.ProductID == "" {
-			if existingIndex := productPositionIndex(draft, update.ProductID, index); existingIndex >= 0 {
+			if existingIndex := productPositionIndex(draft, update.ProductID, index, mergeTargets); existingIndex >= 0 {
 				for sourceIndex, targetIndex := range mergeTargets {
 					if sourceIndex != index && targetIndex == existingIndex {
 						return byo.Draft{}, fmt.Errorf("multiple incomplete positions cannot resolve to product %q in one turn",
@@ -360,7 +360,7 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 	return draft, nil
 }
 
-func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
+func positionIndex(draft byo.Draft, update PositionPatch, mergeTargets map[int]int) (int, error) {
 	if update.ProductID == "" && update.Quantity == nil {
 		return 0, errors.New("quote position update must include a product ID or quantity")
 	}
@@ -369,8 +369,8 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 		if index < 0 || index > len(draft.Positions) {
 			return 0, fmt.Errorf("position index %d is out of range", index)
 		}
-		if index == len(draft.Positions) && update.ProductID == "" && update.Quantity == nil {
-			return 0, errors.New("a new quote position requires a product ID or quantity")
+		if _, merged := mergeTargets[index]; merged {
+			return 0, fmt.Errorf("position %d was already merged by an earlier update", index)
 		}
 		if index < len(draft.Positions) && update.ProductID != "" &&
 			draft.Positions[index].ProductID != "" &&
@@ -385,6 +385,9 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 		return len(draft.Positions), nil
 	}
 	for index, position := range draft.Positions {
+		if _, merged := mergeTargets[index]; merged {
+			continue
+		}
 		if position.ProductID == update.ProductID {
 			return index, nil
 		}
@@ -392,8 +395,11 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 	return len(draft.Positions), nil
 }
 
-func productPositionIndex(draft byo.Draft, productID byo.ProductID, exclude int) int {
+func productPositionIndex(draft byo.Draft, productID byo.ProductID, exclude int, mergeTargets map[int]int) int {
 	for index, position := range draft.Positions {
+		if _, merged := mergeTargets[index]; merged {
+			continue
+		}
 		if index != exclude && position.ProductID == productID {
 			return index
 		}
