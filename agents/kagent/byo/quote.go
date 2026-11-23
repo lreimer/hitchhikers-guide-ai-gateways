@@ -18,13 +18,13 @@ type Product struct {
 type Catalog map[ProductID]Product
 
 type Position struct {
-	ProductID ProductID
-	Quantity  *Quantity
+	ProductID ProductID `json:"product_id"`
+	Quantity  *Quantity `json:"quantity,omitempty"`
 }
 
 type Draft struct {
-	Positions   []Position
-	BudgetCents *Cents
+	Positions   []Position `json:"positions"`
+	BudgetCents *Cents     `json:"budget_cents,omitempty"`
 }
 
 type Status string
@@ -120,7 +120,7 @@ func ChangeQuantity(draft Draft, productID ProductID, quantity Quantity) (Draft,
 }
 
 func Evaluate(draft Draft, catalog Catalog) (Result, error) {
-	missing := missingInputs(draft)
+	missing := MissingInputs(draft)
 	if len(missing) > 0 {
 		return Result{Status: StatusIncomplete, Missing: missing}, nil
 	}
@@ -173,6 +173,10 @@ func Evaluate(draft Draft, catalog Catalog) (Result, error) {
 		BudgetRemainingCents: remaining,
 		WithinBudget:         remaining >= 0,
 	}, nil
+}
+
+func MissingInputs(draft Draft) []MissingInput {
+	return missingInputs(draft)
 }
 
 func missingInputs(draft Draft) []MissingInput {
