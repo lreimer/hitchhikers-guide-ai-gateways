@@ -98,51 +98,56 @@ func (c *mcpCatalog) tool(ctx agent.ReadonlyContext) (mcpLookupTool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	if c.lookupTool != nil {
-		lookupTool := c.lookupTool
+	for {
+		c.mu.Lock()
+		if c.lookupTool != nil {
+			lookupTool := c.lookupTool
+			c.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return lookupTool, nil
+		}
+		if discovery := c.discovery; discovery != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-discovery.done:
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if errors.Is(discovery.err, context.Canceled) || errors.Is(discovery.err, context.DeadlineExceeded) {
+				continue
+			}
+			return discovery.tool, discovery.err
+		}
+
+		discovery := &toolDiscovery{done: make(chan struct{})}
+		c.discovery = discovery
 		c.mu.Unlock()
+
+		lookupTool, err := c.discover(ctx)
+
+		c.mu.Lock()
+		if err == nil {
+			c.lookupTool = lookupTool
+		}
+		discovery.tool = lookupTool
+		discovery.err = err
+		c.discovery = nil
+		close(discovery.done)
+		c.mu.Unlock()
+
+		if err != nil {
+			return nil, err
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		return lookupTool, nil
 	}
-	if discovery := c.discovery; discovery != nil {
-		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-discovery.done:
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return discovery.tool, discovery.err
-	}
-
-	discovery := &toolDiscovery{done: make(chan struct{})}
-	c.discovery = discovery
-	c.mu.Unlock()
-
-	lookupTool, err := c.discover(ctx)
-
-	c.mu.Lock()
-	if err == nil {
-		c.lookupTool = lookupTool
-	}
-	discovery.tool = lookupTool
-	discovery.err = err
-	c.discovery = nil
-	close(discovery.done)
-	c.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return lookupTool, nil
 }
 
 func (c *mcpCatalog) discover(ctx agent.ReadonlyContext) (mcpLookupTool, error) {

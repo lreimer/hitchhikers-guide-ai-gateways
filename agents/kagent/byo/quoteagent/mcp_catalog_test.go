@@ -164,6 +164,77 @@ func TestCatalogDiscoveryWaiterHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestCatalogDiscoveryWaiterRetriesWhenOwnerIsCanceled(t *testing.T) {
+	lookupTool := &catalogToolDouble{}
+	toolset := &canceledOwnerToolset{
+		firstStarted: make(chan struct{}),
+		retryStarted: make(chan struct{}),
+		releaseRetry: make(chan struct{}),
+		lookup:       lookupTool,
+	}
+	defer toolset.release()
+	catalog := &mcpCatalog{toolset: toolset}
+
+	ownerContext, cancelOwner := context.WithCancel(context.Background())
+	defer cancelOwner()
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := catalog.Lookup(newToolContext(ownerContext), "star-widget")
+		ownerResult <- err
+	}()
+	select {
+	case <-toolset.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("discovery owner did not start tool discovery")
+	}
+
+	waiterStarted := make(chan struct{})
+	waiterBase, cancelWaiter := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelWaiter()
+	waiterContext := &discoveryWaitContext{Context: waiterBase, doneObserved: waiterStarted}
+	waiterResult := make(chan error, 1)
+	go func() {
+		_, err := catalog.Lookup(newToolContext(waiterContext), "star-widget")
+		waiterResult <- err
+	}()
+	select {
+	case <-waiterStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live lookup did not wait for the in-flight discovery")
+	}
+
+	cancelOwner()
+	select {
+	case err := <-ownerResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled owner error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled discovery owner remained blocked")
+	}
+
+	select {
+	case <-toolset.retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not retry discovery under its own context")
+	}
+	toolset.release()
+	select {
+	case err := <-waiterResult:
+		if err != nil {
+			t.Fatalf("live waiter lookup error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live waiter remained blocked after its discovery retry")
+	}
+	if got := toolset.calls.Load(); got != 2 {
+		t.Fatalf("toolset discovery calls = %d, want canceled owner plus live waiter retry", got)
+	}
+	if got := lookupTool.calls.Load(); got != 1 {
+		t.Fatalf("catalog tool calls = %d, want only the live waiter's call", got)
+	}
+}
+
 type blockingToolset struct {
 	started chan struct{}
 	release chan struct{}
@@ -183,6 +254,40 @@ func (s *blockingToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) 
 	case <-s.release:
 		return []tool.Tool{s.lookup}, nil
 	}
+}
+
+type canceledOwnerToolset struct {
+	firstStarted chan struct{}
+	retryStarted chan struct{}
+	releaseRetry chan struct{}
+	releaseOnce  sync.Once
+	lookup       tool.Tool
+	calls        atomic.Int32
+}
+
+func (s *canceledOwnerToolset) Name() string { return "canceled-owner-test-toolset" }
+
+func (s *canceledOwnerToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+	switch s.calls.Add(1) {
+	case 1:
+		close(s.firstStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	case 2:
+		close(s.retryStarted)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.releaseRetry:
+			return []tool.Tool{s.lookup}, nil
+		}
+	default:
+		return nil, errors.New("unexpected extra tool discovery")
+	}
+}
+
+func (s *canceledOwnerToolset) release() {
+	s.releaseOnce.Do(func() { close(s.releaseRetry) })
 }
 
 type catalogToolDouble struct {
