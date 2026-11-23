@@ -307,6 +307,7 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 		draft.BudgetCents = &budget
 	}
 
+	mergeTargets := make(map[int]int)
 	for _, update := range patch.Positions {
 		if update.Quantity != nil && *update.Quantity <= 0 {
 			return byo.Draft{}, fmt.Errorf("%w: quantity must be positive", byo.ErrInvalidQuantity)
@@ -321,15 +322,13 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 		position := &draft.Positions[index]
 		if update.ProductID != "" && position.ProductID == "" {
 			if existingIndex := productPositionIndex(draft, update.ProductID, index); existingIndex >= 0 {
-				if update.Quantity != nil {
-					quantity := *update.Quantity
-					draft.Positions[existingIndex].Quantity = &quantity
-				} else if position.Quantity != nil {
-					quantity := *position.Quantity
-					draft.Positions[existingIndex].Quantity = &quantity
+				for sourceIndex, targetIndex := range mergeTargets {
+					if sourceIndex != index && targetIndex == existingIndex {
+						return byo.Draft{}, fmt.Errorf("multiple incomplete positions cannot resolve to product %q in one turn",
+							update.ProductID)
+					}
 				}
-				draft.Positions = append(draft.Positions[:index], draft.Positions[index+1:]...)
-				continue
+				mergeTargets[index] = existingIndex
 			}
 		}
 		if update.ProductID != "" {
@@ -339,6 +338,24 @@ func applyPatch(draft byo.Draft, patch Patch) (byo.Draft, error) {
 			quantity := *update.Quantity
 			position.Quantity = &quantity
 		}
+	}
+	if len(mergeTargets) > 0 {
+		removed := make(map[int]struct{}, len(mergeTargets))
+		for sourceIndex, targetIndex := range mergeTargets {
+			source := draft.Positions[sourceIndex]
+			if source.Quantity != nil {
+				quantity := *source.Quantity
+				draft.Positions[targetIndex].Quantity = &quantity
+			}
+			removed[sourceIndex] = struct{}{}
+		}
+		positions := make([]byo.Position, 0, len(draft.Positions)-len(removed))
+		for index, position := range draft.Positions {
+			if _, shouldRemove := removed[index]; !shouldRemove {
+				positions = append(positions, position)
+			}
+		}
+		draft.Positions = positions
 	}
 	return draft, nil
 }
@@ -365,33 +382,7 @@ func positionIndex(draft byo.Draft, update PositionPatch) (int, error) {
 	}
 
 	if update.ProductID == "" {
-		incompleteIndex := -1
-		for index, position := range draft.Positions {
-			if position.ProductID != "" {
-				continue
-			}
-			if incompleteIndex >= 0 {
-				return 0, errors.New("multiple incomplete quote positions require explicit position indices")
-			}
-			incompleteIndex = index
-		}
-		if incompleteIndex >= 0 {
-			return incompleteIndex, nil
-		}
 		return len(draft.Positions), nil
-	}
-	incompleteIndex := -1
-	for index, position := range draft.Positions {
-		if position.ProductID != "" {
-			continue
-		}
-		if incompleteIndex >= 0 {
-			return 0, errors.New("multiple incomplete quote positions require explicit position indices")
-		}
-		incompleteIndex = index
-	}
-	if incompleteIndex >= 0 {
-		return incompleteIndex, nil
 	}
 	for index, position := range draft.Positions {
 		if position.ProductID == update.ProductID {

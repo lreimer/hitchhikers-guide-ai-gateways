@@ -217,6 +217,90 @@ func TestQuoteWorkflowRestoresPendingClarificationAcrossSessions(t *testing.T) {
 	}
 }
 
+func TestApplyPatchKeepsSameTurnPlaceholdersSeparate(t *testing.T) {
+	firstQuantity := byo.Quantity(3)
+	secondQuantity := byo.Quantity(2)
+	updated, err := applyPatch(byo.Draft{}, Patch{Positions: []PositionPatch{
+		{Quantity: &firstQuantity},
+		{ProductID: "moon-gadget", Quantity: &secondQuantity},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Positions) != 2 ||
+		updated.Positions[0].ProductID != "" || updated.Positions[0].Quantity == nil ||
+		*updated.Positions[0].Quantity != firstQuantity ||
+		updated.Positions[1].ProductID != "moon-gadget" || updated.Positions[1].Quantity == nil ||
+		*updated.Positions[1].Quantity != secondQuantity {
+		t.Fatalf("same-turn patch positions = %#v; want separate quantity-only and Moon Gadget positions", updated.Positions)
+	}
+
+	twoPlaceholders, err := applyPatch(byo.Draft{}, Patch{Positions: []PositionPatch{
+		{Quantity: &firstQuantity},
+		{Quantity: &secondQuantity},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(twoPlaceholders.Positions) != 2 ||
+		*twoPlaceholders.Positions[0].Quantity != firstQuantity ||
+		*twoPlaceholders.Positions[1].Quantity != secondQuantity {
+		t.Fatalf("quantity-only patch positions = %#v; want two distinct placeholders", twoPlaceholders.Positions)
+	}
+}
+
+func TestApplyPatchResolvesMultiplePlaceholdersWithoutShiftingIndices(t *testing.T) {
+	starQuantity := byo.Quantity(3)
+	moonQuantity := byo.Quantity(2)
+	firstPendingQuantity := byo.Quantity(4)
+	secondPendingQuantity := byo.Quantity(5)
+	draft := byo.Draft{Positions: []byo.Position{
+		{ProductID: "star-widget", Quantity: &starQuantity},
+		{ProductID: "moon-gadget", Quantity: &moonQuantity},
+		{Quantity: &firstPendingQuantity},
+		{Quantity: &secondPendingQuantity},
+	}}
+	starIndex := 2
+	moonIndex := 3
+	updated, err := applyPatch(draft, Patch{Positions: []PositionPatch{
+		{Index: &starIndex, ProductID: "star-widget"},
+		{Index: &moonIndex, ProductID: "moon-gadget"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Positions) != 2 ||
+		updated.Positions[0].ProductID != "star-widget" || *updated.Positions[0].Quantity != 4 ||
+		updated.Positions[1].ProductID != "moon-gadget" || *updated.Positions[1].Quantity != 5 {
+		t.Fatalf("resolved positions = %#v; want original indices merged without shifting", updated.Positions)
+	}
+}
+
+func TestApplyPatchDoesNotConsumeUnresolvedPositionForExistingProduct(t *testing.T) {
+	starQuantity := byo.Quantity(3)
+	pendingQuantity := byo.Quantity(4)
+	updatedQuantity := byo.Quantity(1)
+	budget := byo.Cents(8000)
+	draft := byo.Draft{Positions: []byo.Position{
+		{ProductID: "star-widget", Quantity: &starQuantity},
+		{Quantity: &pendingQuantity},
+	}, BudgetCents: &budget}
+	updated, err := applyPatch(draft, Patch{Positions: []PositionPatch{{
+		ProductID: "star-widget",
+		Quantity:  &updatedQuantity,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Positions) != 2 || *updated.Positions[0].Quantity != 1 ||
+		updated.Positions[1].ProductID != "" || *updated.Positions[1].Quantity != pendingQuantity {
+		t.Fatalf("updated draft = %#v; want changed Star Widget and preserved unresolved quantity", updated)
+	}
+	if missing := byo.MissingInputs(updated); len(missing) != 1 || missing[0].Field != byo.MissingProductID {
+		t.Fatalf("missing inputs = %#v; want unresolved product to block a quote", missing)
+	}
+}
+
 func TestQuoteWorkflowKeepsSessionsIsolatedAndAsksForMissingFields(t *testing.T) {
 	one := byo.Quantity(1)
 	extractor := extractorFunc(func(_ context.Context, input string, draft byo.Draft) (Patch, error) {
@@ -489,6 +573,7 @@ func TestKAgentExecutorKeepsTaskAndContextIDsOnProgressAndTerminalEvents(t *test
 		Message:   a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("request")),
 	}
 	eventCount := 0
+	completed := false
 	for event, err := range executor.Execute(context.Background(), request) {
 		if err != nil {
 			t.Fatalf("A2A execute: %v", err)
@@ -501,9 +586,16 @@ func TestKAgentExecutorKeepsTaskAndContextIDsOnProgressAndTerminalEvents(t *test
 		if info.TaskID != request.TaskID || info.ContextID != request.ContextID {
 			t.Fatalf("A2A task info = %#v; want task %q and context %q", info, request.TaskID, request.ContextID)
 		}
+		if status, ok := event.(*a2atype.TaskStatusUpdateEvent); ok &&
+			status.Status.State == a2atype.TaskStateCompleted {
+			completed = true
+		}
 	}
 	if eventCount < 3 {
 		t.Fatalf("A2A events = %d, want progress and terminal events", eventCount)
+	}
+	if !completed {
+		t.Fatal("A2A execution did not emit a completed task status event")
 	}
 }
 

@@ -23,6 +23,13 @@ type mcpCatalog struct {
 
 	mu         sync.Mutex
 	lookupTool mcpLookupTool
+	discovery  *toolDiscovery
+}
+
+type toolDiscovery struct {
+	done chan struct{}
+	tool mcpLookupTool
+	err  error
 }
 
 type mcpLookupTool interface {
@@ -65,8 +72,14 @@ func NewMCPCatalog(ctx context.Context, config *configv1.ADKAgentConfig) (Catalo
 }
 
 func (c *mcpCatalog) Lookup(ctx agent.Context, productID byo.ProductID) (byo.Product, error) {
+	if err := ctx.Err(); err != nil {
+		return byo.Product{}, err
+	}
 	lookup, err := c.tool(ctx)
 	if err != nil {
+		return byo.Product{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return byo.Product{}, err
 	}
 	result, err := lookup.Run(ctx, map[string]any{"product_id": string(productID)})
@@ -81,16 +94,63 @@ func (c *mcpCatalog) Lookup(ctx agent.Context, productID byo.ProductID) (byo.Pro
 	return parseProduct(output, productID)
 }
 
-func (c *mcpCatalog) tool(ctx agent.Context) (mcpLookupTool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lookupTool != nil {
-		return c.lookupTool, nil
+func (c *mcpCatalog) tool(ctx agent.ReadonlyContext) (mcpLookupTool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	c.mu.Lock()
+	if c.lookupTool != nil {
+		lookupTool := c.lookupTool
+		c.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return lookupTool, nil
+	}
+	if discovery := c.discovery; discovery != nil {
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-discovery.done:
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return discovery.tool, discovery.err
+	}
+
+	discovery := &toolDiscovery{done: make(chan struct{})}
+	c.discovery = discovery
+	c.mu.Unlock()
+
+	lookupTool, err := c.discover(ctx)
+
+	c.mu.Lock()
+	if err == nil {
+		c.lookupTool = lookupTool
+	}
+	discovery.tool = lookupTool
+	discovery.err = err
+	c.discovery = nil
+	close(discovery.done)
+	c.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return lookupTool, nil
+}
+
+func (c *mcpCatalog) discover(ctx agent.ReadonlyContext) (mcpLookupTool, error) {
 	tools, err := c.toolset.Tools(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("discover protected catalog tool: %w", err)
 	}
+	var lookupTool mcpLookupTool
 	for _, candidate := range tools {
 		if candidate.Name() != catalogToolName {
 			continue
@@ -99,15 +159,15 @@ func (c *mcpCatalog) tool(ctx agent.Context) (mcpLookupTool, error) {
 		if !ok {
 			return nil, fmt.Errorf("catalog tool %q cannot execute MCP calls", catalogToolName)
 		}
-		if c.lookupTool != nil {
+		if lookupTool != nil {
 			return nil, fmt.Errorf("catalog tool %q is ambiguous", catalogToolName)
 		}
-		c.lookupTool = lookup
+		lookupTool = lookup
 	}
-	if c.lookupTool == nil {
+	if lookupTool == nil {
 		return nil, fmt.Errorf("protected MCP tool %q was not discovered", catalogToolName)
 	}
-	return c.lookupTool, nil
+	return lookupTool, nil
 }
 
 func parseProduct(values map[string]any, requestedID byo.ProductID) (byo.Product, error) {
