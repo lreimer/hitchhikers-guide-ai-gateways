@@ -7,7 +7,7 @@ ENVOY_AI_GATEWAY_SYSTEM_NAMESPACE ?= envoy-ai-gateway-system
 KAGENT_NAMESPACE ?= kagent
 KAGENT_CONTEXT ?= rancher-desktop
 
-.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall kagent-install kagent-port-forward kagent-demo kagent-uninstall
+.PHONY: help validate bifrost-install bifrost-port-forward bifrost-demo bifrost-uninstall krakend-install krakend-port-forward krakend-demo krakend-uninstall agentgateway-install agentgateway-port-forward agentgateway-demo agentgateway-uninstall envoy-ai-gateway-install envoy-ai-gateway-port-forward envoy-ai-gateway-demo envoy-ai-gateway-uninstall kagent-install kagent-port-forward kagent-demo kagent-uninstall kagent-byo-build kagent-byo-install kagent-byo-demo kagent-byo-uninstall
 .PHONY: agentgateway-mcp-install agentgateway-mcp-demo agentgateway-mcp-uninstall
 
 help:
@@ -35,6 +35,10 @@ help:
 	  'kagent-port-forward   Forward the kagent UI to localhost:8081' \
 	  'kagent-demo           Run the explicitly opted-in live agent evaluation' \
 	  'kagent-uninstall      Remove the kagent demo and its owned runtime' \
+	  'kagent-byo-build      Build and push the digest-pinned Go BYO image' \
+	  'kagent-byo-install    Install the optional Go BYO quote agent' \
+	  'kagent-byo-demo       Run the explicitly opted-in BYO agent evaluation' \
+	  'kagent-byo-uninstall  Remove only BYO resources and its tracked sessions' \
 	  'validate              Check shell/Python syntax, gateway JSON, and kagent YAML'
 
 validate:
@@ -42,7 +46,7 @@ validate:
 	@python3 -m json.tool gateways/krakend/krakend.json >/dev/null
 	@python3 -c 'import ast; ast.parse(open("gateways/envoy-ai-gateway/mock-backend.py", encoding="utf-8").read())'
 	@python3 -c 'import ast, pathlib; [ast.parse(p.read_text(encoding="utf-8"), filename=str(p)) for p in pathlib.Path("gateways/agentgateway/mcp").glob("*.py")]'
-	@uv run --with pyyaml python -c 'import pathlib, yaml; [list(yaml.parse(p.read_text(encoding="utf-8"))) for p in pathlib.Path("agents/kagent").glob("*.yaml")]'
+	@uv run --with pyyaml python -c 'import pathlib, yaml; [list(yaml.parse(p.read_text(encoding="utf-8"))) for p in pathlib.Path("agents/kagent").rglob("*.yaml")]'
 
 bifrost-install:
 	@BIFROST_NAMESPACE="$(BIFROST_NAMESPACE)" ./scripts/install-bifrost.sh
@@ -125,3 +129,20 @@ kagent-demo:
 kagent-uninstall:
 	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
 	  ./scripts/uninstall-kagent.sh
+
+kagent-byo-build:
+	@./scripts/build-kagent-byo.sh
+
+kagent-byo-install:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" ./scripts/install-kagent-byo.sh
+
+kagent-byo-demo:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  AGENTGATEWAY_NAMESPACE="$(AGENTGATEWAY_NAMESPACE)" \
+	  KAGENT_QUOTE_AGENT="product-quote-byo-assistant" \
+	  KAGENT_BYO_SESSION_TRACKING=true ./scripts/demo-kagent.sh
+
+kagent-byo-uninstall:
+	@KAGENT_CONTEXT="$(KAGENT_CONTEXT)" KAGENT_NAMESPACE="$(KAGENT_NAMESPACE)" \
+	  ./scripts/uninstall-kagent-byo.sh

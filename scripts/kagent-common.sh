@@ -335,7 +335,10 @@ kagent_demo_capture_custom_resources() {
       [[ -z "$resource" ]] && continue
       objects="$(kubectl get "$resource" --all-namespaces -o json)" || return 1
       entries="$(jq -c --arg resource "$resource" '
-        [.items[] | {
+        [.items[] |
+          select(.metadata.labels["app.kubernetes.io/managed-by"] != "kagent-byo-addon" or
+            (.metadata.name != "kagent-byo-harness" and
+             .metadata.name != "product-quote-byo-assistant")) | {
           resource:$resource,
           namespace:(.metadata.namespace // ""),
           name:.metadata.name,
@@ -378,6 +381,10 @@ kagent_demo_capture_inventory() {
         [.items[] |
           select(.kind != "Event" and .kind != "Pod" and
             .kind != "Endpoint" and .kind != "EndpointSlice") |
+          select(.metadata.labels["app.kubernetes.io/managed-by"] != "kagent-byo-addon" or
+            (.metadata.name != "kagent-byo-ownership" and
+             .metadata.name != "kagent-byo-harness" and
+             .metadata.name != "product-quote-byo-assistant")) |
           select(.kind != "ConfigMap" or
             .metadata.name != "kagent-demo-ownership" or
             .metadata.namespace != $namespace) | {

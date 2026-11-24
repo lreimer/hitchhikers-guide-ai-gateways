@@ -28,6 +28,12 @@ if [[ "$(kagent version | jq -r '.kagent_version')" != "1.0.1" ]]; then
   printf 'Use the pinned kagent CLI v1.0.1 to uninstall this runtime.\n' >&2
   exit 1
 fi
+byo_record="$(kubectl get configmap kagent-byo-ownership -n "$namespace" \
+  --ignore-not-found -o json)"
+if [[ -n "$byo_record" ]]; then
+  printf 'Removing the owned BYO add-on and tracked Sessions before uninstalling the shared runtime.\n'
+  "$script_dir/uninstall-kagent-byo.sh"
+fi
 gateway_namespace="$(jq -r '.data["gateway-namespace"]' <<<"$record")"
 cleanup() {
   local status=$?

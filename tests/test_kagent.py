@@ -364,6 +364,32 @@ kagent_demo_verify_inventory custom "$captured"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Resources in the kagent runtime namespaces changed", result.stderr)
 
+    def test_inventory_excludes_only_byo_addon_owned_resources(self):
+        inventory = [
+            {"kind": "ConfigMap", "metadata": {
+                "name": "runtime-config", "namespace": "custom", "uid": "runtime-uid",
+                "labels": {"app.kubernetes.io/managed-by": "kagent-demo"},
+            }},
+            {"kind": "Agent", "metadata": {
+                "name": "product-quote-byo-assistant", "namespace": "custom", "uid": "byo-uid",
+                "labels": {"app.kubernetes.io/managed-by": "kagent-byo-addon"},
+            }},
+            {"kind": "ConfigMap", "metadata": {
+                "name": "unrelated-addon-labelled", "namespace": "custom", "uid": "other-uid",
+                "labels": {"app.kubernetes.io/managed-by": "kagent-byo-addon"},
+            }},
+        ]
+        result = self.run_shell("""
+captured="$(kagent_demo_capture_inventory custom)"
+printf '%s' "$captured"
+""", namespaces={"custom": self.namespace("custom")},
+            extra_env={"TEST_INVENTORY": json.dumps(inventory)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [entry["name"] for entry in json.loads(result.stdout)],
+            ["runtime-config", "unrelated-addon-labelled"],
+        )
+
     def test_only_garbage_collected_certificate_requests_may_disappear(self):
         config = {
             "resource": "configmaps", "namespace": "custom",
@@ -509,3 +535,225 @@ class KagentHelmTests(unittest.TestCase):
         result = self.check_version("v4.3.1", status=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Could not determine the Helm version", result.stderr)
+
+
+class KagentByoTests(unittest.TestCase):
+    def run_shell(self, script, extra_env=None):
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail\nsource scripts/kagent-byo-common.sh\n" + script],
+            cwd=ROOT,
+            env={**os.environ, **(extra_env or {})},
+            text=True,
+            capture_output=True,
+        )
+
+    def test_make_targets_integrate_build_install_demo_and_cleanup(self):
+        expected = {
+            "kagent-byo-build": "build-kagent-byo.sh",
+            "kagent-byo-install": "install-kagent-byo.sh",
+            "kagent-byo-uninstall": "uninstall-kagent-byo.sh",
+        }
+        for target, script in expected.items():
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["make", "--dry-run", target],
+                    cwd=ROOT, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(script, result.stdout)
+        demo = subprocess.run(
+            ["make", "--dry-run", "kagent-byo-demo"],
+            cwd=ROOT, text=True, capture_output=True,
+        )
+        self.assertEqual(demo.returncode, 0, demo.stderr)
+        self.assertIn("product-quote-byo-assistant", demo.stdout)
+        self.assertIn("KAGENT_BYO_SESSION_TRACKING=true", demo.stdout)
+
+    def test_only_accepts_confirmed_registry_digest(self):
+        valid = "ghcr.io/lreimer/hitchhikers-guide-ai-gateways@sha256:" + "a" * 64
+        result = self.run_shell('kagent_byo_validate_image "$TEST_IMAGE"', {"TEST_IMAGE": valid})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for image in (
+            "ghcr.io/lreimer/hitchhikers-guide-ai-gateways:latest",
+            "ghcr.io/other/image@sha256:" + "a" * 64,
+            "ghcr.io/lreimer/hitchhikers-guide-ai-gateways@sha256:abc",
+        ):
+            with self.subTest(image=image):
+                result = self.run_shell(
+                    'kagent_byo_validate_image "$TEST_IMAGE"', {"TEST_IMAGE": image},
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_build_pushes_to_the_confirmed_registry_and_returns_its_digest(self):
+        digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            docker = path / "docker"
+            args_file = path / "docker-args"
+            docker.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" > \"$TEST_DOCKER_ARGS\"\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = --metadata-file ]; then\n"
+                "    shift\n"
+                f"    printf '{{\"containerimage.digest\":\"{digest}\"}}' > \"$1\"\n"
+                "  fi\n"
+                "  shift\n"
+                "done\n",
+            )
+            docker.chmod(0o755)
+            result = subprocess.run(
+                [str(ROOT / "scripts/build-kagent-byo.sh")],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "PATH": f"{directory}:{os.environ['PATH']}",
+                    "TEST_DOCKER_ARGS": str(args_file),
+                },
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "export KAGENT_BYO_IMAGE='ghcr.io/lreimer/hitchhikers-guide-ai-gateways@"
+                + digest + "'",
+            )
+            self.assertIn("--platform linux/arm64 --push", args_file.read_text())
+
+    def test_owned_resource_record_detects_replacement_and_foreign_objects(self):
+        objects = {
+            f"{kind}/{name}": {
+                "metadata": {
+                    "name": name, "uid": kind + "-" + name + "-uid",
+                    "labels": {"app.kubernetes.io/managed-by": "kagent-byo-addon"},
+                },
+            }
+            for kind, name in (
+                ("harness", "kagent-byo-harness"),
+                ("agenttemplate", "product-quote-byo-assistant"),
+                ("agent", "product-quote-byo-assistant"),
+            )
+        }
+        mock = """
+kubectl() {
+  case "$1 $2" in
+    "config current-context") printf rancher-desktop ;;
+    "get "*)
+      jq -c --arg resource "$2/$3" '.[$resource] // empty' <<<"$TEST_OBJECTS" ;;
+    *) return 1 ;;
+  esac
+}
+"""
+        expected = [
+            {"kind": kind, "name": name, "uid": kind + "-" + name + "-uid"}
+            for kind, name in (
+                ("harness", "kagent-byo-harness"),
+                ("agenttemplate", "product-quote-byo-assistant"),
+                ("agent", "product-quote-byo-assistant"),
+            )
+        ]
+        setup = """
+record="$(jq -cn --arg resources "$TEST_EXPECTED" '{
+  metadata:{labels:{"app.kubernetes.io/managed-by":"kagent-byo-addon"}},
+  data:{context:"rancher-desktop",phase:"ready",resources:$resources,sessions:"[]"}}')"
+kagent_byo_verify_record custom "$record"
+"""
+        result = self.run_shell(
+            mock + setup, {
+                "TEST_OBJECTS": json.dumps(objects),
+                "TEST_EXPECTED": json.dumps(expected),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replaced = json.loads(json.dumps(objects))
+        replaced["harness/kagent-byo-harness"]["metadata"]["uid"] = "replacement-uid"
+        result = self.run_shell(
+            mock + setup, {
+                "TEST_OBJECTS": json.dumps(replaced),
+                "TEST_EXPECTED": json.dumps(expected),
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("identities changed", result.stderr)
+        unowned = json.loads(json.dumps(objects))
+        unowned["harness/kagent-byo-harness"]["metadata"]["labels"] = {}
+        result = self.run_shell(
+            mock + setup, {
+                "TEST_OBJECTS": json.dumps(unowned),
+                "TEST_EXPECTED": json.dumps(expected),
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing to adopt unowned", result.stderr)
+
+    def test_cleanup_can_resume_only_by_removing_recorded_resources(self):
+        expected = [
+            {"kind": "harness", "name": "kagent-byo-harness", "uid": "harness-uid"},
+            {"kind": "agenttemplate", "name": "product-quote-byo-assistant", "uid": "template-uid"},
+            {"kind": "agent", "name": "product-quote-byo-assistant", "uid": "agent-uid"},
+        ]
+        actual = expected[:2]
+        result = self.run_shell("""
+kubectl() {
+  case "$1 $2" in
+    "config current-context") printf rancher-desktop ;;
+    "get "*)
+      jq -c --arg resource "$2/$3" '.[$resource] // empty' <<<"$TEST_OBJECTS" ;;
+    *) return 1 ;;
+  esac
+}
+record="$(jq -cn --arg resources "$TEST_EXPECTED" '{
+  metadata:{labels:{"app.kubernetes.io/managed-by":"kagent-byo-addon"}},
+  data:{context:"rancher-desktop",phase:"cleanup-failed",resources:$resources,sessions:"[]"}}')"
+kagent_byo_verify_record custom "$record"
+""", {
+            "TEST_EXPECTED": json.dumps(expected),
+            "TEST_OBJECTS": json.dumps({
+                f'{resource["kind"]}/{resource["name"]}': {
+                    "metadata": {
+                        "name": resource["name"],
+                        "uid": resource["uid"],
+                        "labels": {"app.kubernetes.io/managed-by": "kagent-byo-addon"},
+                    },
+                }
+                for resource in actual
+            }),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_session_tracking_deduplicates_and_removes_only_the_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record_path = Path(directory) / "record.json"
+            record_path.write_text(json.dumps({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "kagent-byo-ownership",
+                    "namespace": "custom",
+                    "labels": {"app.kubernetes.io/managed-by": "kagent-byo-addon"},
+                },
+                "data": {"phase": "ready", "sessions": "[]"},
+            }))
+            result = subprocess.run(
+                ["bash", "-c", """
+set -euo pipefail
+source scripts/kagent-byo-common.sh
+kubectl() {
+  case "$1 $2" in
+    "get configmap") cat "$TEST_RECORD" ;;
+    "apply -f") cat > "$TEST_RECORD" ;;
+    *) return 1 ;;
+  esac
+}
+kagent_byo_track_session custom first-session add
+kagent_byo_track_session custom second-session add
+kagent_byo_track_session custom first-session add
+kagent_byo_track_session custom first-session remove
+jq -r '.data.sessions' "$TEST_RECORD"
+"""],
+                cwd=ROOT,
+                env={**os.environ, "TEST_RECORD": str(record_path)},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), ["second-session"])

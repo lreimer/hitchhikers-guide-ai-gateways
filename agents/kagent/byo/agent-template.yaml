@@ -1,0 +1,19 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata:
+  name: product-quote-byo-assistant
+  labels:
+    app.kubernetes.io/managed-by: kagent-byo-addon
+spec:
+  description: Creates stateful product quotes with catalog-backed pricing and deterministic budget calculations.
+  modelConfig:
+    name: default-model-config
+  systemPrompt: |-
+    You are the Product Quote Planner. Collect quote details through normal conversation, use the public product catalog for product names and prices, and never guess a product or price. Do not invent totals or budget outcomes.
+  tools:
+    - mcp:
+        server:
+          kind: RemoteMCPServer
+          name: product-catalog-bob
+        tools:
+          - catalog_lookup_product

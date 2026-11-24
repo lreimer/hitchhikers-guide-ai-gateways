@@ -6,7 +6,8 @@ Chat Completions route. Both agents call the existing `/mcp` route; the
 gateway's Bob/Alice JWT policy, not the prompts, limits access to internal
 notes.
 
-The separate Go ADK BYO compatibility spike and its remaining live gates are
+The optional Go ADK BYO quote planner uses its own digest-pinned Harness and
+owned lifecycle. The compatibility contract and verified registry path are
 documented in [BYO compatibility](BYO-compatibility.md).
 
 | Agent | MCP identity | Tools |
@@ -179,6 +180,43 @@ If the process is forcibly killed or the API is unavailable while recording
 failure, the last checkpoint may not match the cluster. Review those
 resources manually; do not bypass the ownership safeguards or delete the
 record to force adoption.
+
+## Optional Go BYO quote planner
+
+The BYO add-on builds the Go module as a Linux container and pushes it to the
+public repository-named GHCR package. Substrate pulls BYO workload images
+itself and does not use Kubernetes image pull Secrets, so the package must be
+public for the documented setup. The build target defaults to `linux/arm64`;
+set `KAGENT_BYO_PLATFORM=linux/amd64` for an amd64 worker pool. The target
+prints an `export KAGENT_BYO_IMAGE=...` line containing the image's immutable
+SHA-256 digest. Use that exact value for installation:
+
+```sh
+make kagent-byo-build
+export KAGENT_BYO_IMAGE='ghcr.io/lreimer/hitchhikers-guide-ai-gateways@sha256:<digest-from-build-output>'
+make kagent-byo-install
+KAGENT_LIVE_EVAL=true make kagent-byo-demo
+make kagent-byo-uninstall
+```
+
+`kagent-byo-install` requires the ready base kagent demo, its protected
+agentgateway/MCP bindings, and the digest from the build. It installs a
+separate `byo: {}` Harness with an explicit executable command, then its own
+AgentTemplate and Agent. The Go workflow uses the Bob catalog route and the
+existing gateway-backed ModelConfig; it adds no provider credentials or
+MCP permissions. `kagent-byo-demo` reuses the bounded live evaluation and
+requires explicit `KAGENT_LIVE_EVAL=true` opt-in.
+
+The add-on records its own resource UIDs and temporary evaluation Sessions.
+`kagent-byo-uninstall` deletes only the recorded Sessions and its Agent,
+AgentTemplate, and Harness; the base runtime, declarative agents, gateway,
+and MCP resources remain. An interrupted cleanup can be retried after
+ownership verification. `kagent-uninstall` removes the add-on first when it is
+present, then proceeds with the shared runtime cleanup. The base install and
+cleanup inventories exclude only resources explicitly labelled as managed
+by the BYO add-on. Uninstall leaves the public digest-pinned GHCR image in
+place; registry package retention is managed separately from the cluster
+lifecycle.
 
 ## Live evaluation
 
