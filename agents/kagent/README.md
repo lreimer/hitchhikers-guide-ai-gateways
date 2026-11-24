@@ -34,6 +34,7 @@ gateway.
   required by the pinned kagent/Substrate runtime
 - Helm 3.12+ or Helm 4.x, `kubectl`, the kagent CLI v1.0.1, `jq`, `openssl`,
   Python 3.12, and `uv`
+- `grpcurl` for the live BYO actor snapshot assertions
 - An installed agentgateway v1.7.0 demo and its MCP add-on in the same
   `AGENTGATEWAY_NAMESPACE`
 - Docker for building the MCP image; Rancher Desktop uses its Docker Engine,
@@ -204,8 +205,30 @@ agentgateway/MCP bindings, and the digest from the build. It installs a
 separate `byo: {}` Harness with an explicit executable command, then its own
 AgentTemplate and Agent. The Go workflow uses the Bob catalog route and the
 existing gateway-backed ModelConfig; it adds no provider credentials or
-MCP permissions. `kagent-byo-demo` reuses the bounded live evaluation and
-requires explicit `KAGENT_LIVE_EVAL=true` opt-in.
+MCP permissions. `kagent-byo-demo` retains the declarative-agent checks and
+adds three live BYO turns: the initial quote, its same-Session follow-up, and
+a fresh-Session isolation check. It requires explicit
+`KAGENT_LIVE_EVAL=true` opt-in.
+
+The BYO checks require the initial result to report **$85.50 total** and
+**$5.50 over budget**, then the follow-up to report **$61.50 total** and
+**$18.50 remaining**. Before sending the follow-up, the evaluation polls the
+read-only Substrate actor API until the quote actor is `ACTOR_STATE_SUSPENDED`
+with a completed `SNAPSHOT_FIDELITY_VOLUMES` snapshot. After the same-Session
+follow-up, it requires the same actor UID to suspend again with a newer
+completed volume snapshot. A separate Session is asked for the prior quote;
+disclosing either total or budget delta fails the evaluation. The evaluation
+removes the temporary Sessions on exit and records BYO Session IDs so a later
+add-on cleanup can remove them after interruption. The BYO workflow performs
+all arithmetic in Go cents, so the BYO run expects catalog MCP calls and no
+calculator MCP call.
+
+`kagent-byo-demo` adds up to three model-backed turns to the existing live
+evaluation, so provider charges and the gateway's shared token allowance may
+apply. It never sets the opt-in itself. Offline workflow, error, timeout,
+cancellation, and A2A Task/Context ID checks remain available with
+`cd agents/kagent/byo && go test ./...`; shell ownership/evaluation tests run
+with `python3 -m unittest discover -s tests -p 'test_kagent.py'`.
 
 The add-on records its own resource UIDs and temporary evaluation Sessions.
 `kagent-byo-uninstall` deletes only the recorded Sessions and its Agent,
@@ -259,6 +282,24 @@ The provider-backed evaluation passed on Rancher Desktop on 2026-11-17:
 | Unknown product | Reported absent rather than estimating |
 | Bob internal note | Private note not disclosed; direct tool call denied |
 | Tool-call evidence | Catalog lookup, internal-note lookup, and multiplication logged |
+
+### BYO integrated evaluation
+
+The opted-in BYO evaluation passed on Rancher Desktop on 2026-11-24 using
+`ghcr.io/lreimer/hitchhikers-guide-ai-gateways@sha256:029c72b034ddce68e872527d6b3571b3d4444e638d7aaf18d9d150f15c8db003`.
+
+| Scenario | Verified outcome |
+| --- | --- |
+| BYO quote and same-Session follow-up | $85.50 total / $5.50 over budget, then $61.50 total / $18.50 remaining |
+| Substrate suspend and restore | Same actor UID suspended with a completed volume snapshot before and after the follow-up; snapshot generation advanced |
+| Fresh-Session isolation | A separate Session did not disclose the prior quote or budget delta |
+| Shared demo checks | Alice support, unknown-product refusal, and Bob internal-note denial passed |
+| Tool-call evidence | Catalog calls were logged; the Go workflow made no calculator MCP call |
+| Cleanup | BYO Agent, AgentTemplate, Harness, and tracked Sessions removed; base runtime and gateway remained |
+
+Earlier opted-in retries encountered HTTP 429 responses from the shared
+gateway allowance. The verified run completed after the allowance recovered;
+avoid repeated live runs until needed, since each consumes provider quota.
 
 Tool descriptions supply exact catalog IDs rather than relying on the model
 to guess identifiers from product names. MCP container logs use unwrapped

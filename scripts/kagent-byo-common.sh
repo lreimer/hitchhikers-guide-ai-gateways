@@ -12,6 +12,16 @@ kagent_byo_validate_image() {
   fi
 }
 
+kagent_byo_validate_install_phase() {
+  case "$1" in
+    ready|installing|failed|cleaned) ;;
+    *)
+      printf 'The BYO add-on is being cleaned up; finish make kagent-byo-uninstall before reinstalling.\n' >&2
+      return 1
+      ;;
+  esac
+}
+
 kagent_byo_capture_resources() {
   local namespace="$1" kind name object uid rows="[]"
   local index
@@ -122,4 +132,44 @@ kagent_byo_track_session() {
     .data.sessions = $sessions |
     {apiVersion,kind,metadata:{name:.metadata.name,namespace:.metadata.namespace,
       labels:.metadata.labels},data}' <<<"$record" | kubectl apply -f -
+}
+
+kagent_byo_actor_uids() {
+  jq -c '[.actors[]?.metadata.uid | select(type == "string")] | unique' <<<"$1"
+}
+
+kagent_byo_find_new_actor() {
+  jq -ce --argjson previous "$2" '
+    [.actors[]? |
+      select((.metadata.uid // "") as $uid | ($previous | index($uid)) == null)] |
+    if length == 1 then .[0] else error("expected exactly one new Substrate actor") end' \
+    <<<"$1"
+}
+
+kagent_byo_actor_snapshot_generation() {
+  jq -er --arg uid "$2" '
+    [.actors[]? | select(.metadata.uid == $uid) |
+      .status.snapshots[]?.generation] | max // 0' <<<"$1"
+}
+
+kagent_byo_actor_has_completed_snapshot() {
+  jq -e --arg uid "$2" --argjson minimum_generation "$3" '
+    [.actors[]? | select(.metadata.uid == $uid)] as $actors |
+    ($actors | length) == 1 and
+    $actors[0].status.state == "ACTOR_STATE_SUSPENDED" and
+    any($actors[0].status.snapshots[]?;
+      .generation > $minimum_generation and
+      .fidelity == "SNAPSHOT_FIDELITY_VOLUMES" and
+      .durableSnapshot.state == "SNAPSHOT_STORAGE_STATE_COMPLETED")' <<<"$1" >/dev/null
+}
+
+kagent_byo_validate_unknown_response() {
+  local response_file="$1"
+  if ! grep -Eiq 'unknown|not found|couldn.t find|could not find|does not exist|not in (the )?catalog|cannot|can.t|unable|error|unavailable|don.t know|do not know|no such product' \
+    "$response_file" ||
+    grep -Eq 'Total:|\$[0-9]' "$response_file"; then
+    printf 'BYO quote agent did not identify the unknown product without producing a price or total.\n' >&2
+    cat "$response_file" >&2
+    return 1
+  fi
 }

@@ -134,6 +134,64 @@ class KagentEvaluationTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, expected, result.stderr)
 
+    def test_invoke_retries_only_the_specific_session_not_ready_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for mode, expected_status, expected_count in (
+                ("ready-after-two", 0, 3),
+                ("unrelated", 1, 1),
+                ("never-ready", 1, 6),
+            ):
+                with self.subTest(mode=mode):
+                    counter = path / "counter"
+                    counter.write_text("0")
+                    result = subprocess.run(
+                        ["bash", "-c", """
+set -euo pipefail
+source scripts/kagent-common.sh
+sleep() { :; }
+kagent() {
+  local count
+  count="$(cat "$TEST_COUNTER")"
+  count="$((count + 1))"
+  printf '%s' "$count" > "$TEST_COUNTER"
+  case "$TEST_MODE" in
+    ready-after-two)
+      if (( count < 3 )); then
+        printf 'Error: input was not accepted; retry after the session becomes available\\n' >&2
+        return 1
+      fi ;;
+    never-ready)
+      printf 'Error: input was not accepted; retry after the session becomes available\\n' >&2
+      return 1 ;;
+    unrelated)
+      printf 'Error: model request failed\\n' >&2
+      return 1 ;;
+  esac
+  printf '{"status":"accepted"}'
+}
+kagent_demo_invoke_with_retry "$TEST_OUTPUT" "$TEST_ERROR" kagent invoke
+cat "$TEST_OUTPUT"
+"""],
+                        cwd=ROOT,
+                        env={
+                            **os.environ,
+                            "TEST_COUNTER": str(counter),
+                            "TEST_OUTPUT": str(path / "response.json"),
+                            "TEST_ERROR": str(path / "invoke-error.log"),
+                            "TEST_MODE": mode,
+                        },
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual(int(counter.read_text()), expected_count)
+                    if mode == "ready-after-two":
+                        self.assertEqual(result.stdout, '{"status":"accepted"}')
+                    if mode == "unrelated":
+                        self.assertIn("model request failed", result.stderr)
+                    if mode == "never-ready":
+                        self.assertIn("six bounded invoke attempts", result.stderr)
+
     def test_log_boundary_waits_past_authentication_second(self):
         with tempfile.TemporaryDirectory() as directory:
             counter = Path(directory) / "counter"
@@ -584,6 +642,21 @@ class KagentByoTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_cleaned_ownership_record_allows_safe_reinstall(self):
+        for phase in ("ready", "installing", "failed", "cleaned"):
+            with self.subTest(phase=phase):
+                result = self.run_shell(
+                    'kagent_byo_validate_install_phase "$TEST_PHASE"',
+                    {"TEST_PHASE": phase},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_shell(
+            'kagent_byo_validate_install_phase "$TEST_PHASE"',
+            {"TEST_PHASE": "cleanup-failed"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("finish make kagent-byo-uninstall", result.stderr)
+
     def test_build_pushes_to_the_confirmed_registry_and_returns_its_digest(self):
         digest = "sha256:" + "b" * 64
         with tempfile.TemporaryDirectory() as directory:
@@ -720,6 +793,87 @@ kagent_byo_verify_record custom "$record"
             }),
         })
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_substrate_snapshot_assertion_requires_same_suspended_actor_and_new_volume_snapshot(self):
+        complete = {
+            "actors": [{
+                "metadata": {"uid": "actor-uid"},
+                "status": {
+                    "state": "ACTOR_STATE_SUSPENDED",
+                    "snapshots": [{
+                        "generation": 4,
+                        "fidelity": "SNAPSHOT_FIDELITY_VOLUMES",
+                        "durableSnapshot": {"state": "SNAPSHOT_STORAGE_STATE_COMPLETED"},
+                    }],
+                },
+            }],
+        }
+        result = self.run_shell("""
+kagent_byo_actor_has_completed_snapshot "$TEST_ACTORS" actor-uid 3
+kagent_byo_actor_snapshot_generation "$TEST_ACTORS" actor-uid
+""", {"TEST_ACTORS": json.dumps(complete)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "4")
+
+        for mutation in (
+            lambda value: value["actors"][0]["status"].update(state="ACTOR_STATE_RUNNING"),
+            lambda value: value["actors"][0]["status"]["snapshots"][0].update(generation=3),
+            lambda value: value["actors"][0]["status"]["snapshots"][0].update(
+                durableSnapshot={"state": "SNAPSHOT_STORAGE_STATE_PENDING"},
+            ),
+        ):
+            altered = json.loads(json.dumps(complete))
+            mutation(altered)
+            with self.subTest(actor=altered):
+                result = self.run_shell(
+                    'kagent_byo_actor_has_completed_snapshot "$TEST_ACTORS" actor-uid 3',
+                    {"TEST_ACTORS": json.dumps(altered)},
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_new_actor_detection_excludes_the_preexisting_actor_set(self):
+        actors = {
+            "actors": [
+                {"metadata": {"uid": "old-actor", "name": "old"}},
+                {"metadata": {"uid": "new-actor", "name": "current"}},
+            ],
+        }
+        result = self.run_shell(
+            'kagent_byo_find_new_actor "$TEST_ACTORS" \'["old-actor"]\' | jq -r \'.metadata.uid\'',
+            {"TEST_ACTORS": json.dumps(actors)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "new-actor")
+
+    def test_unknown_byo_response_rejects_prices_and_successful_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            response_file = Path(directory) / "unknown.txt"
+            for response, accepted in (
+                ("I could not find that product in the catalog.", True),
+                ("The product is unknown.", True),
+                ("The unknown product costs $99.00.", False),
+                ("Total: $85.50. Over budget by $5.50.", False),
+                ("It is unavailable.", True),
+            ):
+                with self.subTest(response=response):
+                    response_file.write_text(response)
+                    result = self.run_shell(
+                        'kagent_byo_validate_unknown_response "$TEST_RESPONSE"',
+                        {"TEST_RESPONSE": str(response_file)},
+                    )
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_byo_demo_has_expected_quote_turns_and_fresh_session_assertion(self):
+        script = (ROOT / "scripts/demo-kagent.sh").read_text()
+        self.assertIn("Create an offer for three Star Widgets and two Moon Gadgets.", script)
+        self.assertIn("Then just one Moon Gadget; everything else stays the same.", script)
+        self.assertIn("Total: $85.50", script)
+        self.assertIn("Over budget by $5.50", script)
+        self.assertIn("Total: $61.50", script)
+        self.assertIn("Within budget; $18.50 remains", script)
+        self.assertIn("wait_for_byo_actor_snapshot", script)
+        self.assertIn("A fresh BYO Session disclosed quote state", script)
+        self.assertIn("unexpectedly delegated deterministic arithmetic to MCP", script)
 
     def test_session_tracking_deduplicates_and_removes_only_the_target(self):
         with tempfile.TemporaryDirectory() as directory:

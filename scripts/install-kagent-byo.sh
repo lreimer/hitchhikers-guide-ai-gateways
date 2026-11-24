@@ -10,8 +10,9 @@ source "$script_dir/kagent-byo-common.sh"
 
 namespace="${KAGENT_NAMESPACE:-kagent}"
 image="${KAGENT_BYO_IMAGE:-}"
-kagent_demo_require_commands kubectl jq kagent sed
+kagent_demo_require_commands kubectl helm jq kagent sed
 kagent_demo_require_context
+kagent_demo_require_helm
 kagent_demo_validate_namespace "$namespace"
 kagent_byo_validate_image "$image"
 if [[ "$(kagent version | jq -r '.kagent_version')" != "1.0.1" ]]; then
@@ -48,13 +49,7 @@ fi
 record="$(kubectl get configmap kagent-byo-ownership -n "$namespace" --ignore-not-found -o json)"
 if [[ -n "$record" ]]; then
   kagent_byo_verify_record "$namespace" "$record"
-  case "$(jq -r '.data.phase' <<<"$record")" in
-    ready|installing|failed) ;;
-    *)
-      printf 'The BYO add-on is being cleaned up; finish make kagent-byo-uninstall before reinstalling.\n' >&2
-      exit 1
-      ;;
-  esac
+  kagent_byo_validate_install_phase "$(jq -r '.data.phase' <<<"$record")"
 else
   for resource in \
     "harness kagent-byo-harness" \

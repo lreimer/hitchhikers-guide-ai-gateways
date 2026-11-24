@@ -158,6 +158,27 @@ kagent_demo_log_boundary() {
   return 1
 }
 
+kagent_demo_invoke_with_retry() {
+  local output_file="$1" error_file="$2" attempt
+  shift 2
+  for ((attempt = 1; attempt <= 6; attempt++)); do
+    if "$@" >"$output_file" 2>"$error_file"; then
+      return 0
+    fi
+    if ! grep -Fq 'input was not accepted; retry after the session becomes available' \
+      "$error_file"; then
+      cat "$error_file" >&2
+      return 1
+    fi
+    if (( attempt == 6 )); then
+      cat "$error_file" >&2
+      printf 'The kagent Session remained unavailable after six bounded invoke attempts.\n' >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 kagent_demo_check_fresh_install() {
   local namespace="$1" name release_namespace release_json crd_json groups
   for name in "$namespace" ate-system podcertificate-controller-system; do

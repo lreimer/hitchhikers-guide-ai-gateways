@@ -10,8 +10,9 @@ source "$script_dir/kagent-byo-common.sh"
 namespace="${KAGENT_NAMESPACE:-kagent}"
 api_local_port="${KAGENT_BYO_API_LOCAL_PORT:-18084}"
 api_url="http://127.0.0.1:$api_local_port"
-kagent_demo_require_commands kubectl jq kagent curl
+kagent_demo_require_commands kubectl helm jq kagent curl
 kagent_demo_require_context
+kagent_demo_require_helm
 kagent_demo_validate_namespace "$namespace"
 if [[ ! "$api_local_port" =~ ^[0-9]+$ ]] ||
   (( api_local_port < 1024 || api_local_port > 65535 )); then

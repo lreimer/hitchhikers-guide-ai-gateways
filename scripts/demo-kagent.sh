@@ -71,6 +71,7 @@ if [[ "$(kagent version | jq -r '.kagent_version')" != 1.0.1 ]]; then
   exit 1
 fi
 if [[ "${KAGENT_BYO_SESSION_TRACKING:-}" == true ]]; then
+  kagent_demo_require_commands grpcurl
   byo_record="$(kubectl get configmap kagent-byo-ownership -n "$namespace" -o json)"
   kagent_byo_verify_record "$namespace" "$byo_record"
   if [[ "$(jq -r '.data.phase' <<<"$byo_record")" != ready ||
@@ -171,7 +172,10 @@ cleanup() {
     "$tmp_dir/quote.json" "$tmp_dir/support.json" "$tmp_dir/unknown.json" \
     "$tmp_dir/bob-denial.json" "$tmp_dir/quote.txt" "$tmp_dir/support.txt" \
     "$tmp_dir/unknown.txt" "$tmp_dir/bob-denial.txt" "$tmp_dir/catalog.log" \
-    "$tmp_dir/calculator.log"
+    "$tmp_dir/calculator.log" "$tmp_dir/invoke-error.log" \
+    "$tmp_dir/byo-initial.json" "$tmp_dir/byo-initial.txt" \
+    "$tmp_dir/byo-followup.json" "$tmp_dir/byo-followup.txt" \
+    "$tmp_dir/byo-isolation.json" "$tmp_dir/byo-isolation.txt"
   rmdir "$tmp_dir" 2>/dev/null || true
   exit "$status"
 }
@@ -245,9 +249,10 @@ create_session() {
 
 invoke() {
   local session="$1" task="$2" output="$3" text_output="$4"
-  kagent --api-url "$api_url" --gateway-url "$api_url" \
+  kagent_demo_invoke_with_retry "$output" "$tmp_dir/invoke-error.log" \
+    kagent --api-url "$api_url" --gateway-url "$api_url" \
     --namespace "$namespace" \
-    --timeout 5m -o json agent invoke --session "$session" --task "$task" > "$output"
+    --timeout 5m -o json agent invoke --session "$session" --task "$task"
   if ! jq -er '
     [.. | objects | select(has("artifactId") and has("parts")) |
       .parts[]? | .text? | select(type == "string")] |
@@ -258,16 +263,91 @@ invoke() {
   fi
 }
 
-create_session "$quote_agent"
-quote_session="$created_session"
-invoke "$quote_session" \
-  "Create a quote for three Star Widgets. Look up the current unit price and use the calculator to compute the total. State the unit price and total." \
-  "$tmp_dir/quote.json" "$tmp_dir/quote.txt"
-jq -Rse 'test("12[.]5(0)?") and test("37[.]5(0)?")' \
-  "$tmp_dir/quote.txt" >/dev/null || {
-  printf 'Quote agent response did not include both the catalog price and calculated total.\n' >&2
-  exit 1
+capture_substrate_actors() {
+  grpcurl -plaintext -H 'x-user-id: admin@kagent.dev' \
+    -d '{"atespace":"kagent","page":{"limit":100}}' \
+    "127.0.0.1:$api_local_port" \
+    kagent.api.v1.SystemService/ListSubstrateActors
 }
+
+wait_for_byo_actor_snapshot() {
+  local actor_uid="$1" minimum_generation="$2" actors
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    actors="$(capture_substrate_actors)" || return 1
+    if kagent_byo_actor_has_completed_snapshot \
+      "$actors" "$actor_uid" "$minimum_generation"; then
+      printf '%s' "$actors"
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'Timed out waiting for BYO actor %s to suspend with a newer completed VOLUMES snapshot.\n' \
+    "$actor_uid" >&2
+  return 1
+}
+
+if [[ "${KAGENT_BYO_SESSION_TRACKING:-}" == true ]]; then
+  actors_before="$(capture_substrate_actors)"
+  actor_uids_before="$(kagent_byo_actor_uids "$actors_before")"
+  create_session "$quote_agent"
+  quote_session="$created_session"
+  invoke "$quote_session" \
+    "Create an offer for three Star Widgets and two Moon Gadgets. My budget is 80 dollars. Use the product catalog for current prices." \
+    "$tmp_dir/byo-initial.json" "$tmp_dir/byo-initial.txt"
+  if ! grep -Fq 'Total: $85.50' "$tmp_dir/byo-initial.txt" ||
+    ! grep -Fq 'Over budget by $5.50' "$tmp_dir/byo-initial.txt"; then
+    printf 'BYO quote did not report the expected $85.50 total and $5.50 budget overage.\n' >&2
+    exit 1
+  fi
+
+  actors_after_initial="$(capture_substrate_actors)"
+  byo_actor="$(kagent_byo_find_new_actor "$actors_after_initial" "$actor_uids_before")" || {
+    printf 'Could not identify exactly one new Substrate actor for the BYO quote Session.\n' >&2
+    exit 1
+  }
+  byo_actor_uid="$(jq -er '.metadata.uid' <<<"$byo_actor")"
+  actors_suspended="$(wait_for_byo_actor_snapshot "$byo_actor_uid" 0)"
+  initial_generation="$(kagent_byo_actor_snapshot_generation \
+    "$actors_suspended" "$byo_actor_uid")"
+
+  invoke "$quote_session" \
+    "Then just one Moon Gadget; everything else stays the same." \
+    "$tmp_dir/byo-followup.json" "$tmp_dir/byo-followup.txt"
+  if ! grep -Fq 'Total: $61.50' "$tmp_dir/byo-followup.txt" ||
+    ! grep -Fq 'Within budget; $18.50 remains' "$tmp_dir/byo-followup.txt"; then
+    printf 'BYO follow-up did not report the expected $61.50 total and $18.50 remaining budget.\n' >&2
+    exit 1
+  fi
+  actors_restored="$(wait_for_byo_actor_snapshot \
+    "$byo_actor_uid" "$initial_generation")"
+  final_generation="$(kagent_byo_actor_snapshot_generation \
+    "$actors_restored" "$byo_actor_uid")"
+  if (( final_generation <= initial_generation )); then
+    printf 'BYO actor snapshot generation did not advance after the resumed follow-up.\n' >&2
+    exit 1
+  fi
+
+  create_session "$quote_agent"
+  isolation_session="$created_session"
+  invoke "$isolation_session" \
+    "What was the total and budget status of the quote from my other session? If you cannot know, say so without guessing." \
+    "$tmp_dir/byo-isolation.json" "$tmp_dir/byo-isolation.txt"
+  if grep -Eq '85[.]50|61[.]50|5[.]50|18[.]50' "$tmp_dir/byo-isolation.txt"; then
+    printf 'A fresh BYO Session disclosed quote state from another Session.\n' >&2
+    exit 1
+  fi
+else
+  create_session "$quote_agent"
+  quote_session="$created_session"
+  invoke "$quote_session" \
+    "Create a quote for three Star Widgets. Look up the current unit price and use the calculator to compute the total. State the unit price and total." \
+    "$tmp_dir/quote.json" "$tmp_dir/quote.txt"
+  jq -Rse 'test("12[.]5(0)?") and test("37[.]5(0)?")' \
+    "$tmp_dir/quote.txt" >/dev/null || {
+    printf 'Quote agent response did not include both the catalog price and calculated total.\n' >&2
+    exit 1
+  }
+fi
 
 create_session internal-product-support-assistant
 support_session="$created_session"
@@ -284,11 +364,15 @@ unknown_session="$created_session"
 invoke "$unknown_session" \
   "Look up product ID unknown-demo-product. If it is not in the catalog, say it is unknown and do not estimate." \
   "$tmp_dir/unknown.json" "$tmp_dir/unknown.txt"
-jq -Rse 'test("unknown|not found|does not exist"; "i")' \
-  "$tmp_dir/unknown.txt" >/dev/null || {
-  printf 'Quote agent did not clearly report that the unknown product is absent.\n' >&2
-  exit 1
-}
+if [[ "${KAGENT_BYO_SESSION_TRACKING:-}" == true ]]; then
+  kagent_byo_validate_unknown_response "$tmp_dir/unknown.txt"
+else
+  jq -Rse 'test("unknown|not found|does not exist"; "i")' \
+    "$tmp_dir/unknown.txt" >/dev/null || {
+    printf 'Quote agent did not clearly report that the unknown product is absent.\n' >&2
+    exit 1
+  }
+fi
 
 create_session "$quote_agent"
 bob_session="$created_session"
@@ -310,9 +394,20 @@ for tool in catalog.lookup_product catalog.lookup_internal_note; do
     exit 1
   fi
 done
-if ! grep -Fq 'tool_call=calculator.multiply' "$tmp_dir/calculator.log"; then
-  printf 'No MCP server log confirmed the expected calculator.multiply call.\n' >&2
-  exit 1
+if [[ "${KAGENT_BYO_SESSION_TRACKING:-}" == true ]]; then
+  if grep -Fq 'tool_call=calculator.multiply' "$tmp_dir/calculator.log"; then
+    printf 'The BYO quote workflow unexpectedly delegated deterministic arithmetic to MCP.\n' >&2
+    exit 1
+  fi
+else
+  if ! grep -Fq 'tool_call=calculator.multiply' "$tmp_dir/calculator.log"; then
+    printf 'No MCP server log confirmed the expected calculator.multiply call.\n' >&2
+    exit 1
+  fi
 fi
 
-printf 'PASS kagent live evaluation: Bob quote, Alice internal support, unknown-product refusal, Bob internal-note denial, and MCP tool-call logs verified. Provider charges may apply.\n'
+if [[ "${KAGENT_BYO_SESSION_TRACKING:-}" == true ]]; then
+  printf 'PASS kagent live evaluation: BYO quote totals, suspended/restored actor snapshot, fresh-session isolation, Alice support, unknown-product refusal, Bob internal-note denial, and MCP tool-call logs verified. Provider charges may apply.\n'
+else
+  printf 'PASS kagent live evaluation: Bob quote, Alice internal support, unknown-product refusal, Bob internal-note denial, and MCP tool-call logs verified. Provider charges may apply.\n'
+fi
